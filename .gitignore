@@ -1,0 +1,43 @@
+# Local/build outputs
+.build/
+**/.build/
+dist/
+**/dist/
+artifacts/
+obs-studio/build_macos/
+obs-studio/.deps/
+.tools/
+*.app/
+*.dmg
+*.pkg
+*.exe
+*.msi
+*.dll
+*.dylib
+*.so
+*.a
+*.o
+*.pem
+*.key
+*.p12
+*.mobileprovision
+.DS_Store
+
+# Local credentials, logs and reverse-engineering captures
+*.cookie
+*.cookies
+*.token
+*.session
+*.log
+*.har
+captures/
+private/
+
+# Keep source checkouts from being absorbed into the release repository.
+/biliobs/
+/obs-studio/
+
+# Local research notes and downloaded version metadata
+/PORTING_NOTES.md
+/Livehime-Win-beta-8.6.0.11050-api.json
+/tools/

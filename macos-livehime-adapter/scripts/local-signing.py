@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Persistent, private development identity; never changes system certificate trust.
+
+Only codesign can access the imported non-extractable key without prompting.
+The keychain, password and certificate stay outside the checkout and app bundle.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import shlex
+import subprocess
+import tempfile
+
+ROOT = Path.home() / "Library/Application Support/LiveHime/DevelopmentSigning"
+KEYCHAIN = ROOT / "livehime-development.keychain-db"
+CONFIG = ROOT / "identity.json"
+
+
+def run(args):
+    result = subprocess.run([str(arg) for arg in args], capture_output=True, text=True)
+    if result.returncode:
+        # Do not include subprocess arguments: security requires passphrases
+        # as arguments and they must never appear in build logs.
+        raise RuntimeError(f"{Path(args[0]).name} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def identity():
+    os.umask(0o077)
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if CONFIG.exists():
+        settings = json.loads(CONFIG.read_text())
+        if not KEYCHAIN.exists() or not (ROOT / "keychain-password").exists():
+            raise RuntimeError("Development identity is incomplete; restore its keychain rather than replacing the certificate.")
+        fingerprint = hashlib.sha1((ROOT / "certificate.der").read_bytes()).hexdigest().upper()
+        if fingerprint != settings["sha1"]:
+            raise RuntimeError("Development certificate fingerprint changed.")
+        return settings
+    if KEYCHAIN.exists() or (ROOT / "keychain-password").exists():
+        raise RuntimeError("Incomplete signing setup found; inspect it before retrying. No identity was overwritten.")
+
+    password = secrets.token_urlsafe(40)
+    password_file = ROOT / "keychain-password"
+    password_file.write_text(password)
+    original_search = shlex.split(run(["/usr/bin/security", "list-keychains", "-d", "user"]))
+    try:
+        run(["/usr/bin/security", "create-keychain", "-p", password, KEYCHAIN])
+    finally:
+        # create-keychain may add itself to the search list. Leave the user's
+        # original search order untouched and use --keychain explicitly.
+        run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", *original_search])
+    run(["/usr/bin/security", "unlock-keychain", "-p", password, KEYCHAIN])
+    with tempfile.TemporaryDirectory(prefix="create-", dir=ROOT) as temporary:
+        work = Path(temporary)
+        configuration = work / "certificate.cnf"
+        configuration.write_text("""[req]
+prompt = no
+distinguished_name = dn
+x509_extensions = signing
+[dn]
+CN = LiveHime Local Development
+O = LiveHime Local Development
+[signing]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+subjectKeyIdentifier = hash
+""")
+        run(["/usr/bin/openssl", "req", "-new", "-x509", "-newkey", "rsa:3072", "-nodes", "-sha256", "-days", "3650",
+             "-config", configuration, "-keyout", work / "private.pem", "-out", work / "certificate.pem"])
+        run(["/usr/bin/openssl", "x509", "-in", work / "certificate.pem", "-outform", "DER", "-out", ROOT / "certificate.der"])
+        run(["/usr/bin/openssl", "pkcs12", "-export", "-inkey", work / "private.pem", "-in", work / "certificate.pem",
+             "-out", work / "identity.p12", "-passout", f"file:{password_file}"])
+        run(["/usr/bin/security", "import", work / "identity.p12", "-k", KEYCHAIN, "-f", "pkcs12", "-P", password,
+             "-x", "-T", "/usr/bin/codesign"])
+    run(["/usr/bin/security", "set-key-partition-list", "-S", "apple-tool:,codesign:", "-s", "-k", password, KEYCHAIN])
+    settings = {"sha1": hashlib.sha1((ROOT / "certificate.der").read_bytes()).hexdigest().upper(),
+                "name": "LiveHime Local Development"}
+    CONFIG.write_text(json.dumps(settings, indent=2) + "\n")
+    return settings
+
+
+def sign(path, deep=False):
+    settings = identity()
+    password = (ROOT / "keychain-password").read_text()
+    run(["/usr/bin/security", "unlock-keychain", "-p", password, KEYCHAIN])
+    arguments = ["/usr/bin/codesign", "--force", "--sign", settings["sha1"], "--keychain", KEYCHAIN, "--timestamp=none"]
+    if deep:
+        arguments.append("--deep")
+    # Default DR includes the actual identifier and self-signed certificate.
+    # Never propagate a host-specific requirement to nested code with --deep.
+    # codesign's private-key lookup still consults the user search list even
+    # with --keychain on current macOS. Include this isolated keychain only
+    # while signing; this is not a certificate trust change.
+    with (ROOT / "signing.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        original_search = shlex.split(run(["/usr/bin/security", "list-keychains", "-d", "user"]))
+        try:
+            if str(KEYCHAIN) not in original_search:
+                run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", *original_search, KEYCHAIN])
+            run([*arguments, path])
+        finally:
+            run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", *original_search])
+    run(["/usr/bin/codesign", "--verify", "--strict", path])
+    requirement = run(["/usr/bin/codesign", "-d", "-r-", path])
+    if "certificate" not in requirement or "cdhash H" in requirement:
+        raise RuntimeError("Signing did not produce a stable certificate identity.")
+    print("Signed using persistent local development certificate: " + str(path))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sign", type=Path)
+    parser.add_argument("--deep", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.sign:
+            sign(args.sign, args.deep)
+        else:
+            print("Local development identity ready: " + identity()["sha1"])
+    except (RuntimeError, OSError, ValueError, KeyError) as error:
+        parser.exit(1, f"local-signing: {error}\n")
