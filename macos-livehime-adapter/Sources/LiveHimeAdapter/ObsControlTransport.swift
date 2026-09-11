@@ -6,6 +6,7 @@ public protocol ObsControlTransport: Sendable {
     func startStreaming() async throws
     func stopStreaming() async throws
     func streamingActive() async throws -> Bool
+    func recordingActive() async throws -> Bool
 }
 
 public enum ObsControlError: Error, Equatable {

@@ -18,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var obsTransport: any ObsControlTransport = ObsWebSocketTransport(password: BundledOBSLauncher.configuredWebSocketPassword)
     private var webSessionAuthenticated = false
     private var obsStreaming = false
+    private var obsRecording = false
+    private var obsRecordingKnown = false
     private var obsStatusLabel: NSTextField?
     private var obsToggleButton: NSButton?
     private var roomStatusLabel: NSTextField?
@@ -305,10 +307,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // Keep a live backend from surviving the one user-facing app. The
         // independent in-app end-live action remains available while this
         // reply is cancelled.
-        if obsStreaming || stoppingOBS {
+        if obsStreaming || obsRecording || stoppingOBS {
             let alert = NSAlert()
-            alert.messageText = "直播仍在进行"
-            alert.informativeText = "请先在 LiveHime 中点“结束直播（关闭直播间）”，再退出应用。"
+            alert.messageText = "OBS 仍有输出任务"
+            alert.informativeText = "请先停止直播或录制，再退出应用。"
+            alert.addButton(withTitle: "好")
+            alert.beginSheetModal(for: window)
+            return .terminateCancel
+        }
+        if BundledOBSLauncher.runningBundledApp != nil && !obsRecordingKnown {
+            let alert = NSAlert()
+            alert.messageText = "无法确认 OBS 输出状态"
+            alert.informativeText = "请先刷新 OBS 状态，确认直播和录制都已停止，再退出应用。"
             alert.addButton(withTitle: "好")
             alert.beginSheetModal(for: window)
             return .terminateCancel
@@ -674,17 +684,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             defer { self.statusRefreshInFlight = false }
             do {
                 let active = try await obsTransport.streamingActive()
+                let recording = try await obsTransport.recordingActive()
                 guard self.streamOperation == operation else { return }
                 await MainActor.run {
                     self.obsStreaming = active
+                    self.obsRecording = recording
+                    self.obsRecordingKnown = true
                     self.obsConnected = true
-                    self.obsStatusLabel?.stringValue = active ? "OBS：直播中" : "OBS：已连接，未直播"
+                    if active && recording {
+                        self.obsStatusLabel?.stringValue = "OBS：直播中（录制中）"
+                    } else if active {
+                        self.obsStatusLabel?.stringValue = "OBS：直播中"
+                    } else if recording {
+                        self.obsStatusLabel?.stringValue = "OBS：已连接，未直播（录制中）"
+                    } else {
+                        self.obsStatusLabel?.stringValue = "OBS：已连接，未直播"
+                    }
                     self.updateLiveButtonEnabled()
                 }
             } catch let error as ObsControlError {
                 guard self.streamOperation == operation else { return }
                 await MainActor.run {
                     self.obsConnected = false
+                    self.obsRecordingKnown = false
                     self.obsStatusLabel?.stringValue = self.obsErrorMessage(error)
                     self.obsToggleButton?.isEnabled = false
                     self.updateLiveButtonEnabled()
@@ -700,6 +722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 guard self.streamOperation == operation else { return }
                 await MainActor.run {
                     self.obsConnected = false
+                    self.obsRecordingKnown = false
                     self.obsStatusLabel?.stringValue = "OBS：连接失败"
                     self.obsToggleButton?.isEnabled = false
                     self.updateLiveButtonEnabled()
@@ -844,6 +867,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         currentIdentityMid = 0
         availableAreas = []
         obsStreaming = false
+        obsRecording = false
+        obsRecordingKnown = false
         obsConnected = false
         areaPopup = nil
         roomStatusLabel = nil
@@ -1080,6 +1105,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
         obsConnected = false
         obsStreaming = false
+        obsRecording = false
+        obsRecordingKnown = true
         forceStopButton?.isHidden = true
         if pendingLogout { pendingLogoutOBSConfirmed = true }
         updateLiveButtonEnabled()
