@@ -79,6 +79,16 @@ final class ObsControlTransportTests: XCTestCase {
         try await ObsWebSocketTransport(port: fixture.port).stopStreaming()
     }
 
+    func testStreamStatusDistinguishesReconnectFromStableOutput() async throws {
+        let fixture = try OBSFixture(mode: "already_reconnecting")
+        defer { fixture.stop() }
+        let status = try await ObsWebSocketTransport(port: fixture.port).streamStatus()
+        XCTAssertFalse(status.active)
+        XCTAssertTrue(status.reconnecting)
+        XCTAssertTrue(status.outputting)
+        XCTAssertFalse(status.stable)
+    }
+
     func testMalformedStatusCannotConfirmOffline() async throws {
         let fixture = try OBSFixture(mode: "malformed")
         defer { fixture.stop() }

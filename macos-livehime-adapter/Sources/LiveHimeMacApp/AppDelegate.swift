@@ -685,17 +685,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             guard let self else { return }
             defer { self.statusRefreshInFlight = false }
             do {
-                let active = try await obsTransport.streamingActive()
+                let streamStatus = try await obsTransport.streamStatus()
                 let recording = try await obsTransport.recordingActive()
                 guard self.streamOperation == operation else { return }
                 await MainActor.run {
-                    self.obsStreaming = active
+                    // A reconnecting output still needs to be stopped, but it
+                    // is not a successful live stream. Keep the button locked
+                    // while making the rejection visible to the user.
+                    self.obsStreaming = streamStatus.outputting
                     self.obsRecording = recording
                     self.obsRecordingKnown = true
                     self.obsConnected = true
-                    if active && recording {
+                    if streamStatus.reconnecting && recording {
+                        self.obsStatusLabel?.stringValue = "OBS：推流重连中（录制中，服务器未接受输出）"
+                    } else if streamStatus.reconnecting {
+                        self.obsStatusLabel?.stringValue = "OBS：推流重连中（服务器未接受输出）"
+                    } else if streamStatus.active && recording {
                         self.obsStatusLabel?.stringValue = "OBS：直播中（录制中）"
-                    } else if active {
+                    } else if streamStatus.active {
                         self.obsStatusLabel?.stringValue = "OBS：直播中"
                     } else if recording {
                         self.obsStatusLabel?.stringValue = "OBS：已连接，未直播（录制中）"
@@ -1052,9 +1059,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     await self.closeLateStartedRoom(roomID: room.roomID)
                     return
                 }
-                self.obsStreaming = try await self.obsTransport.streamingActive()
+                // StartStream only acknowledges OBS accepting the command.
+                // Wait for a stable output before reporting success; when Bili
+                // rejects the RTMP write OBS stays active while reconnecting.
+                let stableStatus = try await self.waitForStableOBSOutput()
+                guard self.streamOperation == operation else {
+                    try? await self.obsTransport.stopStreaming()
+                    await self.closeLateStartedRoom(roomID: room.roomID)
+                    return
+                }
+                self.obsStreaming = stableStatus.outputting
                 self.obsConnected = true
-                self.obsStatusLabel?.stringValue = self.obsStreaming ? "OBS：正在推流" : "OBS：已提交启动，等待输出状态"
+                self.obsStatusLabel?.stringValue = "OBS：正在推流"
             } catch {
                 if self.streamOperation != operation {
                     // A timeout is ambiguous: the POST may have reached the
@@ -1072,6 +1088,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 }
             }
         }
+    }
+
+    private func waitForStableOBSOutput(timeout: TimeInterval = 8) async throws -> ObsStreamStatus {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var sawReconnect = false
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            let status = try await obsTransport.streamStatus()
+            if status.stable { return status }
+            sawReconnect = sawReconnect || status.reconnecting
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            if remaining > 0 {
+                try await Task.sleep(for: .seconds(min(0.5, remaining)))
+            }
+        }
+        if sawReconnect {
+            throw ObsControlError.rejected("OBS 推流服务器拒绝输出，当前正在重连；请检查推流地址和串流密钥")
+        }
+        throw ObsControlError.rejected("OBS 未进入稳定推流状态，请检查 OBS 输出配置")
     }
 
     private func closeLateStartedRoom(roomID: Int64) async {

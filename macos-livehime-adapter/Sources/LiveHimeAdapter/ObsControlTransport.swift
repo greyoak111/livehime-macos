@@ -1,10 +1,27 @@
 import Foundation
 import CryptoKit
 
+public struct ObsStreamStatus: Equatable, Sendable {
+    public let active: Bool
+    public let reconnecting: Bool
+
+    public init(active: Bool, reconnecting: Bool) {
+        self.active = active
+        self.reconnecting = reconnecting
+    }
+
+    /// Whether OBS still owns an output and must be treated as live for stop/logout safety.
+    public var outputting: Bool { active || reconnecting }
+
+    /// Whether OBS has an active output which is not in its reconnect loop.
+    public var stable: Bool { active && !reconnecting }
+}
+
 public protocol ObsControlTransport: Sendable {
     func setStreamingService(url: URL, key: String, metadata: [String: String]) async throws
     func startStreaming() async throws
     func stopStreaming() async throws
+    func streamStatus() async throws -> ObsStreamStatus
     func streamingActive() async throws -> Bool
     func recordingActive() async throws -> Bool
 }
@@ -126,8 +143,9 @@ public actor ObsWebSocketTransport: ObsControlTransport {
         }
 
         while true {
-            let status = try await streamStatus(timeout: remaining())
-            if !status.active && !status.reconnecting { return }
+            let rawStatus = try await fetchStreamStatus(timeout: remaining())
+            let status = ObsStreamStatus(active: rawStatus.active, reconnecting: rawStatus.reconnecting)
+            if !status.outputting { return }
             if ProcessInfo.processInfo.systemUptime >= deadline {
                 if alreadyStopped { throw ObsControlError.rejected("OBS 仍在重连，停止直播超时") }
                 throw ObsControlError.rejected("OBS 停止直播超时")
@@ -136,9 +154,14 @@ public actor ObsWebSocketTransport: ObsControlTransport {
         }
     }
 
+    public func streamStatus() async throws -> ObsStreamStatus {
+        let status = try await fetchStreamStatus()
+        return ObsStreamStatus(active: status.active, reconnecting: status.reconnecting)
+    }
+
     public func streamingActive() async throws -> Bool {
         let status = try await streamStatus()
-        return status.active || status.reconnecting
+        return status.outputting
     }
 
     public func recordingActive() async throws -> Bool {
@@ -149,7 +172,7 @@ public actor ObsWebSocketTransport: ObsControlTransport {
         return active
     }
 
-    private func streamStatus(timeout: TimeInterval? = nil) async throws -> (active: Bool, reconnecting: Bool) {
+    private func fetchStreamStatus(timeout: TimeInterval? = nil) async throws -> (active: Bool, reconnecting: Bool) {
         let response = try await request(type: "GetStreamStatus", timeout: timeout)
         guard let active = response["outputActive"] as? Bool,
               let reconnecting = response["outputReconnecting"] as? Bool else {
