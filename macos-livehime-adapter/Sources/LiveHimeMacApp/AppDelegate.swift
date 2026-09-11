@@ -1103,7 +1103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             }
         }
         if sawReconnect {
-            throw ObsControlError.rejected("OBS 推流服务器拒绝输出，当前正在重连；请检查推流地址和串流密钥")
+            throw ObsControlError.rejected("OBS 推流服务器拒绝输出，当前正在重连；请检查推流地址、串流密钥和网络出口/代理规则")
         }
         throw ObsControlError.rejected("OBS 未进入稳定推流状态，请检查 OBS 输出配置")
     }
