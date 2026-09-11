@@ -1052,13 +1052,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         if matches.isEmpty {
             obsStatusLabel?.stringValue = "OBS：内置进程已退出"
         } else {
-            let stopped = matches.map { $0.forceTerminate() }.allSatisfy { $0 }
-            obsStatusLabel?.stringValue = stopped ? "OBS：已强制退出内置进程" : "OBS：强制退出未成功，请检查活动监视器"
+            let requested = matches.map { $0.forceTerminate() }.allSatisfy { $0 }
+            // NSWorkspace can report a process that did not honor the force
+            // request. Never clear the streaming bit until the exact bundled
+            // app path has disappeared from the running application list.
+            let remaining = NSWorkspace.shared.runningApplications.filter { $0.bundleURL?.resolvingSymlinksInPath() == bundledURL }
+            guard requested, remaining.isEmpty else {
+                obsStatusLabel?.stringValue = "OBS：强制退出未确认，请检查活动监视器后重试"
+                forceStopButton?.isHidden = false
+                obsConnected = false
+                updateLiveButtonEnabled()
+                return
+            }
+            obsStatusLabel?.stringValue = "OBS：已强制退出内置进程"
         }
         obsConnected = false
         obsStreaming = false
         forceStopButton?.isHidden = true
+        if pendingLogout { pendingLogoutOBSConfirmed = true }
         updateLiveButtonEnabled()
+        maybeCompletePendingLogout()
     }
 
     private func obsErrorMessage(_ error: ObsControlError) -> String {
