@@ -4,7 +4,10 @@ script_dir=${0:A:h}
 package_dir=${script_dir:h}
 cd "$package_dir"
 swift build -c release --product LiveHimeMacApp
-app="$package_dir/dist/LiveHimeMacApp.app"
+app="${LIVEHIME_APP_PATH:-$package_dir/dist/LiveHimeMacApp.app}"
+bundle_id="${LIVEHIME_BUNDLE_ID:-local.livehime.macos}"
+bundle_name="${LIVEHIME_BUNDLE_NAME:-LiveHime macOS}"
+bundle_version="${LIVEHIME_BUNDLE_VERSION:-0.1.0}"
 # Do not rewrite a mapped executable or its signature while macOS is using
 # that bundle for privacy decisions. Build may finish, packaging must wait.
 if pgrep -f "^$app/Contents/MacOS/LiveHimeMacApp" >/dev/null; then
@@ -39,15 +42,15 @@ fi
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp ".build/arm64-apple-macosx/release/LiveHimeMacApp" "$app/Contents/MacOS/LiveHimeMacApp"
-cat > "$app/Contents/Info.plist" <<'PLIST'
+cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleExecutable</key><string>LiveHimeMacApp</string>
-  <key>CFBundleIdentifier</key><string>local.livehime.macos</string>
-  <key>CFBundleName</key><string>LiveHime macOS</string>
+  <key>CFBundleIdentifier</key><string>$bundle_id</string>
+  <key>CFBundleName</key><string>$bundle_name</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>$bundle_version</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSCameraUsageDescription</key><string>LiveHime uses the camera as an OBS capture source.</string>

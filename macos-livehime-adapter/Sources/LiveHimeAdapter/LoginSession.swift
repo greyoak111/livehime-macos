@@ -30,6 +30,11 @@ public enum LoginSessionStoreError: Error, Equatable {
 /// The token is never logged and is not exposed through diagnostics.
 public final class KeychainLoginSessionStore: LoginSessionStore, @unchecked Sendable {
     public static let defaultService = "local.livehime.macos.session"
+    public static func service(for bundleIdentifier: String?) -> String {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty,
+              bundleIdentifier != "local.livehime.macos" else { return defaultService }
+        return "\(bundleIdentifier).session"
+    }
     private let service: String
     private let account: String
 

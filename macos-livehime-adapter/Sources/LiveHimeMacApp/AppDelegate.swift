@@ -13,7 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var webView: WKWebView!
     private var statusLabel: NSTextField?
     private let bridge = AuthWebViewBridge()
-    private let sessionCoordinator = LoginSessionCoordinator(store: KeychainLoginSessionStore())
+    private lazy var sessionCoordinator = LoginSessionCoordinator(
+        store: KeychainLoginSessionStore(service: KeychainLoginSessionStore.service(for: Bundle.main.bundleIdentifier))
+    )
     private lazy var bilibili = BilibiliControlClient(diagnostics: diagnostics)
     private var obsTransport: any ObsControlTransport = ObsWebSocketTransport(password: BundledOBSLauncher.configuredWebSocketPassword)
     private var webSessionAuthenticated = false

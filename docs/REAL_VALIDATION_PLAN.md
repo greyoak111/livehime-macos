@@ -6,7 +6,21 @@
 
 ## 开始前
 
-1. 使用当前分支重新打包并通过只读 Bundle 预检。
+1. 使用独立验证 Bundle ID 重新打包并通过只读 Bundle 预检。示例：
+
+   ```sh
+   cd /Users/sunxifeng/livehime-macos-compat-lab/macos-livehime-adapter
+   LIVEHIME_APP_PATH="$PWD/dist/LiveHimeMacAppValidation.app" \
+   LIVEHIME_BUNDLE_ID="local.livehime.macos.validation" \
+   LIVEHIME_BUNDLE_NAME="LiveHime macOS Validation" \
+   LIVEHIME_BUNDLE_VERSION="0.1.0-validation" \
+   OBS_APP_SOURCE="/Users/sunxifeng/哔哩哔哩直播姬/obs-studio/build_macos/frontend/RelWithDebInfo/OBS.app" \
+   ./scripts/package-app.sh
+   ./scripts/verify-bundle.sh dist/LiveHimeMacAppValidation.app
+   ```
+
+   验证包必须使用 `local.livehime.macos.validation`；不要用正式包的 Bundle ID，
+   否则 Keychain 和 WebKit 网站数据可能复用已安装版本。
 2. 关闭单独安装的 OBS，避免 WebSocket 端口和权限归属混淆。
 3. 确认麦克风、摄像头、屏幕录制和系统音频权限已经按需授予。
 4. 准备一个可以安全开播、随时关播的测试时段；不要在正式活动直播中首次验证。

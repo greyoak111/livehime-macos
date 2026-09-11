@@ -30,6 +30,12 @@ final class LoginSessionTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .secondaryValidationPending)
     }
 
+    func testValidationBundleUsesSeparateKeychainService() {
+        XCTAssertEqual(KeychainLoginSessionStore.service(for: "local.livehime.macos"), KeychainLoginSessionStore.defaultService)
+        XCTAssertEqual(KeychainLoginSessionStore.service(for: "local.livehime.macos.validation"), "local.livehime.macos.validation.session")
+        XCTAssertEqual(KeychainLoginSessionStore.service(for: nil), KeychainLoginSessionStore.defaultService)
+    }
+
     func testCookieLoginCompletesAfterSecondaryValidation() throws {
         let store = MemoryStore()
         let coordinator = LoginSessionCoordinator(store: store)
