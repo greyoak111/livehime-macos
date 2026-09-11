@@ -39,6 +39,17 @@ class BundleSafetyTests(unittest.TestCase):
             app = self.make_bundle(Path(t)); secret = app / "Contents/Resources/private"; secret.mkdir(parents=True); (secret / "x.token").write_text("fixture")
             with self.assertRaises(check.SafetyError): check.inspect(str(app), skip_signature=True, processes=set())
 
+    def test_obs_public_sparkle_key_is_allowed_but_other_pem_is_blocked(self):
+        with tempfile.TemporaryDirectory() as t:
+            app = self.make_bundle(Path(t), nested=True)
+            public_key = app / "Contents/Resources/OBS.app/Contents/Resources/OBSPublicRSAKey.pem"
+            public_key.parent.mkdir(parents=True)
+            public_key.write_text("fixture-public-key")
+            result = check.inspect(str(app), skip_signature=True, processes=set())
+            self.assertEqual(result["status"], "ready")
+            (app / "Contents/Resources/OBS.app/Contents/Resources/private-key.pem").write_text("fixture-secret")
+            with self.assertRaises(check.SafetyError): check.inspect(str(app), skip_signature=True, processes=set())
+
     def test_symlinked_bundle_or_executable_blocks(self):
         with tempfile.TemporaryDirectory() as t:
             app = self.make_bundle(Path(t)); (app / "Contents/MacOS/App").unlink(); (app / "Contents/MacOS/App").symlink_to("/bin/echo")

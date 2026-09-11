@@ -58,6 +58,8 @@ python3 scripts/bundle-update-safety.py compare OLD.app NEW.app
 预检会拒绝 Bundle 内的 symlink、私有/凭据目录和 Cookie/Token/Session/密钥文件，确认
 宿主与嵌套 OBS 的 Bundle 身份不同，并检测两个进程的精确可执行路径。运行中的任一组件
 都会得到 `blocked`；检测通过也只表示“可以进入人工审阅”，不会自动安装。
+OBS 正常携带的固定路径 `OBSPublicRSAKey.pem` 是公开验证公钥，预检只对白名单中的这一
+个路径放行；其他 PEM、KEY、Token 或会话文件仍然会被拒绝。
 
 候选包的版本、主程序和嵌套 OBS 变化会得到 `review_required`。当前生产更新仍未实现，
 因此不会因为预检通过就触碰 `/Applications` 或已安装的 v0.1.0。

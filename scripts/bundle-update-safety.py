@@ -21,6 +21,12 @@ EXPECTED_HOST_ID = "local.livehime.macos"
 EXPECTED_LAB_ID = "local.livehime.compat-lab"
 FORBIDDEN_PARTS = {"private", "captures", "credentials"}
 FORBIDDEN_SUFFIXES = (".cookie", ".cookies", ".token", ".session", ".pem", ".p12", ".key")
+ALLOWED_PUBLIC_FILES = {
+    # OBS ships this public Sparkle verification key in its normal bundle.
+    # It is not a credential or signing secret; keep the broader suffix
+    # block for all other PEM/key material.
+    "Contents/Resources/OBS.app/Contents/Resources/OBSPublicRSAKey.pem",
+}
 
 
 class SafetyError(Exception):
@@ -72,6 +78,9 @@ def scan_forbidden_files(bundle: Path) -> None:
         relative_parts = {part.lower() for part in item.relative_to(bundle).parts}
         if relative_parts & FORBIDDEN_PARTS:
             raise SafetyError("bundle_private_path_found")
+        relative = str(item.relative_to(bundle))
+        if relative in ALLOWED_PUBLIC_FILES:
+            continue
         if item.is_file() and item.name.lower().endswith(FORBIDDEN_SUFFIXES):
             raise SafetyError("bundle_credential_file_found")
 
