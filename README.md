@@ -20,6 +20,8 @@ Bilibili 直播功能的本地路径，尤其方便部分账号在 Bilibili 侧�
 `macos-livehime-adapter/scripts/package-compat-lab.sh`，打开生成的 **LiveHime Compatibility Lab**。
 它不读取真实账号或启动 OBS。测试路径、诊断输出、公开页面观察和合并条件见
 [兼容性实验室说明](docs/COMPATIBILITY_LAB.md)。这不是新的正式 Release。
+进入真实账号验证前，先按[真实验证计划](docs/REAL_VALIDATION_PLAN.md)逐轮执行；验证由用户
+在本机完成，测试代码不会读取或导出账号凭据。
 
 更新候选包前可运行只读预检：
 
