@@ -32,7 +32,7 @@ python3 scripts/bundle-update-safety.py inspect /path/to/Candidate.app
 
 预检通过不会自动替换已安装版本；它只确认包身份、签名、运行状态和敏感文件边界。
 
-## v0.1.0 包含内容
+## v0.1.1 包含内容
 
 - AppKit + WKWebView 原生 macOS 宿主，目标 macOS 13+、Apple Silicon arm64。
 - 承接 Bilibili 官方 mini-login 页面，支持账号密码、二维码、短信、图片验证码/极验、
@@ -65,7 +65,7 @@ Bilibili 客户端 DLL/CEF 文件、账号数据、日志或本地签名密钥�
 
 ## 已知限制
 
-- v0.1.0 是本地证书签名、未经过 Apple notarization 的开发构建；首次运行可能需要
+- v0.1.1 是本地证书签名、未经过 Apple notarization 的开发构建；首次运行可能需要
   macOS 隐私权限。
 - 当前只提供 Apple Silicon arm64 构建，不包含 Intel Mac 构建。
 - Bilibili 页面、接口、账号资格、地区网络、人脸验证和风控策略都可能变化；应用不保证
