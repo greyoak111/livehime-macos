@@ -255,6 +255,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let menu = NSMenu()
         let app = NSMenuItem()
         let appMenu = NSMenu()
+        let update = NSMenuItem(title: "检查更新…", action: #selector(openReleasePage), keyEquivalent: "")
+        update.target = self
+        appMenu.addItem(update)
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 LiveHime", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         app.submenu = appMenu
         menu.addItem(app)
@@ -446,7 +450,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         obsActions.spacing = 12
         let logout = NSButton(title: "退出登录（自动关播）", target: self, action: #selector(signOut))
         logout.bezelStyle = .rounded
-        let accountActions = NSStackView(views: [logout])
+        let update = NSButton(title: "检查更新（打开 Releases）", target: self, action: #selector(openReleasePage))
+        update.bezelStyle = .rounded
+        let accountActions = NSStackView(views: [logout, update])
         accountActions.spacing = 12
         let panel = NSStackView(views: [label, roomLabel, area, reloadAreas, obsLabel, streamActions, forceStop, obsActions, permissions, accountActions])
         panel.orientation = .vertical
@@ -472,6 +478,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         if !closeOnRestore {
             didAutoLaunchOBS = true
             launchBundledOBS()
+        }
+    }
+
+    /// Open the public release list so users on v0.1.0 (or any older build) can
+    /// download the latest signed bundle without relying on an in-app updater.
+    /// The app never replaces itself or handles a downloaded archive.
+    @objc private func openReleasePage() {
+        guard NSWorkspace.shared.open(LiveHimeUpdateInfo.releasesURL) else {
+            let alert = NSAlert()
+            alert.messageText = "无法打开更新页面"
+            alert.informativeText = "请在浏览器中打开 GitHub Releases 页面，下载最新版本。"
+            alert.addButton(withTitle: "好")
+            alert.beginSheetModal(for: window)
+            return
         }
     }
 
