@@ -41,3 +41,8 @@ private/
 /PORTING_NOTES.md
 /Livehime-Win-beta-8.6.0.11050-api.json
 /tools/
+
+# Compatibility lab generated caches and reports
+__pycache__/
+*.pyc
+.compat-reports/

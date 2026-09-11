@@ -2,15 +2,19 @@ import AppKit
 import CryptoKit
 import WebKit
 import LiveHimeAdapter
+import UniformTypeIdentifiers
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
+    private let diagnostics = BilibiliDiagnosticStore()
+    private var pageLoadTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    private var faceAuthStatusLabel: NSTextField?
     private var window: NSWindow!
     private var webView: WKWebView!
     private var statusLabel: NSTextField?
     private let bridge = AuthWebViewBridge()
     private let sessionCoordinator = LoginSessionCoordinator(store: KeychainLoginSessionStore())
-    private let bilibili = BilibiliControlClient()
+    private lazy var bilibili = BilibiliControlClient(diagnostics: diagnostics)
     private var obsTransport: any ObsControlTransport = ObsWebSocketTransport(password: BundledOBSLauncher.configuredWebSocketPassword)
     private var webSessionAuthenticated = false
     private var obsStreaming = false
@@ -42,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var pendingLogoutOBSConfirmed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installDiagnosticsMenu()
         let contentController = WKUserContentController()
         // The Windows CEF host defines this object before loading the official
         // page. mini-login-v2 copies it into bilibili.com cookies; leaving it
@@ -59,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         )
         contentController.addUserScript(shim)
         contentController.add(self, name: "livehime_login")
+        contentController.addScriptMessageHandler(self, contentWorld: .page, name: "livehime_native")
 
         let configuration = WKWebViewConfiguration()
         configuration.userContentController = contentController
@@ -126,13 +132,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "livehime_login", let body = dictionary(from: message.body), let method = body["method"] as? String else { return }
+        guard acceptsLoginMessage(message), message.name == "livehime_login", let body = dictionary(from: message.body), let method = body["method"] as? String else { return }
         switch method {
         case "LoginSuccess":
             // The payload is intentionally not logged. The session coordinator handles persistence.
             bridge.loginSuccess(dictionary(from: body["data"]) ?? [:])
         case "SetCookies":
-            setWebCookies(body["data"])
+            if let batch = try? AuthCookieBatch(payload: body["data"]) { applyWebCookies(batch) {} }
         case "Cancel":
             bridge.cancel()
         case "SecondaryValidationResult":
@@ -140,33 +146,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         case "SwitchLogin":
             bridge.switchLogin(width: body["width"] as? Double ?? 0, height: body["height"] as? Double ?? 0)
         case "NativeAction":
-            handleNativeAction(action: body["action"] as? String, payload: body["payload"])
+            handleNativeAction(action: body["action"] as? String, payload: body["payload"]) { _, _ in }
         default:
             break
         }
     }
 
-    private func handleNativeAction(action: String?, payload: Any?) {
-        switch action {
-        case "auth/setRefreshToken":
-            // The Windows bridge receives the successful login payload here
-            // instead of emitting miniLogin's outer success event.
-            bridge.loginSuccess(dictionary(from: payload) ?? [:])
-        case "auth/setCookies":
-            setWebCookies(payload)
-        default:
-            break
+    private func acceptsLoginMessage(_ message: WKScriptMessage) -> Bool {
+        let origin = message.frameInfo.securityOrigin
+        return message.webView === webView && AuthBridgeOriginPolicy.allows(
+            scheme: origin.protocol, host: origin.host, port: origin.port,
+            isMainFrame: message.frameInfo.isMainFrame)
+    }
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage,
+                               replyHandler: @escaping (Any?, String?) -> Void) {
+        guard acceptsLoginMessage(message), message.name == "livehime_native" else {
+            diagnostics.record(.init(stage: .webBridge, operation: .callback, errorKind: .untrusted))
+            replyHandler(nil, AuthBridgeContractError.untrustedOrigin.rawValue)
+            return
+        }
+        guard let body = dictionary(from: message.body) else {
+            replyHandler(nil, AuthBridgeContractError.malformedPayload.rawValue)
+            return
+        }
+        handleNativeAction(action: body["action"] as? String, payload: body["payload"], completion: replyHandler)
+    }
+
+    private func handleNativeAction(action: String?, payload: Any?, completion: @escaping (Any?, String?) -> Void) {
+        do {
+            switch try NativeAuthRequest.parse(action: action, payload: payload) {
+            case .login(let result):
+                diagnostics.record(.init(stage: .webBridge, operation: .callback))
+                bridge.loginSuccess(result)
+                completion(["accepted": true], nil)
+            case .cookies(let batch):
+                applyWebCookies(batch) { [weak self] in
+                    self?.diagnostics.record(.init(stage: .webBridge, operation: .callback))
+                    completion(["accepted": true], nil)
+                }
+            }
+        } catch let error as AuthBridgeContractError {
+            diagnostics.record(.init(stage: .webBridge, operation: .callback, errorKind: error == .unsupportedAction ? .unsupported : .schema))
+            completion(nil, error.rawValue)
+        } catch {
+            completion(nil, AuthBridgeContractError.malformedPayload.rawValue)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        let id = ObjectIdentifier(webView)
+        pageLoadTasks[id]?.cancel()
+        pageLoadTasks[id] = Task { @MainActor [weak self, weak webView] in
+            do { try await Task.sleep(nanoseconds: 20_000_000_000) } catch { return }
+            guard let self, let webView else { return }
+            self.pageFailed(webView, kind: .timeout)
         }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        // Installing biliBridgePc at documentStart makes the current Vue
-        // bundle select its native-host mode before it has rendered, which
-        // produces a blank page in WKWebView. Install it after the first
-        // render instead; the bridge is only consulted when the user submits
-        // a login result.
-        webView.evaluateJavaScript(nativeAuthBridgeScript, completionHandler: nil)
+        pageLoadTasks.removeValue(forKey: ObjectIdentifier(webView))?.cancel()
+        let isLogin = webView === self.webView
+        diagnostics.record(.init(stage: isLogin ? .loginPage : .faceAuthPage, operation: .navigation))
+        if !isLogin {
+            faceAuthStatusLabel?.stringValue = "页面已载入，请完成页面内的身份验证"
+            return
+        }
+        guard let url = webView.url, AuthBridgeOriginPolicy.allows(scheme: url.scheme ?? "",
+            host: url.host ?? "", port: url.port ?? 0, isMainFrame: true) else { return }
+        // Preserve the working render order; verify the bridge separately from page navigation.
+        webView.evaluateJavaScript(AuthWebViewBridge.nativeAuthBridgeScript) { [weak self] _, error in
+            if error != nil {
+                self?.diagnostics.record(.init(stage: .webBridge, operation: .callback, errorKind: .schema))
+                self?.window.title = "Bilibili LiveHime · 登录桥接初始化失败（可导出诊断）"
+            }
+        }
         updateWindowTitle()
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        if (error as? URLError)?.code != .cancelled { pageFailed(webView, kind: .transport) }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        if (error as? URLError)?.code != .cancelled { pageFailed(webView, kind: .transport) }
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { pageFailed(webView, kind: .transport) }
+
+    private func pageFailed(_ view: WKWebView, kind: BilibiliDiagnosticErrorKind) {
+        pageLoadTasks.removeValue(forKey: ObjectIdentifier(view))?.cancel()
+        let isLogin = view === webView
+        diagnostics.record(.init(stage: isLogin ? .loginPage : .faceAuthPage, operation: .navigation, errorKind: kind))
+        if isLogin {
+            window.title = "Bilibili LiveHime · 页面加载失败（可在诊断菜单重试）"
+        } else {
+            faceAuthStatusLabel?.stringValue = "验证页面加载失败，请关闭后重新打开；可从诊断菜单导出记录"
+        }
+        // Page failure never removes a previously valid session or retries a live mutation.
+    }
+
+    private func installDiagnosticsMenu() {
+        let menu = NSMenu()
+        let app = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "退出 LiveHime", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        app.submenu = appMenu
+        menu.addItem(app)
+        let edit = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
+        let editMenu = NSMenu(title: "编辑")
+        for (title, action, key) in [("剪切", #selector(NSText.cut(_:)), "x"), ("复制", #selector(NSText.copy(_:)), "c"),
+                                     ("粘贴", #selector(NSText.paste(_:)), "v"), ("全选", #selector(NSText.selectAll(_:)), "a")] {
+            editMenu.addItem(withTitle: title, action: action, keyEquivalent: key)
+        }
+        edit.submenu = editMenu
+        menu.addItem(edit)
+        let item = NSMenuItem(title: "诊断", action: nil, keyEquivalent: "")
+        let diagnosticsMenu = NSMenu(title: "诊断")
+        for (title, action) in [("导出脱敏诊断…", #selector(exportDiagnostics)), ("清空诊断记录", #selector(clearDiagnostics)), ("重新加载登录页", #selector(retryLoginPage))] {
+            let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            entry.target = self
+            diagnosticsMenu.addItem(entry)
+        }
+        item.submenu = diagnosticsMenu
+        menu.addItem(item)
+        NSApplication.shared.mainMenu = menu
+    }
+
+    @objc private func clearDiagnostics() { diagnostics.clear() }
+    @objc private func retryLoginPage() {
+        guard window.contentView === webView else { return }
+        loadLoginPage()
+    }
+    @objc private func exportDiagnostics() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "LiveHime-diagnostics.json"
+        panel.allowedContentTypes = [.json]
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let self, let url = panel.url else { return }
+            do {
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try encoder.encode(self.diagnostics.snapshot()).write(to: url, options: .atomic)
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "诊断文件写入失败"
+                alert.informativeText = "请检查所选文件夹是否可写。"
+                alert.beginSheetModal(for: self.window)
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -413,7 +543,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         areaPopup?.removeAllItems()
         areaPopup?.addItem(withTitle: "直播分区：正在读取…")
         areaPopup?.isEnabled = false
-        let client = BilibiliLiveClient(cookieHeader: cookieHeader)
+        let client = BilibiliLiveClient(cookieHeader: cookieHeader, diagnostics: diagnostics)
         Task { [weak self] in
             do {
                 let room = try await client.fetchCurrentRoom(mid: identity.mid)
@@ -447,7 +577,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         Task { [weak self] in
             guard let self else { return }
             do {
-                let areas = try await BilibiliLiveClient(cookieHeader: self.currentCookieHeader).fetchAreas()
+                let areas = try await BilibiliLiveClient(cookieHeader: self.currentCookieHeader, diagnostics: self.diagnostics).fetchAreas()
                 self.setAvailableAreas(areas, preferredID: self.currentRoom?.areaID ?? 0)
             } catch {
                 self.areaPopup?.removeAllItems()
@@ -752,7 +882,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 self.updateLiveButtonEnabled()
                 self.maybeCompletePendingLogout()
             }
-            let client = BilibiliLiveClient(cookieHeader: self.currentCookieHeader)
+            let client = BilibiliLiveClient(cookieHeader: self.currentCookieHeader, diagnostics: self.diagnostics)
             do {
                 try await client.stopLive(roomID: room.roomID, cookieHeader: self.currentCookieHeader)
                 var verifiedRoom: BilibiliRoomInfo?
@@ -817,7 +947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 self.startingStream = false
                 self.updateLiveButtonEnabled()
             }
-            let client = BilibiliLiveClient(cookieHeader: self.currentCookieHeader)
+            let client = BilibiliLiveClient(cookieHeader: self.currentCookieHeader, diagnostics: self.diagnostics)
             do {
                 self.obsStatusLabel?.stringValue = "Bilibili：正在读取最新直播间状态…"
                 let latest = try await client.fetchRoomInfo(roomID: room.roomID, cookieHeader: self.currentCookieHeader)
@@ -871,7 +1001,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     private func closeLateStartedRoom(roomID: Int64) async {
-        let client = BilibiliLiveClient(cookieHeader: currentCookieHeader)
+        let client = BilibiliLiveClient(cookieHeader: currentCookieHeader, diagnostics: diagnostics)
         do {
             try await client.stopLive(roomID: roomID, cookieHeader: currentCookieHeader)
             let room = try await client.fetchRoomInfo(roomID: roomID, cookieHeader: currentCookieHeader)
@@ -914,6 +1044,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         case .missingStreamConfig: return "Bilibili：开播接口未返回推流地址"
         case .faceAuthRequired: return "Bilibili：需要完成身份验证"
         case .api(let code, let message): return "Bilibili：开播失败（\(code)）\(message)"
+        case .http(let status, let retry):
+            return "Bilibili：HTTP \(status)" + (retry.map { "，建议等待 \($0) 秒后手动重试" } ?? "，请查看诊断记录")
+        case .network(let code): return "Bilibili：网络请求失败（\(code)），可导出诊断"
         case .transport: return "Bilibili：开播接口网络请求失败"
         default: return "Bilibili：开播参数或返回数据无效"
         }
@@ -944,6 +1077,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         let authWebView = WKWebView(frame: .zero, configuration: configuration)
+        authWebView.navigationDelegate = self
         authWebView.load(URLRequest(url: authURL))
 
         let retry = NSButton(title: "验证完成，重试开播", target: self, action: #selector(faceAuthRetry))
@@ -953,7 +1087,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let buttons = NSStackView(views: [retry, close])
         buttons.orientation = .horizontal
         buttons.spacing = 12
-        let root = NSStackView(views: [authWebView, buttons])
+        let pageStatus = NSTextField(labelWithString: "正在载入官方身份验证页面…")
+        faceAuthStatusLabel = pageStatus
+        let root = NSStackView(views: [pageStatus, authWebView, buttons])
         root.orientation = .vertical
         root.spacing = 10
         root.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
@@ -975,6 +1111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     @objc private func closeFaceAuth() {
         faceAuthWindow?.orderOut(nil)
         faceAuthWindow = nil
+        faceAuthStatusLabel = nil
     }
 
     /// Reproduces the official Safari handoff used by mini-login when a host
@@ -1018,54 +1155,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         return "window.browser = Object.assign({}, window.browser || {}, \(json));"
     }
 
-    private var nativeAuthBridgeScript: String {
-        """
-        (() => {
-          if (window.biliBridgePc) return;
-          window.biliBridgePc = {
-            callNative: (action, payload) => {
-              webkit.messageHandlers.livehime_login.postMessage({method:'NativeAction', action, payload});
-              return Promise.resolve();
-            }
-          };
-        })();
-        """
-    }
-
-    private func setWebCookies(_ value: Any?) {
-        let rawItems: [Any]
-        if let items = value as? [Any] {
-            rawItems = items
-        } else if let items = value as? NSArray {
-            rawItems = items.compactMap { $0 }
-        } else {
-            return
-        }
+    private func applyWebCookies(_ batch: AuthCookieBatch, completion: @escaping () -> Void) {
         let store = webView.configuration.websiteDataStore.httpCookieStore
-        for rawItem in rawItems {
-            guard let item = dictionary(from: rawItem) else { continue }
-            guard let name = item["name"] as? String,
-                  let cookieValue = item["value"] as? String,
-                  !name.isEmpty else { continue }
-            if let expiration = item["expirationDate"] as? NSNumber,
-               expiration.doubleValue <= Date().timeIntervalSince1970,
-               (item["isExpiredRemove"] as? Bool) == true {
-                if let existing = HTTPCookie(properties: [
-                    .domain: ".bilibili.com", .path: "/", .name: name, .value: cookieValue
-                ]) {
-                    store.delete(existing)
-                }
-                continue
+        Task { @MainActor in
+            // Ordered, awaited writes prevent acknowledgement from racing the
+            // next login callback. Legacy events keep their existing behavior.
+            for operation in batch.operations {
+                if operation.remove { await store.deleteCookie(operation.cookie) }
+                else { await store.setCookie(operation.cookie) }
             }
-            var properties: [HTTPCookiePropertyKey: Any] = [
-                .domain: ".bilibili.com", .path: "/", .name: name, .value: cookieValue
-            ]
-            if let expiration = item["expirationDate"] as? NSNumber {
-                properties[.expires] = Date(timeIntervalSince1970: expiration.doubleValue)
-            }
-            if let cookie = HTTPCookie(properties: properties) {
-                store.setCookie(cookie)
-            }
+            completion()
         }
     }
 

@@ -39,7 +39,35 @@ final class LoginSessionTests: XCTestCase {
         XCTAssertEqual(store.value?.refreshToken, "sessdata")
     }
 
+    func testIncompleteOrRepeatedCallbacksKeepStoredSessionForRecovery() throws {
+        let store = MemoryStore()
+        let coordinator = LoginSessionCoordinator(store: store)
+        try coordinator.completeCookieLogin(cookieValue: "synthetic-session")
+        let saved = store.value
+        try coordinator.handle(.succeeded(LoginResult(type: "fixture")))
+        try coordinator.handle(.secondaryValidationReturned)
+        try coordinator.handle(.cancelled)
+        XCTAssertEqual(store.value, saved, "A navigation or partial callback must not erase the working credential")
+    }
+
+    func testFailedLogoutStoreRemovalDoesNotClaimSignedOut() throws {
+        final class FailingStore: LoginSessionStore, @unchecked Sendable {
+            var value: StoredLoginSession?
+            func save(_ session: StoredLoginSession) throws { value = session }
+            func load() throws -> StoredLoginSession? { value }
+            func remove() throws { throw LoginSessionStoreError.invalidData }
+        }
+        let coordinator = LoginSessionCoordinator(store: FailingStore())
+        try coordinator.completeCookieLogin(cookieValue: "synthetic-session")
+        let state = coordinator.state
+        XCTAssertThrowsError(try coordinator.signOut())
+        XCTAssertEqual(coordinator.state, state)
+    }
+
     func testRealKeychainRoundTripWithIsolatedService() throws {
+        guard ProcessInfo.processInfo.environment["LIVEHIME_TEST_KEYCHAIN"] == "1" else {
+            throw XCTSkip("Opt in to isolated Keychain integration with LIVEHIME_TEST_KEYCHAIN=1")
+        }
         let store = KeychainLoginSessionStore(service: "local.livehime.test.\(UUID().uuidString)", account: "test")
         defer { try? store.remove() }
         let session = StoredLoginSession(type: "scan", refreshToken: "test-token", timestamp: "1")

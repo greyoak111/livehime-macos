@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "project": "livehime-macos-compat-lab",
+  "projectVersion": "0.1.0",
+  "purpose": "Read-only compatibility evidence for the unofficial LiveHime macOS learning project.",
+  "observed": {
+    "version": null,
+    "build": null,
+    "source": null,
+    "checkedAt": null
+  },
+  "tested": {
+    "projectVersion": "0.1.0",
+    "evidence": "One local end-to-end user test was reported; this is not a current compatibility certification.",
+    "historicalWindowsPackageVersion": "8.6.0.11050",
+    "historicalWindowsPackageBuild": 11050,
+    "obsCommit": "6b3e550729f125b6c5b3767df88c08f5aef9d264",
+    "obsVersionOverride": "32.2.2",
+    "obsWebSocketProtocol": "5"
+  },
+  "resources": {
+    "liveVersion": {
+      "host": "api.live.bilibili.com",
+      "path": "/xlive/app-blink/v1/liveVersionInfo/getHomePageLiveVersion",
+      "query": "system_version=2",
+      "kind": "public-version-metadata"
+    },
+    "miniLogin": {
+      "host": "live.bilibili.com",
+      "path": "/p/html/live-pc-blink/mini-login-v2/",
+      "query": "",
+      "kind": "public-page"
+    },
+    "faceAuth": {
+      "host": "live.bilibili.com",
+      "path": "/p/html/bilili-page-face-auth/index.html",
+      "query": "",
+      "kind": "public-page"
+    }
+  },
+  "baseline": {
+    "resources": {
+      "liveVersion": null,
+      "miniLogin": null,
+      "faceAuth": null
+    },
+    "note": "Null means no captured official baseline is asserted. A changed hash requires review; it is not proof of incompatibility."
+  }
+}

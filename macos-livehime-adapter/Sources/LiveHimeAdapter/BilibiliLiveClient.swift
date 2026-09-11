@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import CoreFoundation
 
 public struct BilibiliRoomInfo: Equatable, Sendable {
     public let roomID: Int64
@@ -76,6 +77,8 @@ public enum BilibiliLiveError: Error, Equatable {
     case missingCSRF
     case missingRoom
     case transport
+    case network(code: Int)
+    case http(status: Int, retryAfterSeconds: Int?)
     case notLoggedIn
     case missingStreamConfig
     case faceAuthRequired(voucher: String?)
@@ -86,11 +89,13 @@ public enum BilibiliLiveError: Error, Equatable {
 public struct BilibiliLiveClient: Sendable {
     public let session: URLSession
     public let endpoints: BilibiliLiveEndpoints
+    public let diagnostics: BilibiliDiagnosticStore?
     private let defaultCookieHeader: String
 
-    public init(session: URLSession = .shared) { self.session = session; self.endpoints = .init(); self.defaultCookieHeader = "" }
+    public init(session: URLSession = .shared, diagnostics: BilibiliDiagnosticStore? = nil) { self.session = session; self.endpoints = .init(); self.defaultCookieHeader = ""; self.diagnostics = diagnostics }
     public init(cookieHeader: String, biliJct: String? = nil, session: URLSession = .shared,
-                endpoints: BilibiliLiveEndpoints = .init()) {
+                endpoints: BilibiliLiveEndpoints = .init(), diagnostics: BilibiliDiagnosticStore? = nil) {
+        self.diagnostics = diagnostics
         self.session = session; self.endpoints = endpoints
         if let biliJct, !biliJct.isEmpty, !cookieHeader.contains("bili_jct=") {
             self.defaultCookieHeader = cookieHeader + (cookieHeader.isEmpty ? "" : "; ") + "bili_jct=" + biliJct
@@ -199,7 +204,7 @@ public struct BilibiliLiveClient: Sendable {
         var query: [URLQueryItem] = [URLQueryItem(name: "platform", value: "pc_link")]
         if let roomID { query.append(URLQueryItem(name: "room_id", value: String(roomID))) }
         let root = try await requestJSON(url: withQuery(endpoints.upstreamURL, query), cookieHeader: defaultCookieHeader, body: nil)
-        return try parseStreamConfig(root)
+        return try parseStreamConfig(root, stage: .upstream)
     }
 
     public func resolveCurrentRoom(cookieHeader: String) async throws -> Int64 {
@@ -236,13 +241,19 @@ public struct BilibiliLiveClient: Sendable {
         var components = URLComponents(string: "https://api.live.bilibili.com/room/v1/Room/get_info")!
         components.queryItems = [URLQueryItem(name: "room_id", value: String(roomID))]
         let root = try await requestJSON(url: components.url!, cookieHeader: cookieHeader, body: nil)
-        guard let data = root["data"] as? [String: Any] else { throw BilibiliLiveError.invalidResponse }
+        guard let data = root["data"] as? [String: Any],
+              int64(data["room_id"]) == roomID,
+              let liveStatus = Self.apiCode(data["live_status"] ?? data["liveStatus"]),
+              [0, 1, 2].contains(liveStatus) else {
+            diagnostics?.record(.init(stage: .room, operation: .parse, errorKind: .schema))
+            throw BilibiliLiveError.invalidResponse
+        }
         return BilibiliRoomInfo(
-            roomID: int64(data["room_id"]) == 0 ? roomID : int64(data["room_id"]),
+            roomID: roomID,
             uid: int64(data["uid"]),
             shortRoomID: int64(data["short_id"]),
             title: data["title"] as? String ?? "",
-            liveStatus: int(data["live_status"] ?? data["liveStatus"]),
+            liveStatus: liveStatus,
             areaID: int(data["area_v2_id"] ?? data["area_id"])
         )
     }
@@ -267,28 +278,11 @@ public struct BilibiliLiveClient: Sendable {
         let unsigned = formString(values)
         let signedValues = values + [("sign", md5Hex(unsigned + "af125a0d5279fd576c1b4418a3e8276d"))]
         let query = signedValues.map { URLQueryItem(name: $0.0, value: $0.1) }
-        do {
-            let root = try await requestJSON(
-                url: withQuery(URL(string: "https://api.live.bilibili.com/room/v1/Room/startLive")!, query),
-                cookieHeader: cookieHeader, body: nil, httpMethod: "POST"
-            )
-            return try parseStreamConfig(root)
-        } catch BilibiliLiveError.api(let code, _) where code == -400 {
-            // Bilibili accepts both the LiveHime marker and the ordinary PC
-            // marker. Some accounts reject pc_link even though the same room
-            // and child area are valid; retry once with the documented PC
-            // platform before surfacing the original request error.
-            var fallback = values.filter { $0.0 != "platform" }
-            fallback.append(("platform", "pc"))
-            let signingValues = fallback
-            let signature = md5Hex(formString(signingValues) + "af125a0d5279fd576c1b4418a3e8276d")
-            let retryValues = signingValues + [("sign", signature)]
-            let retry = try await requestJSON(
-                url: withQuery(URL(string: "https://api.live.bilibili.com/room/v1/Room/startLive")!, retryValues.map { URLQueryItem(name: $0.0, value: $0.1) }),
-                cookieHeader: cookieHeader, body: nil, httpMethod: "POST"
-            )
-            return try parseStreamConfig(retry)
-        }
+        let root = try await requestJSON(
+            url: withQuery(URL(string: "https://api.live.bilibili.com/room/v1/Room/startLive")!, query),
+            cookieHeader: cookieHeader, body: nil, httpMethod: "POST"
+        )
+        return try parseStreamConfig(root, stage: .start)
     }
 
     public func stopLive(roomID: Int64, cookieHeader: String) async throws {
@@ -302,7 +296,8 @@ public struct BilibiliLiveClient: Sendable {
 
     public static func parseStreamConfig(from data: Data) throws -> BilibiliStreamConfig {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BilibiliLiveError.invalidResponse }
-        if let code = root["code"] as? Int, code != 0 {
+        guard let code = Self.apiCode(root["code"]) else { throw BilibiliLiveError.invalidResponse }
+        if code != 0 {
             if code == -101 { throw BilibiliLiveError.notLoggedIn }
             if code == 60043 || code == 60024 {
                 let data = root["data"] as? [String: Any]
@@ -324,11 +319,19 @@ public struct BilibiliLiveClient: Sendable {
             } else if let a = value as? [Any] { for v in a { if let x = scan(v) { return x } } }
             return nil
         }
-        guard let pair = scan(root["data"]), let server = URL(string: pair.0) else { throw BilibiliLiveError.missingStreamConfig }
+        guard let pair = scan(root["data"]), let server = URL(string: pair.0),
+              ["rtmp", "rtmps"].contains(server.scheme?.lowercased() ?? ""),
+              let host = server.host, !host.isEmpty else { throw BilibiliLiveError.missingStreamConfig }
         return BilibiliStreamConfig(server: server, key: pair.1)
     }
 
-    private func parseStreamConfig(_ root: [String: Any]) throws -> BilibiliStreamConfig { try Self.parseStreamConfig(root) }
+    private func parseStreamConfig(_ root: [String: Any], stage: BilibiliDiagnosticStage) throws -> BilibiliStreamConfig {
+        do { return try Self.parseStreamConfig(root) }
+        catch {
+            diagnostics?.record(.init(stage: stage, operation: .parse, errorKind: .schema))
+            throw error
+        }
+    }
 
     private func fetchRoomInfo(url: URL, query: [URLQueryItem], cookieHeader: String) async throws -> BilibiliRoomInfo {
         let root = try await requestJSON(url: withQuery(url, query), cookieHeader: cookieHeader, body: nil)
@@ -356,12 +359,37 @@ public struct BilibiliLiveClient: Sendable {
         request.setValue("https://live.bilibili.com/", forHTTPHeaderField: "Referer")
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         if body != nil { request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type") }
+        let started = Date()
+        let stage = diagnosticStage(url)
+        let operation: BilibiliDiagnosticOperation = request.httpMethod == "POST" ? .mutate : .request
+        func record(_ kind: BilibiliDiagnosticErrorKind? = nil, http: Int? = nil, api: Int? = nil, retry: Int? = nil, network: Int? = nil) {
+            diagnostics?.record(.init(stage: stage, operation: operation, httpStatus: http,
+                apiCode: api, networkCode: network, durationMilliseconds: Int(max(0, Date().timeIntervalSince(started)) * 1000),
+                errorKind: kind, retryAfterSeconds: retry))
+        }
         let data: Data
         let response: URLResponse
-        do { (data, response) = try await session.data(for: request) } catch { throw BilibiliLiveError.transport }
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw BilibiliLiveError.transport }
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BilibiliLiveError.invalidResponse }
-        if let code = root["code"] as? Int, code != 0 {
+        do { (data, response) = try await session.data(for: request) }
+        catch let error as URLError {
+            record(error.code == .cancelled ? .cancelled : error.code == .timedOut ? .timeout : .transport, network: error.errorCode)
+            throw BilibiliLiveError.network(code: error.errorCode)
+        } catch { record(.transport); throw BilibiliLiveError.transport }
+        guard let http = response as? HTTPURLResponse else {
+            record(.schema); throw BilibiliLiveError.invalidResponse
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let retry = Self.retryAfterSeconds(http.value(forHTTPHeaderField: "Retry-After"))
+            record(.http, http: http.statusCode, retry: retry)
+            throw BilibiliLiveError.http(status: http.statusCode, retryAfterSeconds: retry)
+        }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let code = Self.apiCode(root["code"]) else {
+            record(.schema, http: http.statusCode); throw BilibiliLiveError.invalidResponse
+        }
+        if code != 0 {
+            let kind: BilibiliDiagnosticErrorKind = code == -101 ? .auth :
+                (code == 60043 || code == 60024) ? .faceAuth : .api
+            record(kind, http: http.statusCode, api: code)
             if code == -101 { throw BilibiliLiveError.notLoggedIn }
             if code == 60043 || code == 60024 {
                 let data = root["data"] as? [String: Any]
@@ -370,7 +398,42 @@ public struct BilibiliLiveClient: Sendable {
             }
             throw BilibiliLiveError.api(code: code, message: root["message"] as? String ?? root["msg"] as? String ?? "Bilibili 接口返回失败")
         }
+        record(http: http.statusCode, api: code)
         return root
+    }
+
+    private func diagnosticStage(_ url: URL) -> BilibiliDiagnosticStage {
+        switch url.path {
+        case endpoints.areaListURL.path: return .areas
+        case endpoints.liveVersionURL.path: return .version
+        case endpoints.upstreamURL.path: return .upstream
+        case "/room/v1/Room/startLive": return .start
+        case "/room/v1/Room/stopLive": return .stop
+        case "/x/report/click/now": return .serverTime
+        case endpoints.roomInfoURL.path, endpoints.roomIDByUIDURL.path,
+             endpoints.liveInfoURL.path, "/room/v1/Room/get_info": return .room
+        default: return .http
+        }
+    }
+
+    private static func apiCode(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
+              abs(number.doubleValue) <= Double(Int32.max) else { return nil }
+        return number.intValue
+    }
+
+    static func retryAfterSeconds(_ value: String?, now: Date = Date()) -> Int? {
+        guard let value else { return nil }
+        if let seconds = Int(value.trimmingCharacters(in: .whitespaces)), seconds >= 0 {
+            return min(seconds, 86400)
+        }
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.timeZone = TimeZone(secondsFromGMT: 0)
+        format.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = format.date(from: value) else { return nil }
+        return min(86400, max(0, Int(date.timeIntervalSince(now).rounded(.up))))
     }
 
     private func fetchServerTimestamp() async -> String {
