@@ -1,7 +1,7 @@
-# OBS component used by LiveHime macOS v0.1.1
+# OBS component used by LiveHime macOS v0.1.2
 
 The local development bundle uses an OBS Studio checkout as an internal,
-separately launched backend. The exact checkout used during v0.1.1 development
+separately launched backend. The exact checkout used during v0.1.2 development
 was:
 
 - Repository: https://github.com/obsproject/obs-studio

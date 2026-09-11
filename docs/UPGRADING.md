@@ -1,6 +1,6 @@
 # 升级 LiveHime macOS
 
-从 `v0.1.0` 升级到 `v0.1.1` 不需要重新登录，也不需要导出账号数据。两个正式版本保持同一个
+从 `v0.1.0` 或 `v0.1.1` 升级到 `v0.1.2` 不需要重新登录，也不需要导出账号数据。这些正式版本保持同一个
 `CFBundleIdentifier`（`local.livehime.macos`）和同一个 Keychain service（
 `local.livehime.macos.session`）。因此替换 `/Applications/LiveHimeMacApp.app` 时，macOS
 会继续使用原来的登录会话；默认 WebKit 数据目录也按同一个应用身份保留。
@@ -21,7 +21,7 @@ OBS 用户配置。升级脚本只移动目标 App 本身，成功后临时回�
 
 ```sh
 macos-livehime-adapter/scripts/install-release-app.sh \
-  /path/to/LiveHimeMacApp-v0.1.1.app
+  /path/to/LiveHimeMacApp-v0.1.2.app
 ```
 
 默认目标是 `/Applications/LiveHimeMacApp.app`，也可以传入第二个参数指定其他安装位置。脚本会：

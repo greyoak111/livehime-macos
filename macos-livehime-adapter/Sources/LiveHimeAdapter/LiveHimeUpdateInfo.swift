@@ -8,5 +8,5 @@ import Foundation
 /// one click away.
 public enum LiveHimeUpdateInfo {
     public static let releasesURL = URL(string: "https://github.com/greyoak111/livehime-macos/releases")!
-    public static let currentVersion = "0.1.1"
+    public static let currentVersion = "0.1.2"
 }

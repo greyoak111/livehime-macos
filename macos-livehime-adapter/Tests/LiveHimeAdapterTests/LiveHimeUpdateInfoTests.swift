@@ -11,6 +11,6 @@ final class LiveHimeUpdateInfoTests: XCTestCase {
     }
 
     func testCurrentVersionMatchesStableRelease() {
-        XCTAssertEqual(LiveHimeUpdateInfo.currentVersion, "0.1.1")
+        XCTAssertEqual(LiveHimeUpdateInfo.currentVersion, "0.1.2")
     }
 }

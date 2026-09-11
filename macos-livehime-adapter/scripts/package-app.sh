@@ -7,7 +7,7 @@ swift build -c release --product LiveHimeMacApp
 app="${LIVEHIME_APP_PATH:-$package_dir/dist/LiveHimeMacApp.app}"
 bundle_id="${LIVEHIME_BUNDLE_ID:-local.livehime.macos}"
 bundle_name="${LIVEHIME_BUNDLE_NAME:-LiveHime macOS}"
-bundle_version="${LIVEHIME_BUNDLE_VERSION:-0.1.1}"
+bundle_version="${LIVEHIME_BUNDLE_VERSION:-0.1.2}"
 # Do not rewrite a mapped executable or its signature while macOS is using
 # that bundle for privacy decisions. Build may finish, packaging must wait.
 if pgrep -f "^$app/Contents/MacOS/LiveHimeMacApp" >/dev/null; then
