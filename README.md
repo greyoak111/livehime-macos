@@ -21,6 +21,14 @@ Bilibili 直播功能的本地路径，尤其方便部分账号在 Bilibili 侧�
 它不读取真实账号或启动 OBS。测试路径、诊断输出、公开页面观察和合并条件见
 [兼容性实验室说明](docs/COMPATIBILITY_LAB.md)。这不是新的正式 Release。
 
+更新候选包前可运行只读预检：
+
+```sh
+python3 scripts/bundle-update-safety.py inspect /path/to/Candidate.app
+```
+
+预检通过不会自动替换已安装版本；它只确认包身份、签名、运行状态和敏感文件边界。
+
 ## v0.1.0 包含内容
 
 - AppKit + WKWebView 原生 macOS 宿主，目标 macOS 13+、Apple Silicon arm64。

@@ -40,6 +40,28 @@ cd /Users/sunxifeng/livehime-macos-compat-lab
 scripts/test-compatibility.sh
 ```
 
+## 更新前只读安全检查
+
+在任何未来安装器出现之前，先对候选包做预检。它不会改变文件系统：
+
+```sh
+python3 scripts/bundle-update-safety.py inspect \
+  macos-livehime-adapter/dist/LiveHimeCompatLab.app
+
+# 只对本地测试 fixture 跳过签名检查；正式候选包不要使用这个选项
+python3 scripts/bundle-update-safety.py --skip-signature inspect \
+  macos-livehime-adapter/dist/LiveHimeCompatLab.app
+
+python3 scripts/bundle-update-safety.py compare OLD.app NEW.app
+```
+
+预检会拒绝 Bundle 内的 symlink、私有/凭据目录和 Cookie/Token/Session/密钥文件，确认
+宿主与嵌套 OBS 的 Bundle 身份不同，并检测两个进程的精确可执行路径。运行中的任一组件
+都会得到 `blocked`；检测通过也只表示“可以进入人工审阅”，不会自动安装。
+
+候选包的版本、主程序和嵌套 OBS 变化会得到 `review_required`。当前生产更新仍未实现，
+因此不会因为预检通过就触碰 `/Applications` 或已安装的 v0.1.0。
+
 Swift 测试包含真实 WKWebView 中的 JavaScript Promise、原生异步回复、旧桥接事件和
 Origin 策略测试；Bilibili HTTP 使用 URLProtocol 截获全部请求；OBS 使用本机随机端口
 上的 WebSocket fixture。测试不会向 Bilibili 登录或开关播，也不会连接已安装 OBS 的端口。
