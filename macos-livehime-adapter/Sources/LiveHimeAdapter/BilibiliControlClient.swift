@@ -17,6 +17,7 @@ public enum BilibiliControlError: Error, Equatable {
     case invalidResponse
     case api(code: Int, message: String)
     case notLoggedIn
+    case http(status: Int, retryAfterSeconds: Int?)
     case transport
 }
 
@@ -34,9 +35,10 @@ public struct BilibiliControlClient: Sendable {
         request.httpMethod = "GET"
         request.timeoutInterval = 12
         let started = Date()
-        func record(_ kind: BilibiliDiagnosticErrorKind? = nil, http: Int? = nil, api: Int? = nil, network: Int? = nil) {
+        func record(_ kind: BilibiliDiagnosticErrorKind? = nil, http: Int? = nil, api: Int? = nil, network: Int? = nil, retry: Int? = nil) {
             diagnostics?.record(.init(stage: .identity, httpStatus: http, apiCode: api, networkCode: network,
-                durationMilliseconds: Int(max(0, Date().timeIntervalSince(started)) * 1000), errorKind: kind))
+                durationMilliseconds: Int(max(0, Date().timeIntervalSince(started)) * 1000), errorKind: kind,
+                retryAfterSeconds: retry))
         }
         request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
         // Match the browser-like headers used by the Windows CEF host. A
@@ -56,7 +58,9 @@ public struct BilibiliControlClient: Sendable {
             record(.schema); throw BilibiliControlError.invalidResponse
         }
         guard (200..<300).contains(http.statusCode) else {
-            record(.http, http: http.statusCode); throw BilibiliControlError.transport
+            let retry = BilibiliLiveClient.retryAfterSeconds(http.value(forHTTPHeaderField: "Retry-After"))
+            record(.http, http: http.statusCode, retry: retry)
+            throw BilibiliControlError.http(status: http.statusCode, retryAfterSeconds: retry)
         }
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let number = root["code"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
