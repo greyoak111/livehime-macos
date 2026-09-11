@@ -892,9 +892,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private func clearBilibiliWebData(completion: @escaping () -> Void) {
         let store = webView.configuration.websiteDataStore
         store.httpCookieStore.getAllCookies { cookies in
-            let bilibiliCookies = cookies.filter { $0.domain.contains("bilibili.com") }
             let deletionGroup = DispatchGroup()
-            for cookie in bilibiliCookies {
+            // This WebView is dedicated to the Bilibili login and face-auth
+            // pages. Clear every cookie in its store rather than relying on a
+            // domain suffix filter; SMS login can leave host-only cookies on
+            // passport/live subdomains that otherwise restore the old account.
+            for cookie in cookies {
                 deletionGroup.enter()
                 store.httpCookieStore.delete(cookie) {
                     deletionGroup.leave()
@@ -906,11 +909,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             // next account screen during a fast account switch.
             deletionGroup.notify(queue: .main) {
                 store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
-                    let recordsToRemove = records.filter { record in
-                        let name = record.displayName.lowercased()
-                        return name.contains("bilibili") || name.contains("biliapi")
-                    }
-                    store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: recordsToRemove) {
+                    // The store is owned by this app's login WebView, so a
+                    // full record purge also removes localStorage,
+                    // IndexedDB, service-worker state and cached login data.
+                    store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: records) {
                         DispatchQueue.main.async { completion() }
                     }
                 }
