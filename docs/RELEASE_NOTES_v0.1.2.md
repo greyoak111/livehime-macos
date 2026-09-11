@@ -8,11 +8,12 @@ LiveHime macOS v0.1.2 is an unofficial third-party macOS adaptation of the Bilib
 - Keeps the update boundary explicit: the app does not download, replace, terminate OBS, or restart itself in the background.
 - Documents a seamless replacement path for users of v0.1.0 and v0.1.1. The production Bundle ID and Keychain service remain stable, so Finder replacement preserves the login session, WebKit data and user OBS configuration.
 - Adds a guarded installer script that checks the production Bundle ID and code signature, refuses to replace running LiveHime/OBS, stages the candidate, and restores the previous app if replacement fails.
+- Adds a standard arm64 DMG with an Applications shortcut for users who are not familiar with dragging a `.app` bundle from a zip.
 - Retains the stable OBS output gating, stop/logout safety and proxy-route diagnostics from v0.1.1.
 
 ## Upgrade
 
-Download the arm64 zip from [GitHub Releases](https://github.com/greyoak111/livehime-macos/releases), stop LiveHime and its bundled OBS, and choose Replace in `/Applications` for the `LiveHimeMacApp.app` inside the archive. The v0.1.2 archive already uses the stable app name; older versioned archives should be renamed before replacement. Do not delete Keychain, WebKit, or Application Support data. Full instructions are in [`docs/UPGRADING.md`](UPGRADING.md).
+Download the arm64 DMG from [GitHub Releases](https://github.com/greyoak111/livehime-macos/releases), stop LiveHime and its bundled OBS, open the DMG, and drag LiveHime onto the Applications shortcut. The zip remains available as an alternative; its v0.1.2 archive already uses the stable app name. Do not delete Keychain, WebKit, or Application Support data. Full instructions are in [`docs/UPGRADING.md`](UPGRADING.md).
 
 ## Validation
 
