@@ -517,6 +517,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                         self.setControlStatus("已登录：\(identity.username)")
                     }
                     self.loadRoomSummary(identity: identity, cookieHeader: header)
+                } catch let error as BilibiliControlError {
+                    if attempt < 5 {
+                        try? await Task.sleep(for: .milliseconds(500))
+                        self?.loadIdentityFromWebViewCookies(attempt: attempt + 1, promoteCookieSession: promoteCookieSession)
+                    } else {
+                        await MainActor.run { self?.setControlStatus(self?.controlErrorMessage(error) ?? "登录已保存，身份读取失败（可稍后重试）") }
+                    }
                 } catch {
                     if attempt < 5 {
                         try? await Task.sleep(for: .milliseconds(500))
@@ -526,6 +533,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     }
                 }
             }
+        }
+    }
+
+    private func controlErrorMessage(_ error: BilibiliControlError) -> String {
+        switch error {
+        case .notLoggedIn:
+            return "登录已保存，但网页会话尚未被 Bilibili 认可"
+        case .http(let status, let retryAfter):
+            if let retryAfter { return "登录已保存，身份接口暂时限流（HTTP \(status)，约 \(retryAfter) 秒后重试）" }
+            return "登录已保存，身份接口暂时不可用（HTTP \(status)）"
+        case .api(_, let message):
+            return "登录已保存，身份接口返回失败：\(message)"
+        case .invalidResponse:
+            return "登录已保存，但身份接口返回格式异常"
+        case .transport:
+            return "登录已保存，但身份接口暂时无法连接"
         }
     }
 
