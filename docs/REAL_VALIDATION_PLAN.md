@@ -9,12 +9,12 @@
 1. 使用独立验证 Bundle ID 重新打包并通过只读 Bundle 预检。示例：
 
    ```sh
-   cd /Users/sunxifeng/livehime-macos-compat-lab/macos-livehime-adapter
+   cd "$WORKTREE/macos-livehime-adapter"
    LIVEHIME_APP_PATH="$PWD/dist/LiveHimeMacAppValidation.app" \
    LIVEHIME_BUNDLE_ID="local.livehime.macos.validation" \
    LIVEHIME_BUNDLE_NAME="LiveHime macOS Validation" \
    LIVEHIME_BUNDLE_VERSION="0.1.0-validation" \
-   OBS_APP_SOURCE="/Users/sunxifeng/哔哩哔哩直播姬/obs-studio/build_macos/frontend/RelWithDebInfo/OBS.app" \
+   OBS_APP_SOURCE="/path/to/obs-studio/build_macos/frontend/RelWithDebInfo/OBS.app" \
    ./scripts/package-app.sh
    ./scripts/verify-bundle.sh dist/LiveHimeMacAppValidation.app
    ```

@@ -1,7 +1,8 @@
 # 兼容性测试分支与维护路线
 
-本轮使用独立 Git worktree：`/Users/sunxifeng/livehime-macos-compat-lab`，分支
-`codex/compatibility-hardening`，从 `ee56fb5` 建立。原工作目录的 `main`、已安装应用和
+本轮使用独立 Git worktree（下文以 `$WORKTREE` 表示；执行命令前请将它设置为当前
+worktree 的实际路径），分支
+`codex/compatibility-hardening`，从历史基线建立。原工作目录的 `main`、已安装应用和
 v0.1.0 Release 保留为基线。这条分支尚未合并、推送或发布。
 
 ## 为什么采用独立路径
@@ -16,7 +17,7 @@ OBS 存储规则没有全部重新设计。因此本轮只运行独立的 **Live
 ## 运行离线测试 App
 
 ```sh
-cd /Users/sunxifeng/livehime-macos-compat-lab
+cd "$WORKTREE"
 macos-livehime-adapter/scripts/package-compat-lab.sh
 open macos-livehime-adapter/dist/LiveHimeCompatLab.app
 ```
@@ -36,7 +37,7 @@ open macos-livehime-adapter/dist/LiveHimeCompatLab.app
 ## 一次运行全部离线回归
 
 ```sh
-cd /Users/sunxifeng/livehime-macos-compat-lab
+cd "$WORKTREE"
 scripts/test-compatibility.sh
 ```
 
