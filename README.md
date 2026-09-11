@@ -34,6 +34,15 @@ python3 scripts/bundle-update-safety.py inspect /path/to/Candidate.app
 
 ## v0.1.1 包含内容
 
+### 从旧版本升级
+
+正式版从 v0.1.0 起保持 `local.livehime.macos` Bundle ID 和
+`local.livehime.macos.session` Keychain service。用户直接从
+[Releases](https://github.com/greyoak111/livehime-macos/releases) 下载最新 arm64 zip，退出
+LiveHime/内置 OBS 后把新 App 拖进“应用程序”并选择替换即可保留登录态和 OBS 用户配置。
+不要删除 Keychain、WebKit 或 Application Support 数据；需要脚本化安装时使用
+[`docs/UPGRADING.md`](docs/UPGRADING.md) 中的安全替换脚本。
+
 - AppKit + WKWebView 原生 macOS 宿主，目标 macOS 13+、Apple Silicon arm64。
 - 承接 Bilibili 官方 mini-login 页面，支持账号密码、二维码、短信、图片验证码/极验、
   二次验证和开播所需的人脸验证页面；应用不自动完成或绕过这些验证。
@@ -62,6 +71,32 @@ scripts/verify-bundle.sh
 `Contents/Resources/OBS.app`。当前公开仓库不包含生成的 `.app`、Windows 安装包、
 Bilibili 客户端 DLL/CEF 文件、账号数据、日志或本地签名密钥。OBS 的精确源码版本和
 构建信息见 [`ThirdPartyLicenses/OBS/BUILD-INFO.md`](ThirdPartyLicenses/OBS/BUILD-INFO.md)。
+
+## 已安装用户如何升级
+
+v0.1.0 和 v0.1.1 使用同一个正式 Bundle ID（`local.livehime.macos`）。因此，升级不需要
+重新登录，也不需要手工导出 Cookie 或直播配置。macOS 的 Keychain 会按应用身份保留登录
+会话，WKWebView 的 Bilibili 网站数据也会在替换应用目录后继续使用。
+
+推荐按下面的顺序升级：
+
+1. 先停止直播，并在 LiveHime 主界面确认 OBS 已停止输出；升级过程中不要替换正在运行的
+   LiveHime 或内置 OBS。
+2. 从 [GitHub Releases](https://github.com/greyoak111/livehime-macos/releases) 下载最新的
+   `LiveHimeMacApp-*-arm64.zip`，双击解压。
+3. 退出旧版 LiveHime，然后把解压出的 `LiveHimeMacApp.app` 拖到 `/Applications`，Finder
+   提示时选择“替换”。这是同一个应用身份的覆盖安装，不会删除 Keychain 登录会话、网站
+   Cookie 或应用外的 OBS 配置。
+4. 从“应用程序”重新打开 LiveHime。若 macOS 首次运行提示隐私权限，按提示重新确认；
+   这属于系统对新代码签名的权限检查，不代表账号数据丢失。
+
+主界面的“检查更新”按钮会打开上面的 Releases 页面，便于查看最新版本和校验信息。它只
+负责导航，不会在后台下载、替换应用或重启 OBS；下载后仍按上述步骤手动替换。这样可以在
+未公证的开发签名包环境下保留用户对文件来源、权限提示和回滚的控制。
+
+如果旧版不是从本项目构建、Bundle ID 被改成了其他值，或者用户主动删除了 Keychain/网站
+数据，则无法保证无缝恢复；这时需要重新登录。替换前保留旧 `.app` 副本即可回滚到旧版本，
+但回滚时也必须先退出 LiveHime 和内置 OBS。
 
 ## 已知限制
 
