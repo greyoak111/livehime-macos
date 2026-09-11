@@ -12,7 +12,7 @@ LiveHime macOS v0.1.2 is an unofficial third-party macOS adaptation of the Bilib
 
 ## Upgrade
 
-Download the arm64 zip from [GitHub Releases](https://github.com/greyoak111/livehime-macos/releases), stop LiveHime and its bundled OBS, rename the versioned app to `LiveHimeMacApp.app`, and choose Replace in `/Applications`. Do not delete Keychain, WebKit, or Application Support data. Full instructions are in [`docs/UPGRADING.md`](UPGRADING.md).
+Download the arm64 zip from [GitHub Releases](https://github.com/greyoak111/livehime-macos/releases), stop LiveHime and its bundled OBS, and choose Replace in `/Applications` for the `LiveHimeMacApp.app` inside the archive. The v0.1.2 archive already uses the stable app name; older versioned archives should be renamed before replacement. Do not delete Keychain, WebKit, or Application Support data. Full instructions are in [`docs/UPGRADING.md`](UPGRADING.md).
 
 ## Validation
 

@@ -39,8 +39,9 @@ python3 scripts/bundle-update-safety.py inspect /path/to/Candidate.app
 正式版从 v0.1.0 起保持 `local.livehime.macos` Bundle ID 和
 `local.livehime.macos.session` Keychain service。用户直接从
 [Releases](https://github.com/greyoak111/livehime-macos/releases) 下载最新 arm64 zip，退出
-LiveHime/内置 OBS 后把解压出的版本化 App 重命名为 `LiveHimeMacApp.app`，再拖进“应用程序”并
-选择替换即可保留登录态和 OBS 用户配置。不要让版本化文件名与旧 App 并存，否则可能误开旧版本。
+LiveHime/内置 OBS 后把其中的 `LiveHimeMacApp.app` 拖进“应用程序”并选择替换即可保留登录态和
+OBS 用户配置。当前 v0.1.2 zip 已固定使用这个名称；如果旧资产解压后带版本号，先重命名为
+`LiveHimeMacApp.app`，不要让两个同 Bundle ID 的副本并存。
 不要删除 Keychain、WebKit 或 Application Support 数据；同 Bundle ID 覆盖安装不会清理这些
 数据。需要脚本化安装时使用
 [`docs/UPGRADING.md`](docs/UPGRADING.md) 中的安全替换脚本。

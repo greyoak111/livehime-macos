@@ -9,9 +9,9 @@
 
 1. 在 [Releases](https://github.com/greyoak111/livehime-macos/releases) 下载最新的
    `LiveHimeMacApp-<version>-arm64.zip`。
-2. 解压得到 `LiveHimeMacApp-<version>.app`，退出 LiveHime 和内置 OBS。
-3. 如果解压后的文件名带版本号，先把它重命名为 `LiveHimeMacApp.app`，再拖入“应用程序”；
-   Finder 询问替换时选择“替换”，然后从“应用程序”启动。这样不会因为文件名不同而在“应用程序”里留下两个副本。
+2. 退出 LiveHime 和内置 OBS，解压下载的 zip。当前 v0.1.2 zip 内的 App 已经命名为 `LiveHimeMacApp.app`。
+3. 将它拖入“应用程序”，Finder 询问替换时选择“替换”，然后从“应用程序”启动。
+   如果使用旧版资产且解压后的文件名带版本号，先重命名为 `LiveHimeMacApp.app`，避免留下两个副本。
 
 替换前不要删除旧 App，也不要在终端里清空 `~/Library/Keychains`、
 `~/Library/WebKit` 或 `~/Library/Application Support`。这些位置保存了登录会话、网页状态和
