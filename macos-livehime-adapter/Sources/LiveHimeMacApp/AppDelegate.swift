@@ -807,6 +807,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             showRestartMessage("当前有直播操作正在进行，请完成后再退出登录。")
             return
         }
+        // A live OBS output without a confirmed room is an unsafe logout
+        // state: endLiveNow needs the room id to send Bilibili's stop request.
+        // Do not enter the pending-logout state and leave the account stuck;
+        // refresh the room summary first so the next attempt can close both
+        // sides and then clear the session.
+        if obsStreaming && currentRoom == nil {
+            showRestartMessage("OBS 仍在推流，但当前直播间尚未确认。请先刷新 OBS 状态和直播间信息，再退出登录。")
+            refreshOBSStatus()
+            return
+        }
         if obsStreaming || currentRoom?.liveStatus == 1 {
             pendingLogout = true
             pendingLogoutRoomConfirmed = false
