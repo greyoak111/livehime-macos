@@ -866,14 +866,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let store = webView.configuration.websiteDataStore
         store.httpCookieStore.getAllCookies { cookies in
             let bilibiliCookies = cookies.filter { $0.domain.contains("bilibili.com") }
-            for cookie in bilibiliCookies { store.httpCookieStore.delete(cookie) }
-            store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
-                let recordsToRemove = records.filter { record in
-                    let name = record.displayName.lowercased()
-                    return name.contains("bilibili") || name.contains("biliapi")
+            let deletionGroup = DispatchGroup()
+            for cookie in bilibiliCookies {
+                deletionGroup.enter()
+                store.httpCookieStore.delete(cookie) {
+                    deletionGroup.leave()
                 }
-                store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: recordsToRemove) {
-                    DispatchQueue.main.async { completion() }
+            }
+            // WKHTTPCookieStore deletion is asynchronous. Wait for every
+            // cookie completion before removing website records and loading
+            // the login page, otherwise the old SESSDATA can repopulate the
+            // next account screen during a fast account switch.
+            deletionGroup.notify(queue: .main) {
+                store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
+                    let recordsToRemove = records.filter { record in
+                        let name = record.displayName.lowercased()
+                        return name.contains("bilibili") || name.contains("biliapi")
+                    }
+                    store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: recordsToRemove) {
+                        DispatchQueue.main.async { completion() }
+                    }
                 }
             }
         }
