@@ -1257,7 +1257,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     private func loadLoginPage() {
         let url = URL(string: "https://live.bilibili.com/p/html/live-pc-blink/mini-login-v2/")!
-        webView.load(URLRequest(url: url))
+        var request = URLRequest(url: url)
+        // A sign-out must not resurrect the previous account from WebKit's
+        // in-memory page/cache state after the cookie store has been cleared.
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        webView.load(request)
     }
 }
 
