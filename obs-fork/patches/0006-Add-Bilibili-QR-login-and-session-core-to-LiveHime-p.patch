@@ -1,0 +1,2656 @@
+From 1c991c049cd1e197af31ab2c817c1ded71d855f8 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 23:14:21 +0800
+Subject: [PATCH 06/26] Add Bilibili QR login and session core to LiveHime
+ plugin
+
+plugins/livehime/core is a Swift package (unit-tested with `swift test`)
+compiled into the plugin: v0.1.2's identity and live-room clients, plus a
+QR login client, a versioned Keychain credential store that recognizes
+v0.1.2 items and migrates their WebKit cookies, and a SessionCoordinator.
+The coordinator only reports "ready" after identity and room load, and
+only returns to "signed out" when Bilibili rejects the login; network or
+API errors stay in "failed" with the login kept and a retry offered.
+
+The dock gains an account section driven by the core's state through a
+small C interface. The automation vendor adds GetAccountState,
+StartQRLogin and CancelQRLogin; LIVEHIME_KEYCHAIN_SERVICE lets tests use
+an isolated Keychain item.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  11 +
+ build-aux/livehime/tests/e2e-account.mjs      |  20 +
+ plugins/livehime/CMakeLists.txt               |  33 +-
+ plugins/livehime/core/.gitignore              |   2 +
+ plugins/livehime/core/Package.swift           |  15 +
+ .../LiveHimeCore/BilibiliControlClient.swift  |  89 ++++
+ .../LiveHimeCore/BilibiliLiveClient.swift     | 476 ++++++++++++++++++
+ .../core/Sources/LiveHimeCore/CBridge.swift   | 106 ++++
+ .../LiveHimeCore/CredentialStore.swift        | 116 +++++
+ .../Sources/LiveHimeCore/Diagnostics.swift    | 102 ++++
+ .../LiveHimeCore/PlatformSupport.swift        |  44 ++
+ .../core/Sources/LiveHimeCore/QRLogin.swift   | 135 +++++
+ .../LiveHimeCore/SessionCoordinator.swift     | 240 +++++++++
+ .../BilibiliControlClientTests.swift          | 127 +++++
+ .../BilibiliLiveClientTests.swift             | 139 +++++
+ .../LiveHimeCoreTests/DiagnosticsTests.swift  | 158 ++++++
+ .../SessionCoordinatorTests.swift             | 213 ++++++++
+ plugins/livehime/core/include/livehime-core.h |  26 +
+ plugins/livehime/data/locale/en-US.ini        |  17 +
+ plugins/livehime/data/locale/zh-CN.ini        |  17 +
+ plugins/livehime/src/account-panel.cpp        | 184 +++++++
+ plugins/livehime/src/account-panel.hpp        |  47 ++
+ plugins/livehime/src/automation.cpp           |  33 ++
+ plugins/livehime/src/livehime-dock.cpp        |   7 +
+ plugins/livehime/src/livehime-dock.hpp        |   3 +
+ 25 files changed, 2358 insertions(+), 2 deletions(-)
+ create mode 100644 build-aux/livehime/tests/e2e-account.mjs
+ create mode 100644 plugins/livehime/core/.gitignore
+ create mode 100644 plugins/livehime/core/Package.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/BilibiliControlClient.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/CredentialStore.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/Diagnostics.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/PlatformSupport.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/QRLogin.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/BilibiliControlClientTests.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/BilibiliLiveClientTests.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/DiagnosticsTests.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+ create mode 100644 plugins/livehime/core/include/livehime-core.h
+ create mode 100644 plugins/livehime/src/account-panel.cpp
+ create mode 100644 plugins/livehime/src/account-panel.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 976752e47..77030c468 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -12,3 +12,14 @@ the user's own stream service is restored.
+    `ffmpeg -listen 1 -i rtmp://127.0.0.1:19350/live/test-key-123 -c copy -f flv -y /tmp/received.flv`
+ 3. Launch `LiveHime.app`, then run `node e2e-stream.mjs <websocket password>`
+    (Node 22+ for the built-in WebSocket).
++
++## Account (QR login) check
++
++`e2e-account.mjs` checks restore → QR code → cancel against the real
++Bilibili QR endpoints without logging in. Launch with an isolated Keychain
++item so the real login is never touched:
++
++```sh
++open --env LIVEHIME_KEYCHAIN_SERVICE=local.livehime.macos.e2e-test build_macos/frontend/RelWithDebInfo/LiveHime.app
++node e2e-account.mjs <websocket password>
++```
+diff --git a/build-aux/livehime/tests/e2e-account.mjs b/build-aux/livehime/tests/e2e-account.mjs
+new file mode 100644
+index 000000000..cb4f1dd8b
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-account.mjs
+@@ -0,0 +1,20 @@
++import { createHash } from 'node:crypto';
++const sha=(s)=>createHash('sha256').update(s).digest('base64'); const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
++const ws=new WebSocket('ws://127.0.0.1:4466'); let id=1; const pend=new Map(); let fails=0;
++const check=(n,ok,i='')=>{ if(!ok) fails++; console.log(`${ok?'PASS':'FAIL'}  ${n}${i?'  — '+i:''}`); };
++const req=(t,d={})=>new Promise(r=>{const k=String(id++);pend.set(k,r);ws.send(JSON.stringify({op:6,d:{requestType:t,requestId:k,requestData:d}}));});
++const vendor=async(t,d={})=>{const r=await req('CallVendorRequest',{vendorName:'livehime',requestType:t,requestData:d});return r.requestStatus.result?r.responseData.responseData:{error:r.requestStatus.comment};};
++const wait=async(want,ms)=>{const end=Date.now()+ms;let s;while(Date.now()<end){s=await vendor('GetAccountState');if(want.includes(s.state))return s;await sleep(250);}return s;};
++ws.onmessage=async(ev)=>{const m=JSON.parse(ev.data);
++ if(m.op===0){const {challenge,salt}=m.d.authentication;ws.send(JSON.stringify({op:1,d:{rpcVersion:1,authentication:sha(sha(process.argv[2]+salt)+challenge),eventSubscriptions:0}}));}
++ else if(m.op===7) pend.get(m.d.requestId)?.(m.d);
++ else if(m.op===2){
++  for(let i=0;i<40&&!(await req('GetVersion')).requestStatus.result;i++) await sleep(500);
++  const s0=await wait(['signedOut','failed','ready'],10000); check('restores to signedOut with empty test keychain', s0.state==='signedOut', JSON.stringify(s0));
++  await vendor('StartQRLogin');
++  const s1=await wait(['qrCode','failed'],10000); check('QR code generated from Bilibili', s1.state==='qrCode'&&s1.hasQr===true&&s1.scanned===false, JSON.stringify(s1));
++  await sleep(3500);
++  const s2=await vendor('GetAccountState'); check('still waiting for scan after polling', s2.state==='qrCode', s2.state);
++  await vendor('CancelQRLogin');
++  const s3=await wait(['signedOut'],5000); check('cancel returns to signedOut', s3.state==='signedOut');
++  console.log(fails? `${fails} failed`:'all passed'); process.exit(fails?1:0);}};
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 3b84db969..9ab68af91 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -8,6 +8,17 @@ add_library(OBS::livehime ALIAS livehime)
+ target_sources(
+   livehime
+   PRIVATE
++    core/include/livehime-core.h
++    core/Sources/LiveHimeCore/BilibiliControlClient.swift
++    core/Sources/LiveHimeCore/BilibiliLiveClient.swift
++    core/Sources/LiveHimeCore/CBridge.swift
++    core/Sources/LiveHimeCore/CredentialStore.swift
++    core/Sources/LiveHimeCore/Diagnostics.swift
++    core/Sources/LiveHimeCore/PlatformSupport.swift
++    core/Sources/LiveHimeCore/QRLogin.swift
++    core/Sources/LiveHimeCore/SessionCoordinator.swift
++    src/account-panel.cpp
++    src/account-panel.hpp
+     src/automation.cpp
+     src/automation.hpp
+     src/livehime-dock.cpp
+@@ -17,11 +28,29 @@ target_sources(
+     src/stream-controller.hpp
+ )
+ 
+-target_compile_options(livehime PRIVATE $<$<PLATFORM_ID:Darwin>:-Wno-quoted-include-in-framework-header>)
++target_compile_options(
++  livehime
++  PRIVATE "$<$<AND:$<PLATFORM_ID:Darwin>,$<COMPILE_LANGUAGE:C,CXX>>:-Wno-quoted-include-in-framework-header>"
++)
+ 
+ # Header-only vendor API; resolved at runtime through obs-websocket's proc handler.
+ target_include_directories(livehime PRIVATE "${CMAKE_SOURCE_DIR}/plugins/obs-websocket/lib")
+ 
+-target_link_libraries(livehime PRIVATE OBS::frontend-api OBS::libobs Qt::Widgets)
++target_include_directories(livehime PRIVATE core/include)
++
++target_link_libraries(
++  livehime
++  PRIVATE
++    OBS::frontend-api
++    OBS::libobs
++    Qt::Widgets
++    "$<LINK_LIBRARY:FRAMEWORK,CoreImage.framework>"
++    "$<LINK_LIBRARY:FRAMEWORK,Security.framework>"
++    "$<LINK_LIBRARY:FRAMEWORK,WebKit.framework>"
++)
+ 
+ set_target_properties_obs(livehime PROPERTIES FOLDER plugins/livehime PREFIX "" AUTOMOC ON)
++
++# The Swift session core (core/) is compiled into the plugin; it is also a
++# standalone Swift package for `swift test`.
++set_target_xcode_properties(livehime PROPERTIES SWIFT_VERSION 5.0 SWIFT_MODULE_NAME LiveHimeCore)
+diff --git a/plugins/livehime/core/.gitignore b/plugins/livehime/core/.gitignore
+new file mode 100644
+index 000000000..2d9f16e2d
+--- /dev/null
++++ b/plugins/livehime/core/.gitignore
+@@ -0,0 +1,2 @@
++.build/
++.swiftpm/
+diff --git a/plugins/livehime/core/Package.swift b/plugins/livehime/core/Package.swift
+new file mode 100644
+index 000000000..daaa4c555
+--- /dev/null
++++ b/plugins/livehime/core/Package.swift
+@@ -0,0 +1,15 @@
++// swift-tools-version: 5.9
++// Bilibili session, room and live-control core for the LiveHime OBS plugin.
++// The plugin's CMake build compiles the same sources; this manifest exists so
++// the core can be unit-tested on its own with `swift test`.
++import PackageDescription
++
++let package = Package(
++    name: "LiveHimeCore",
++    platforms: [.macOS(.v13)],
++    products: [.library(name: "LiveHimeCore", targets: ["LiveHimeCore"])],
++    targets: [
++        .target(name: "LiveHimeCore"),
++        .testTarget(name: "LiveHimeCoreTests", dependencies: ["LiveHimeCore"])
++    ]
++)
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliControlClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliControlClient.swift
+new file mode 100644
+index 000000000..f997a7d17
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliControlClient.swift
+@@ -0,0 +1,89 @@
++import Foundation
++import CoreFoundation
++
++public struct BilibiliIdentity: Equatable, Sendable {
++    public let mid: Int64
++    public let username: String
++    public let isLogin: Bool
++
++    public init(mid: Int64, username: String, isLogin: Bool) {
++        self.mid = mid
++        self.username = username
++        self.isLogin = isLogin
++    }
++}
++
++public enum BilibiliControlError: Error, Equatable {
++    case invalidResponse
++    case api(code: Int, message: String)
++    case notLoggedIn
++    case http(status: Int, retryAfterSeconds: Int?)
++    case transport
++}
++
++/// Cookie-authenticated, read-only first step after the official login page.
++public struct BilibiliControlClient: Sendable {
++    public let session: URLSession
++
++    public let diagnostics: BilibiliDiagnosticStore?
++    public init(session: URLSession = .shared, diagnostics: BilibiliDiagnosticStore? = nil) {
++        self.session = session; self.diagnostics = diagnostics
++    }
++
++    public func fetchIdentity(cookieHeader: String) async throws -> BilibiliIdentity {
++        var request = URLRequest(url: URL(string: "https://api.bilibili.com/x/web-interface/nav")!)
++        request.httpMethod = "GET"
++        request.timeoutInterval = 12
++        let started = Date()
++        func record(_ kind: BilibiliDiagnosticErrorKind? = nil, http: Int? = nil, api: Int? = nil, network: Int? = nil, retry: Int? = nil) {
++            diagnostics?.record(.init(stage: .identity, httpStatus: http, apiCode: api, networkCode: network,
++                durationMilliseconds: Int(max(0, Date().timeIntervalSince(started)) * 1000), errorKind: kind,
++                retryAfterSeconds: retry))
++        }
++        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
++        // Match the browser-like headers used by the Windows CEF host. A
++        // bespoke UA is more likely to be treated as an unsupported client by
++        // the nav endpoint after a risk-control login.
++        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
++        request.setValue("https://www.bilibili.com/", forHTTPHeaderField: "Referer")
++        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
++        let (data, response): (Data, URLResponse)
++        do { (data, response) = try await session.data(for: request) }
++        catch {
++            let network = error as? URLError
++            record(network?.code == .timedOut ? .timeout : network?.code == .cancelled ? .cancelled : .transport, network: network?.errorCode)
++            throw BilibiliControlError.transport
++        }
++        guard let http = response as? HTTPURLResponse else {
++            record(.schema); throw BilibiliControlError.invalidResponse
++        }
++        guard (200..<300).contains(http.statusCode) else {
++            let retry = BilibiliLiveClient.retryAfterSeconds(http.value(forHTTPHeaderField: "Retry-After"))
++            record(.http, http: http.statusCode, retry: retry)
++            throw BilibiliControlError.http(status: http.statusCode, retryAfterSeconds: retry)
++        }
++        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let number = root["code"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
++              number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
++              abs(number.doubleValue) <= Double(Int32.max) else {
++            record(.schema, http: http.statusCode); throw BilibiliControlError.invalidResponse
++        }
++        let code = number.intValue
++        guard code == 0 else {
++            record(code == -101 ? .auth : .api, http: http.statusCode, api: code)
++            if code == -101 { throw BilibiliControlError.notLoggedIn }
++            throw BilibiliControlError.api(code: code, message: "身份接口返回失败")
++        }
++        guard let body = root["data"] as? [String: Any], let isLogin = body["isLogin"] as? Bool else {
++            record(.schema, http: http.statusCode, api: code); throw BilibiliControlError.invalidResponse
++        }
++        guard isLogin else { record(.auth, http: http.statusCode, api: code); throw BilibiliControlError.notLoggedIn }
++        let mid: Int64
++        if let value = body["mid"] as? Int64 { mid = value }
++        else if let value = body["mid"] as? NSNumber { mid = value.int64Value }
++        else { mid = 0 }
++        guard mid > 0 else { record(.schema, http: http.statusCode, api: code); throw BilibiliControlError.invalidResponse }
++        record(http: http.statusCode, api: code)
++        return BilibiliIdentity(mid: mid, username: body["uname"] as? String ?? "", isLogin: true)
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+new file mode 100644
+index 000000000..8f383912c
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+@@ -0,0 +1,476 @@
++import Foundation
++import CryptoKit
++import CoreFoundation
++
++public struct BilibiliRoomInfo: Equatable, Sendable {
++    public let roomID: Int64
++    public let uid: Int64
++    public let shortRoomID: Int64
++    public let title: String
++    public let liveStatus: Int
++    public let areaID: Int
++
++    public init(roomID: Int64, uid: Int64 = 0, shortRoomID: Int64 = 0, title: String = "", liveStatus: Int = 0, areaID: Int = 0) {
++        self.roomID = roomID; self.uid = uid
++        self.shortRoomID = shortRoomID
++        self.title = title
++        self.liveStatus = liveStatus
++        self.areaID = areaID
++    }
++}
++
++public struct BilibiliLiveArea: Equatable, Sendable {
++    public let areaID: Int64
++    public let parentAreaID: Int64
++    public let name: String
++    public let parentName: String
++    public init(areaID: Int64, parentAreaID: Int64 = 0, name: String, parentName: String = "") {
++        self.areaID = areaID; self.parentAreaID = parentAreaID; self.name = name; self.parentName = parentName
++    }
++}
++
++public struct BilibiliLiveEndpoints: Equatable, Sendable {
++    public var roomInfoURL: URL
++    public var roomIDByUIDURL: URL
++    public var areaListURL: URL
++    public var upstreamURL: URL
++    public var liveVersionURL: URL
++    /// Legacy endpoint which resolves the authenticated user's room id.
++    /// Kept injectable so the fallback can be tested without hitting Bilibili.
++    public var liveInfoURL: URL
++    public init(roomInfoURL: URL = URL(string: "https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld")!,
++                roomIDByUIDURL: URL = URL(string: "https://api.live.bilibili.com/room/v2/Room/room_id_by_uid")!,
++                areaListURL: URL = URL(string: "https://api.live.bilibili.com/room/v1/Area/getList")!,
++                upstreamURL: URL = URL(string: "https://api.live.bilibili.com/xlive/app-blink/v1/live/GetUpStreamRtmp")!,
++                liveVersionURL: URL = URL(string: "https://api.live.bilibili.com/xlive/app-blink/v1/liveVersionInfo/getHomePageLiveVersion")!,
++                liveInfoURL: URL = URL(string: "https://api.live.bilibili.com/i/api/liveinfo")!) {
++        self.roomInfoURL = roomInfoURL; self.roomIDByUIDURL = roomIDByUIDURL; self.areaListURL = areaListURL; self.upstreamURL = upstreamURL; self.liveVersionURL = liveVersionURL; self.liveInfoURL = liveInfoURL
++    }
++}
++
++public struct BilibiliStreamConfig: Equatable, Sendable {
++    public let server: URL
++    public let key: String
++
++    public init(server: URL, key: String) {
++        self.server = server
++        self.key = key
++    }
++    public var address: String { server.absoluteString }
++    public var code: String { key }
++
++    public init(address: String, code: String) {
++        self.server = URL(string: address)!
++        self.key = code
++    }
++}
++
++public struct BilibiliLiveVersion: Equatable, Sendable {
++    public let version: String
++    public let build: Int
++    public init(version: String, build: Int) { self.version = version; self.build = build }
++}
++
++public enum BilibiliLiveError: Error, Equatable {
++    case invalidResponse
++    case api(code: Int, message: String)
++    case missingCSRF
++    case missingRoom
++    case transport
++    case network(code: Int)
++    case http(status: Int, retryAfterSeconds: Int?)
++    case notLoggedIn
++    case missingStreamConfig
++    case faceAuthRequired(voucher: String?)
++}
++
++/// Cookie-authenticated live-room operations. The mutating methods are kept
++/// explicit and are never called automatically by the login flow.
++public struct BilibiliLiveClient: Sendable {
++    public let session: URLSession
++    public let endpoints: BilibiliLiveEndpoints
++    public let diagnostics: BilibiliDiagnosticStore?
++    private let defaultCookieHeader: String
++
++    public init(session: URLSession = .shared, diagnostics: BilibiliDiagnosticStore? = nil) { self.session = session; self.endpoints = .init(); self.defaultCookieHeader = ""; self.diagnostics = diagnostics }
++    public init(cookieHeader: String, biliJct: String? = nil, session: URLSession = .shared,
++                endpoints: BilibiliLiveEndpoints = .init(), diagnostics: BilibiliDiagnosticStore? = nil) {
++        self.diagnostics = diagnostics
++        self.session = session; self.endpoints = endpoints
++        if let biliJct, !biliJct.isEmpty, !cookieHeader.contains("bili_jct=") {
++            self.defaultCookieHeader = cookieHeader + (cookieHeader.isEmpty ? "" : "; ") + "bili_jct=" + biliJct
++        } else { self.defaultCookieHeader = cookieHeader }
++    }
++
++    public func fetchCurrentRoom(mid: Int64) async throws -> BilibiliRoomInfo {
++        do {
++            let legacy = try await fetchRoomInfo(url: endpoints.roomInfoURL, query: [URLQueryItem(name: "mid", value: String(mid))], cookieHeader: defaultCookieHeader)
++            // getRoomInfoOld omits the v2 child-area id. Fetch the canonical
++            // record so startLive receives the required area_v2 value.
++            if legacy.areaID == 0 {
++                if let canonical = try? await fetchRoomInfo(roomID: legacy.roomID, cookieHeader: defaultCookieHeader), canonical.areaID != 0 {
++                    return canonical
++                }
++            }
++            return legacy
++        } catch BilibiliLiveError.missingRoom {
++            // The current web client resolves the anchor room through this
++            // endpoint. getRoomInfoOld can return an empty room_info object
++            // even for a valid account, which otherwise disables Start.
++            if let roomID = try? await resolveRoomIDByUID(mid: mid) {
++                return try await fetchRoomInfo(roomID: roomID, cookieHeader: defaultCookieHeader)
++            }
++            // Some accounts return an empty `room_info` from getRoomInfoOld
++            // until the live page has been opened. The authenticated legacy
++            // endpoint still knows the room id, so resolve it and fetch the
++            // canonical room record as a fallback.
++            let roomID = try await resolveCurrentRoom(cookieHeader: defaultCookieHeader)
++            return try await fetchRoomInfo(roomID: roomID, cookieHeader: defaultCookieHeader)
++        }
++    }
++
++    public func resolveRoomIDByUID(mid: Int64) async throws -> Int64 {
++        let root = try await requestJSON(
++            url: withQuery(endpoints.roomIDByUIDURL, [URLQueryItem(name: "uid", value: String(mid))]),
++            cookieHeader: defaultCookieHeader,
++            body: nil
++        )
++        let data = root["data"] as? [String: Any]
++        let roomID = int64(data?["room_id"] ?? root["room_id"])
++        guard roomID > 0 else { throw BilibiliLiveError.missingRoom }
++        return roomID
++    }
++
++    public func fetchAreas(parentID: Int64? = nil, platform: String = "pc_link") async throws -> [BilibiliLiveArea] {
++        var query = [URLQueryItem(name: "platform", value: platform)]
++        if let parentID { query.append(URLQueryItem(name: "parent_id", value: String(parentID))) }
++        let root = try await requestJSON(url: withQuery(endpoints.areaListURL, query), cookieHeader: defaultCookieHeader, body: nil)
++        guard let data = root["data"] else { throw BilibiliLiveError.invalidResponse }
++        var list: [[String: Any]] = []
++        func flatten(_ value: Any, inheritedParentID: Int64 = 0, inheritedParentName: String = "") {
++            if let items = value as? [[String: Any]] {
++                items.forEach { flatten($0, inheritedParentID: inheritedParentID, inheritedParentName: inheritedParentName) }
++                return
++            }
++            guard let d = value as? [String: Any] else { return }
++            let childValues = ["list", "area_list", "children", "areas"].compactMap { d[$0] }
++            let ownID = int64(d["id"] ?? d["area_id"])
++            let ownName = d["name"] as? String ?? d["area_name"] as? String ?? ""
++            // Parent areas are containers only. `startLive.area_v2` must use
++            // a leaf/sub-area id; exposing a parent id (for example “网游”)
++            // produces Bilibili's generic -400 request error.
++            if childValues.isEmpty,
++               (d["id"] != nil || d["area_id"] != nil),
++               d["name"] != nil || d["area_name"] != nil {
++                var leaf = d
++                if leaf["parent_id"] == nil && leaf["parent_area_id"] == nil && inheritedParentID > 0 {
++                    leaf["parent_id"] = inheritedParentID
++                }
++                if leaf["parent_name"] == nil && leaf["parent_area_name"] == nil && !inheritedParentName.isEmpty {
++                    leaf["parent_name"] = inheritedParentName
++                }
++                list.append(leaf)
++            }
++            childValues.forEach {
++                flatten($0,
++                        inheritedParentID: ownID > 0 ? ownID : inheritedParentID,
++                        inheritedParentName: !ownName.isEmpty ? ownName : inheritedParentName)
++            }
++        }
++        flatten(data)
++        guard !list.isEmpty else { throw BilibiliLiveError.invalidResponse }
++        return list.compactMap { d in
++            let id = int64(d["id"] ?? d["area_id"]); guard id > 0, let name = d["name"] as? String ?? d["area_name"] as? String else { return nil }
++            return BilibiliLiveArea(areaID: id, parentAreaID: int64(d["parent_id"] ?? d["parent_area_id"]), name: name, parentName: d["parent_name"] as? String ?? d["parent_area_name"] as? String ?? "")
++        }
++    }
++
++    /// Returns the current LiveHime-compatible client version/build markers
++    /// required by startLive on accounts that reject stale hard-coded values.
++    public func fetchLiveVersion() async throws -> BilibiliLiveVersion {
++        let root = try await requestJSON(
++            url: withQuery(endpoints.liveVersionURL, [URLQueryItem(name: "system_version", value: "2")]),
++            cookieHeader: defaultCookieHeader,
++            body: nil
++        )
++        let data = root["data"] as? [String: Any] ?? root
++        let version = data["curr_version"] as? String ?? data["version"] as? String ?? ""
++        let build = int(data["build"])
++        guard !version.isEmpty, build > 0 else { throw BilibiliLiveError.invalidResponse }
++        return BilibiliLiveVersion(version: version, build: build)
++    }
++
++    public func fetchUpstream(roomID: Int64? = nil) async throws -> BilibiliStreamConfig {
++        var query: [URLQueryItem] = [URLQueryItem(name: "platform", value: "pc_link")]
++        if let roomID { query.append(URLQueryItem(name: "room_id", value: String(roomID))) }
++        let root = try await requestJSON(url: withQuery(endpoints.upstreamURL, query), cookieHeader: defaultCookieHeader, body: nil)
++        return try parseStreamConfig(root, stage: .upstream)
++    }
++
++    public func resolveCurrentRoom(cookieHeader: String) async throws -> Int64 {
++        let root = try await requestJSON(
++            url: endpoints.liveInfoURL,
++            cookieHeader: cookieHeader,
++            body: nil
++        )
++        func findRoomID(_ value: Any?) -> Int64? {
++            if let dict = value as? [String: Any] {
++                // Prefer explicit room keys. `id` is accepted only when it is
++                // nested under room_info/live_info to avoid treating an area
++                // or unrelated object id as a room id.
++                for key in ["roomid", "room_id", "roomId"] {
++                    let id = int64(dict[key]); if id > 0 { return id }
++                }
++                for key in ["room_info", "live_info", "room", "data"] {
++                    if let id = findRoomID(dict[key]) { return id }
++                }
++                if dict["room_id"] == nil, dict["roomid"] == nil,
++                   (dict["room_info"] != nil || dict["live_info"] != nil),
++                   let id = int64(dict["id"]) as Int64?, id > 0 { return id }
++                for child in dict.values { if let id = findRoomID(child) { return id } }
++            } else if let array = value as? [Any] {
++                for child in array { if let id = findRoomID(child) { return id } }
++            }
++            return nil
++        }
++        if let roomID = findRoomID(root["data"]) { return roomID }
++        throw BilibiliLiveError.missingRoom
++    }
++
++    public func fetchRoomInfo(roomID: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo {
++        var components = URLComponents(string: "https://api.live.bilibili.com/room/v1/Room/get_info")!
++        components.queryItems = [URLQueryItem(name: "room_id", value: String(roomID))]
++        let root = try await requestJSON(url: components.url!, cookieHeader: cookieHeader, body: nil)
++        guard let data = root["data"] as? [String: Any],
++              int64(data["room_id"]) == roomID,
++              let liveStatus = Self.apiCode(data["live_status"] ?? data["liveStatus"]),
++              [0, 1, 2].contains(liveStatus) else {
++            diagnostics?.record(.init(stage: .room, operation: .parse, errorKind: .schema))
++            throw BilibiliLiveError.invalidResponse
++        }
++        return BilibiliRoomInfo(
++            roomID: roomID,
++            uid: int64(data["uid"]),
++            shortRoomID: int64(data["short_id"]),
++            title: data["title"] as? String ?? "",
++            liveStatus: liveStatus,
++            areaID: int(data["area_v2_id"] ?? data["area_id"])
++        )
++    }
++
++    public func startLive(roomID: Int64, areaID: Int, parentAreaID: Int64 = 0, cookieHeader: String) async throws -> BilibiliStreamConfig {
++        let csrf = try csrf(from: cookieHeader)
++        // Use the current markers from the same endpoint as the web client;
++        // retain the known values as a transient-network fallback.
++        let liveVersion = try? await fetchLiveVersion()
++        let version = liveVersion?.version ?? "8.6.0"
++        let build = String(liveVersion?.build ?? 11050)
++        // The current Windows/web flow uses the server clock and places these
++        // eight fields on the POST query string in insertion order. Keep that
++        // exact order for the app signature; extra fields (such as
++        // csrf_token/backup_stream) make newer accounts reject the request.
++        let values = [
++            ("appkey", "aae92bc66f3edfab"), ("area_v2", String(areaID)),
++            ("build", build), ("csrf", csrf), ("platform", "pc_link"),
++            ("room_id", String(roomID)), ("ts", await fetchServerTimestamp()),
++            ("version", version)
++        ]
++        let unsigned = formString(values)
++        let signedValues = values + [("sign", md5Hex(unsigned + "af125a0d5279fd576c1b4418a3e8276d"))]
++        let query = signedValues.map { URLQueryItem(name: $0.0, value: $0.1) }
++        let root = try await requestJSON(
++            url: withQuery(URL(string: "https://api.live.bilibili.com/room/v1/Room/startLive")!, query),
++            cookieHeader: cookieHeader, body: nil, httpMethod: "POST"
++        )
++        return try parseStreamConfig(root, stage: .start)
++    }
++
++    public func stopLive(roomID: Int64, cookieHeader: String) async throws {
++        let csrf = try csrf(from: cookieHeader)
++        let body = form([("room_id", String(roomID)), ("platform", "pc_link"), ("csrf", csrf), ("csrf_token", csrf)])
++        _ = try await requestJSON(
++            url: URL(string: "https://api.live.bilibili.com/room/v1/Room/stopLive")!,
++            cookieHeader: cookieHeader, body: body
++        )
++    }
++
++    public static func parseStreamConfig(from data: Data) throws -> BilibiliStreamConfig {
++        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BilibiliLiveError.invalidResponse }
++        guard let code = Self.apiCode(root["code"]) else { throw BilibiliLiveError.invalidResponse }
++        if code != 0 {
++            if code == -101 { throw BilibiliLiveError.notLoggedIn }
++            if code == 60043 || code == 60024 {
++                let data = root["data"] as? [String: Any]
++                let risk = data?["risk_extra"] as? [String: Any]
++                throw BilibiliLiveError.faceAuthRequired(voucher: risk?["v_voucher"] as? String)
++            }
++            throw BilibiliLiveError.api(code: code, message: root["message"] as? String ?? root["msg"] as? String ?? "Bilibili 接口返回失败")
++        }
++        return try parseStreamConfig(root)
++    }
++
++    private static func parseStreamConfig(_ root: [String: Any]) throws -> BilibiliStreamConfig {
++        func scan(_ value: Any?) -> (String, String)? {
++            if let d = value as? [String: Any] {
++                let a = d["addr"] as? String ?? d["server"] as? String ?? d["rtmp_addr"] as? String
++                let k = d["code"] as? String ?? d["key"] as? String ?? d["stream_code"] as? String
++                if let a, let k, !a.isEmpty, !k.isEmpty { return (a, k) }
++                for v in d.values { if let x = scan(v) { return x } }
++            } else if let a = value as? [Any] { for v in a { if let x = scan(v) { return x } } }
++            return nil
++        }
++        guard let pair = scan(root["data"]), let server = URL(string: pair.0),
++              ["rtmp", "rtmps"].contains(server.scheme?.lowercased() ?? ""),
++              let host = server.host, !host.isEmpty else { throw BilibiliLiveError.missingStreamConfig }
++        return BilibiliStreamConfig(server: server, key: pair.1)
++    }
++
++    private func parseStreamConfig(_ root: [String: Any], stage: BilibiliDiagnosticStage) throws -> BilibiliStreamConfig {
++        do { return try Self.parseStreamConfig(root) }
++        catch {
++            diagnostics?.record(.init(stage: stage, operation: .parse, errorKind: .schema))
++            throw error
++        }
++    }
++
++    private func fetchRoomInfo(url: URL, query: [URLQueryItem], cookieHeader: String) async throws -> BilibiliRoomInfo {
++        let root = try await requestJSON(url: withQuery(url, query), cookieHeader: cookieHeader, body: nil)
++        guard let data = root["data"] as? [String: Any] else { throw BilibiliLiveError.missingRoom }
++        let d = data["room_info"] as? [String: Any] ?? data
++        // getRoomInfoOld uses the legacy `roomid`/`roomname` names while
++        // get_info uses `room_id`/`title`; accept both response shapes.
++        let rid = int64(d["room_id"] ?? d["roomid"]); guard rid > 0 else { throw BilibiliLiveError.missingRoom }
++        return BilibiliRoomInfo(roomID: rid, uid: int64(d["uid"]), shortRoomID: int64(d["short_id"]), title: d["title"] as? String ?? d["roomname"] as? String ?? "", liveStatus: int(d["live_status"] ?? d["liveStatus"]), areaID: int(d["area_v2_id"] ?? d["area_id"]))
++    }
++
++    private func withQuery(_ url: URL, _ query: [URLQueryItem]) -> URL { var c = URLComponents(url: url, resolvingAgainstBaseURL: false)!; c.queryItems = query; return c.url! }
++
++    private func requestJSON(url: URL, cookieHeader: String, body: Data?, httpMethod: String? = nil) async throws -> [String: Any] {
++        var request = URLRequest(url: url)
++        request.timeoutInterval = 12
++        request.httpMethod = httpMethod ?? (body == nil ? "GET" : "POST")
++        request.httpBody = body
++        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
++        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
++        // Match the Origin header emitted by the official LiveHime web
++        // client. Some live endpoints reject otherwise well-formed native
++        // requests before they reach CSRF validation.
++        request.setValue("https://api.live.bilibili.com", forHTTPHeaderField: "Origin")
++        request.setValue("https://live.bilibili.com/", forHTTPHeaderField: "Referer")
++        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
++        if body != nil { request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type") }
++        let started = Date()
++        let stage = diagnosticStage(url)
++        let operation: BilibiliDiagnosticOperation = request.httpMethod == "POST" ? .mutate : .request
++        func record(_ kind: BilibiliDiagnosticErrorKind? = nil, http: Int? = nil, api: Int? = nil, retry: Int? = nil, network: Int? = nil) {
++            diagnostics?.record(.init(stage: stage, operation: operation, httpStatus: http,
++                apiCode: api, networkCode: network, durationMilliseconds: Int(max(0, Date().timeIntervalSince(started)) * 1000),
++                errorKind: kind, retryAfterSeconds: retry))
++        }
++        let data: Data
++        let response: URLResponse
++        do { (data, response) = try await session.data(for: request) }
++        catch let error as URLError {
++            record(error.code == .cancelled ? .cancelled : error.code == .timedOut ? .timeout : .transport, network: error.errorCode)
++            throw BilibiliLiveError.network(code: error.errorCode)
++        } catch { record(.transport); throw BilibiliLiveError.transport }
++        guard let http = response as? HTTPURLResponse else {
++            record(.schema); throw BilibiliLiveError.invalidResponse
++        }
++        guard (200..<300).contains(http.statusCode) else {
++            let retry = Self.retryAfterSeconds(http.value(forHTTPHeaderField: "Retry-After"))
++            record(.http, http: http.statusCode, retry: retry)
++            throw BilibiliLiveError.http(status: http.statusCode, retryAfterSeconds: retry)
++        }
++        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let code = Self.apiCode(root["code"]) else {
++            record(.schema, http: http.statusCode); throw BilibiliLiveError.invalidResponse
++        }
++        if code != 0 {
++            let kind: BilibiliDiagnosticErrorKind = code == -101 ? .auth :
++                (code == 60043 || code == 60024) ? .faceAuth : .api
++            record(kind, http: http.statusCode, api: code)
++            if code == -101 { throw BilibiliLiveError.notLoggedIn }
++            if code == 60043 || code == 60024 {
++                let data = root["data"] as? [String: Any]
++                let risk = data?["risk_extra"] as? [String: Any]
++                throw BilibiliLiveError.faceAuthRequired(voucher: risk?["v_voucher"] as? String)
++            }
++            throw BilibiliLiveError.api(code: code, message: root["message"] as? String ?? root["msg"] as? String ?? "Bilibili 接口返回失败")
++        }
++        record(http: http.statusCode, api: code)
++        return root
++    }
++
++    private func diagnosticStage(_ url: URL) -> BilibiliDiagnosticStage {
++        switch url.path {
++        case endpoints.areaListURL.path: return .areas
++        case endpoints.liveVersionURL.path: return .version
++        case endpoints.upstreamURL.path: return .upstream
++        case "/room/v1/Room/startLive": return .start
++        case "/room/v1/Room/stopLive": return .stop
++        case "/x/report/click/now": return .serverTime
++        case endpoints.roomInfoURL.path, endpoints.roomIDByUIDURL.path,
++             endpoints.liveInfoURL.path, "/room/v1/Room/get_info": return .room
++        default: return .http
++        }
++    }
++
++    private static func apiCode(_ value: Any?) -> Int? {
++        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
++              number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
++              abs(number.doubleValue) <= Double(Int32.max) else { return nil }
++        return number.intValue
++    }
++
++    static func retryAfterSeconds(_ value: String?, now: Date = Date()) -> Int? {
++        guard let value else { return nil }
++        if let seconds = Int(value.trimmingCharacters(in: .whitespaces)), seconds >= 0 {
++            return min(seconds, 86400)
++        }
++        let format = DateFormatter()
++        format.locale = Locale(identifier: "en_US_POSIX")
++        format.timeZone = TimeZone(secondsFromGMT: 0)
++        format.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
++        guard let date = format.date(from: value) else { return nil }
++        return min(86400, max(0, Int(date.timeIntervalSince(now).rounded(.up))))
++    }
++
++    private func fetchServerTimestamp() async -> String {
++        guard let url = URL(string: "https://api.bilibili.com/x/report/click/now") else {
++            return String(Int(Date().timeIntervalSince1970))
++        }
++        do {
++            let root = try await requestJSON(url: url, cookieHeader: defaultCookieHeader, body: nil)
++            if let data = root["data"] as? [String: Any] {
++                let value = int64(data["now"])
++                if value > 0 { return String(value) }
++            }
++        } catch { }
++        return String(Int(Date().timeIntervalSince1970))
++    }
++
++    private func csrf(from cookieHeader: String) throws -> String {
++        for part in cookieHeader.split(separator: ";") {
++            let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
++            if pair.count == 2 && pair[0].trimmingCharacters(in: .whitespaces) == "bili_jct" && !pair[1].isEmpty { return pair[1] }
++        }
++        throw BilibiliLiveError.missingCSRF
++    }
++
++    private func form(_ values: [(String, String)]) -> Data {
++        Data(formString(values).utf8)
++    }
++
++    private func formString(_ values: [(String, String)]) -> String {
++        let allowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "+&="))
++        return values.map { "\($0.0.addingPercentEncoding(withAllowedCharacters: allowed) ?? $0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: allowed) ?? $0.1)" }.joined(separator: "&")
++    }
++
++    private func md5Hex(_ string: String) -> String {
++        Insecure.MD5.hash(data: Data(string.utf8)).map { String(format: "%02x", $0) }.joined()
++    }
++
++    private func int(_ value: Any?) -> Int { (value as? NSNumber)?.intValue ?? (value as? String).flatMap(Int.init) ?? 0 }
++    private func int64(_ value: Any?) -> Int64 { (value as? NSNumber)?.int64Value ?? (value as? String).flatMap(Int64.init) ?? 0 }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+new file mode 100644
+index 000000000..fc721f735
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -0,0 +1,106 @@
++import Foundation
++
++/// C entry points for the Qt plugin (declared in include/livehime-core.h).
++///
++/// The plugin calls these on the main thread. State changes are delivered as
++/// a JSON object through the registered callback, also on the main thread.
++/// The JSON never contains cookies or tokens.
++public typealias LiveHimeStateCallback = @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void
++
++@MainActor
++final class CoreBridge {
++    static var shared: CoreBridge?
++
++    let coordinator: SessionCoordinator
++    var callback: LiveHimeStateCallback?
++    var context: UnsafeMutableRawPointer?
++
++    init(coordinator: SessionCoordinator) {
++        self.coordinator = coordinator
++        coordinator.onChange = { [weak self] state in self?.publish(state) }
++    }
++
++    func publish(_ state: SessionState) {
++        guard let callback else { return }
++        let json = Self.json(for: state)
++        json.withCString { callback($0, context) }
++    }
++
++    static func json(for state: SessionState) -> String {
++        var object: [String: Any] = [:]
++        switch state {
++        case .signedOut(let notice):
++            object["state"] = "signedOut"
++            if let notice { object["notice"] = notice.rawValue }
++        case .qrCode(let url, let scanned):
++            object["state"] = "qrCode"
++            object["scanned"] = scanned
++            if let png = QRImage.png(for: url) { object["qrPng"] = png.base64EncodedString() }
++        case .verifying:
++            object["state"] = "verifying"
++        case .ready(let account):
++            object["state"] = "ready"
++            object["mid"] = account.mid
++            object["username"] = account.username
++            object["roomId"] = account.room.roomID
++            object["shortRoomId"] = account.room.shortRoomID
++            object["title"] = account.room.title
++            object["liveStatus"] = account.room.liveStatus
++            object["areaId"] = account.room.areaID
++        case .failed(let notice, let detail):
++            object["state"] = "failed"
++            object["notice"] = notice.rawValue
++            object["detail"] = detail
++        }
++        let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data("{}".utf8)
++        return String(decoding: data, as: UTF8.self)
++    }
++}
++
++private func onMain(_ body: @escaping @MainActor () -> Void) {
++    if Thread.isMainThread {
++        MainActor.assumeIsolated { body() }
++    } else {
++        DispatchQueue.main.async { MainActor.assumeIsolated { body() } }
++    }
++}
++
++/// Creates the session core, registers the state callback and restores any
++/// saved login. `keychain_service` may be NULL for the default service.
++@_cdecl("livehime_core_start")
++public func livehime_core_start(_ keychainService: UnsafePointer<CChar>?,
++                                _ callback: LiveHimeStateCallback?, _ context: UnsafeMutableRawPointer?) {
++    let service = keychainService.map { String(cString: $0) } ?? KeychainCredentialStore.defaultService
++    onMain {
++        let coordinator = SessionCoordinator(api: LiveBilibiliAccountAPI(),
++                                             store: KeychainCredentialStore(service: service),
++                                             importer: WebKitLegacyImporter())
++        let bridge = CoreBridge(coordinator: coordinator)
++        bridge.callback = callback
++        bridge.context = context
++        CoreBridge.shared = bridge
++        bridge.publish(coordinator.state)
++        coordinator.restore()
++    }
++}
++
++@_cdecl("livehime_core_stop")
++public func livehime_core_stop() {
++    onMain {
++        CoreBridge.shared?.callback = nil
++        CoreBridge.shared?.coordinator.cancelQRLogin()
++        CoreBridge.shared = nil
++    }
++}
++
++@_cdecl("livehime_core_start_qr_login")
++public func livehime_core_start_qr_login() { onMain { CoreBridge.shared?.coordinator.startQRLogin() } }
++
++@_cdecl("livehime_core_cancel_qr_login")
++public func livehime_core_cancel_qr_login() { onMain { CoreBridge.shared?.coordinator.cancelQRLogin() } }
++
++@_cdecl("livehime_core_retry")
++public func livehime_core_retry() { onMain { CoreBridge.shared?.coordinator.retry() } }
++
++@_cdecl("livehime_core_sign_out")
++public func livehime_core_sign_out() { onMain { CoreBridge.shared?.coordinator.signOut() } }
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CredentialStore.swift b/plugins/livehime/core/Sources/LiveHimeCore/CredentialStore.swift
+new file mode 100644
+index 000000000..77d88e2c3
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CredentialStore.swift
+@@ -0,0 +1,116 @@
++import Foundation
++import Security
++
++/// What the store found. `legacy` is a v0.1.2 item: it holds only an opaque
++/// refresh token or a bare SESSDATA value, while the rest of that session
++/// lived in the old app's WebKit cookie store.
++public enum StoredCredentials: Equatable, Sendable {
++    case none
++    case current(SessionCredentials)
++    case legacy(refreshToken: String?, sessdata: String?)
++}
++
++public protocol CredentialStore: Sendable {
++    func load() throws -> StoredCredentials
++    func save(_ credentials: SessionCredentials) throws
++    func remove() throws
++}
++
++public enum CredentialStoreError: Error, Equatable {
++    case keychain(OSStatus)
++    case encoding
++}
++
++/// Versioned envelope so later schema changes can be detected explicitly.
++struct CredentialEnvelope: Codable {
++    static let currentVersion = 2
++    var schemaVersion: Int
++    var credentials: SessionCredentials
++}
++
++/// v0.1.2's `StoredLoginSession`, decoded only for migration.
++struct LegacyStoredLoginSession: Codable {
++    let type: String?
++    let refreshToken: String
++}
++
++func decodeStoredCredentials(_ data: Data) -> StoredCredentials {
++    let decoder = JSONDecoder()
++    if let envelope = try? decoder.decode(CredentialEnvelope.self, from: data),
++       envelope.schemaVersion == CredentialEnvelope.currentVersion {
++        return .current(envelope.credentials)
++    }
++    if let legacy = try? decoder.decode(LegacyStoredLoginSession.self, from: data), !legacy.refreshToken.isEmpty {
++        // v0.1.2 stored the SESSDATA cookie in `refreshToken` for type "cookie".
++        return legacy.type == "cookie" ? .legacy(refreshToken: nil, sessdata: legacy.refreshToken)
++                                       : .legacy(refreshToken: legacy.refreshToken, sessdata: nil)
++    }
++    // Unknown data is treated as signed out rather than as a crash or a
++    // silent partial session.
++    return .none
++}
++
++/// Keeps the whole session in one Keychain item. The service name is the one
++/// v0.1.2 used, so an upgrade finds the previous login.
++public final class KeychainCredentialStore: CredentialStore, @unchecked Sendable {
++    public static let defaultService = "local.livehime.macos.session"
++    private let service: String
++    private let account: String
++
++    public init(service: String = KeychainCredentialStore.defaultService, account: String = "default") {
++        self.service = service
++        self.account = account
++    }
++
++    private var query: [String: Any] {
++        [kSecClass as String: kSecClassGenericPassword,
++         kSecAttrService as String: service,
++         kSecAttrAccount as String: account]
++    }
++
++    public func load() throws -> StoredCredentials {
++        var request = query
++        request[kSecReturnData as String] = true
++        request[kSecMatchLimit as String] = kSecMatchLimitOne
++        var result: CFTypeRef?
++        let status = SecItemCopyMatching(request as CFDictionary, &result)
++        if status == errSecItemNotFound { return .none }
++        guard status == errSecSuccess else { throw CredentialStoreError.keychain(status) }
++        guard let data = result as? Data else { return .none }
++        return decodeStoredCredentials(data)
++    }
++
++    public func save(_ credentials: SessionCredentials) throws {
++        guard let data = try? JSONEncoder().encode(
++            CredentialEnvelope(schemaVersion: CredentialEnvelope.currentVersion, credentials: credentials)) else {
++            throw CredentialStoreError.encoding
++        }
++        let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
++        if status == errSecItemNotFound {
++            var item = query
++            item[kSecValueData as String] = data
++            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
++            let added = SecItemAdd(item as CFDictionary, nil)
++            guard added == errSecSuccess else { throw CredentialStoreError.keychain(added) }
++        } else if status != errSecSuccess {
++            throw CredentialStoreError.keychain(status)
++        }
++    }
++
++    public func remove() throws {
++        let status = SecItemDelete(query as CFDictionary)
++        guard status == errSecSuccess || status == errSecItemNotFound else {
++            throw CredentialStoreError.keychain(status)
++        }
++    }
++}
++
++/// In-memory store for tests.
++public final class MemoryCredentialStore: CredentialStore, @unchecked Sendable {
++    private let lock = NSLock()
++    private var stored: StoredCredentials
++    public init(_ initial: StoredCredentials = .none) { stored = initial }
++    public func load() throws -> StoredCredentials { lock.withLock { stored } }
++    public func save(_ credentials: SessionCredentials) throws { lock.withLock { stored = .current(credentials) } }
++    public func remove() throws { lock.withLock { stored = .none } }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/Diagnostics.swift b/plugins/livehime/core/Sources/LiveHimeCore/Diagnostics.swift
+new file mode 100644
+index 000000000..7ec09ff72
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/Diagnostics.swift
+@@ -0,0 +1,102 @@
++import Foundation
++
++public enum BilibiliDiagnosticStage: String, Codable, Sendable {
++    case room
++    case identity
++    case areas
++    case version
++    case upstream
++    case start
++    case stop
++    case serverTime
++    case http
++    case webBridge
++    case loginPage
++    case faceAuthPage
++}
++
++public enum BilibiliDiagnosticOperation: String, Codable, Sendable {
++    case request
++    case parse
++    case resolve
++    case mutate
++    case callback
++    case navigation
++}
++
++public enum BilibiliDiagnosticErrorKind: String, Codable, Sendable {
++    case transport
++    case http
++    case schema
++    case api
++    case auth
++    case eligibility
++    case faceAuth
++    case cancelled
++    case timeout
++    case unsupported
++    case untrusted
++}
++
++/// A deliberately small, export-safe diagnostic record. It never stores URL,
++/// request body, response text, cookies, tokens, stream keys, or server prose.
++public struct BilibiliDiagnosticEvent: Codable, Equatable, Sendable {
++    public let timestamp: Date
++    public let stage: BilibiliDiagnosticStage
++    public let operation: BilibiliDiagnosticOperation
++    public let httpStatus: Int?
++    public let apiCode: Int?
++    public let networkCode: Int?
++    public let durationMilliseconds: Int
++    public let errorKind: BilibiliDiagnosticErrorKind?
++    public let retryAfterSeconds: Int?
++
++    public init(timestamp: Date = Date(), stage: BilibiliDiagnosticStage,
++                operation: BilibiliDiagnosticOperation = .request,
++                httpStatus: Int? = nil, apiCode: Int? = nil, networkCode: Int? = nil,
++                durationMilliseconds: Int = 0,
++                errorKind: BilibiliDiagnosticErrorKind? = nil,
++                retryAfterSeconds: Int? = nil) {
++        self.timestamp = timestamp
++        self.stage = stage
++        self.operation = operation
++        self.httpStatus = httpStatus
++        self.apiCode = apiCode
++        self.networkCode = networkCode
++        self.durationMilliseconds = max(0, durationMilliseconds)
++        self.errorKind = errorKind
++        self.retryAfterSeconds = retryAfterSeconds
++    }
++}
++
++/// Thread-safe bounded in-memory diagnostics. The default capacity is small so
++/// diagnostics cannot become a persistent activity log or contain credentials.
++public final class BilibiliDiagnosticStore: @unchecked Sendable {
++    private let lock = NSLock()
++    private let capacity: Int
++    private var events: [BilibiliDiagnosticEvent] = []
++
++    public init(capacity: Int = 128) {
++        self.capacity = max(1, capacity)
++        self.events.reserveCapacity(self.capacity)
++    }
++
++    public func record(_ event: BilibiliDiagnosticEvent) {
++        lock.lock()
++        defer { lock.unlock() }
++        events.append(event)
++        if events.count > capacity { events.removeFirst(events.count - capacity) }
++    }
++
++    public func snapshot() -> [BilibiliDiagnosticEvent] {
++        lock.lock()
++        defer { lock.unlock() }
++        return events
++    }
++
++    public func clear() {
++        lock.lock()
++        events.removeAll(keepingCapacity: true)
++        lock.unlock()
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/PlatformSupport.swift b/plugins/livehime/core/Sources/LiveHimeCore/PlatformSupport.swift
+new file mode 100644
+index 000000000..56cb90742
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/PlatformSupport.swift
+@@ -0,0 +1,44 @@
++import CoreImage
++import Foundation
++import ImageIO
++import UniformTypeIdentifiers
++import WebKit
++
++/// Reads the bilibili.com cookies that v0.1.2 kept in its WebKit store. The
++/// store belongs to the bundle identifier, so an upgraded app with the same
++/// identifier sees the previous login.
++public struct WebKitLegacyImporter: LegacySessionImporter {
++    public init() {}
++
++    @MainActor
++    public func importCookies() async -> [String: String] {
++        let all = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
++        var cookies: [String: String] = [:]
++        for cookie in all where cookie.domain.hasSuffix("bilibili.com") {
++            cookies[cookie.name] = cookie.value
++        }
++        return cookies
++    }
++}
++
++enum QRImage {
++    /// Renders `text` as a QR code PNG with a quiet zone, `pixels` wide.
++    static func png(for text: String, pixels: Int = 480) -> Data? {
++        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
++        filter.setValue(Data(text.utf8), forKey: "inputMessage")
++        filter.setValue("M", forKey: "inputCorrectionLevel")
++        guard let code = filter.outputImage else { return nil }
++        let modules = code.extent.width + 8 // four-module quiet zone on each side
++        let scale = (CGFloat(pixels) / modules).rounded(.down)
++        let scaled = code.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
++            .transformed(by: CGAffineTransform(translationX: 4 * scale, y: 4 * scale))
++        let canvas = CGRect(x: 0, y: 0, width: modules * scale, height: modules * scale)
++        let image = scaled.composited(over: CIImage(color: .white).cropped(to: canvas))
++        let context = CIContext(options: [.useSoftwareRenderer: false])
++        guard let cg = context.createCGImage(image, from: canvas) else { return nil }
++        let out = NSMutableData()
++        guard let dest = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil) else { return nil }
++        CGImageDestinationAddImage(dest, cg, nil)
++        return CGImageDestinationFinalize(dest) ? out as Data : nil
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/QRLogin.swift b/plugins/livehime/core/Sources/LiveHimeCore/QRLogin.swift
+new file mode 100644
+index 000000000..3024d2ce7
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/QRLogin.swift
+@@ -0,0 +1,135 @@
++import Foundation
++
++/// Web session material for one Bilibili account. `cookies` holds only the
++/// bilibili.com cookies the live APIs need; values are secrets and must never
++/// be logged or exported through diagnostics.
++public struct SessionCredentials: Codable, Equatable, Sendable {
++    public static let requiredCookies = ["SESSDATA", "bili_jct", "DedeUserID"]
++    static let keptCookies: Set<String> = ["SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid", "buvid3"]
++
++    public var cookies: [String: String]
++    public var refreshToken: String
++    public var savedAt: Date
++
++    public init(cookies: [String: String], refreshToken: String, savedAt: Date = Date()) {
++        self.cookies = cookies.filter { Self.keptCookies.contains($0.key) && !$0.value.isEmpty }
++        self.refreshToken = refreshToken
++        self.savedAt = savedAt
++    }
++
++    public var isComplete: Bool { Self.requiredCookies.allSatisfy { cookies[$0] != nil } }
++    public var mid: Int64? { cookies["DedeUserID"].flatMap(Int64.init) }
++    public var csrf: String? { cookies["bili_jct"] }
++    /// Deterministic order keeps requests reproducible in tests.
++    public var cookieHeader: String {
++        cookies.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
++    }
++}
++
++public enum QRLoginPoll: Equatable, Sendable {
++    case waitingForScan
++    case scanned
++    case expired
++    case succeeded(SessionCredentials)
++}
++
++public enum QRLoginError: Error, Equatable {
++    case invalidResponse
++    case api(code: Int, message: String)
++    case incompleteCredentials
++    case network(code: Int)
++    case http(status: Int)
++}
++
++/// Bilibili's public web QR login (the same endpoints the official
++/// mini-login page uses). No captcha is involved: the user confirms on the
++/// phone app, and the poll response carries the session cookies.
++public struct QRLoginClient: Sendable {
++    public static let generateURL = URL(string: "https://passport.bilibili.com/x/passport-login/web/qrcode/generate")!
++    public static let pollURL = URL(string: "https://passport.bilibili.com/x/passport-login/web/qrcode/poll")!
++    /// Matches the `origin` the official live PC login page is opened with.
++    public static let source = "live_pc"
++
++    let session: URLSession
++
++    /// Uses an ephemeral session by default so login cookies never land in a
++    /// shared cookie store; they are returned to the caller instead.
++    public init(session: URLSession = URLSession(configuration: .ephemeral)) {
++        self.session = session
++    }
++
++    public func generate() async throws -> (url: String, key: String) {
++        let (root, _) = try await get(Self.generateURL, [URLQueryItem(name: "source", value: Self.source)])
++        guard let data = root["data"] as? [String: Any],
++              let url = data["url"] as? String, !url.isEmpty,
++              let key = data["qrcode_key"] as? String, !key.isEmpty else { throw QRLoginError.invalidResponse }
++        return (url, key)
++    }
++
++    public func poll(key: String) async throws -> QRLoginPoll {
++        let (root, response) = try await get(Self.pollURL, [
++            URLQueryItem(name: "qrcode_key", value: key),
++            URLQueryItem(name: "source", value: Self.source)
++        ])
++        guard let data = root["data"] as? [String: Any], let code = (data["code"] as? NSNumber)?.intValue else {
++            throw QRLoginError.invalidResponse
++        }
++        switch code {
++        case 86101: return .waitingForScan
++        case 86090: return .scanned
++        case 86038: return .expired
++        case 0: return .succeeded(try Self.credentials(from: data, response: response))
++        default: throw QRLoginError.api(code: code, message: data["message"] as? String ?? "")
++        }
++    }
++
++    /// Cookies arrive as Set-Cookie headers; the cross-domain `url` in the
++    /// body repeats them as query items and is used as a fallback.
++    static func credentials(from data: [String: Any], response: HTTPURLResponse) throws -> SessionCredentials {
++        var cookies: [String: String] = [:]
++        if let url = response.url, let fields = response.allHeaderFields as? [String: String] {
++            for cookie in HTTPCookie.cookies(withResponseHeaderFields: fields, for: url) {
++                cookies[cookie.name] = cookie.value
++            }
++        }
++        if let text = data["url"] as? String, let items = URLComponents(string: text)?.queryItems {
++            for item in items where cookies[item.name] == nil {
++                if let value = item.value { cookies[item.name] = value }
++            }
++        }
++        let credentials = SessionCredentials(cookies: cookies, refreshToken: data["refresh_token"] as? String ?? "")
++        guard credentials.isComplete else { throw QRLoginError.incompleteCredentials }
++        return credentials
++    }
++
++    private func get(_ base: URL, _ query: [URLQueryItem]) async throws -> ([String: Any], HTTPURLResponse) {
++        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
++        components.queryItems = query
++        var request = URLRequest(url: components.url!)
++        request.timeoutInterval = 12
++        request.setValue("https://live.bilibili.com/", forHTTPHeaderField: "Referer")
++        request.setValue(BilibiliWeb.userAgent, forHTTPHeaderField: "User-Agent")
++        let data: Data, response: URLResponse
++        do { (data, response) = try await session.data(for: request) }
++        catch let error as URLError { throw QRLoginError.network(code: error.errorCode) }
++        guard let http = response as? HTTPURLResponse else { throw QRLoginError.invalidResponse }
++        guard (200..<300).contains(http.statusCode) else { throw QRLoginError.http(status: http.statusCode) }
++        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let code = (root["code"] as? NSNumber)?.intValue else { throw QRLoginError.invalidResponse }
++        guard code == 0 else { throw QRLoginError.api(code: code, message: root["message"] as? String ?? "") }
++        return (root, http)
++    }
++}
++
++enum BilibiliWeb {
++    /// Requests carry an explicit Cookie header; nothing is read from or
++    /// written to a shared cookie jar inside the OBS process.
++    static let session: URLSession = {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.httpCookieStorage = nil
++        configuration.httpShouldSetCookies = false
++        configuration.httpCookieAcceptPolicy = .never
++        return URLSession(configuration: configuration)
++    }()
++    static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+new file mode 100644
+index 000000000..60ad6ed9f
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -0,0 +1,240 @@
++import Foundation
++
++public struct LiveAccount: Equatable, Sendable {
++    public let mid: Int64
++    public let username: String
++    public let room: BilibiliRoomInfo
++}
++
++/// Why the session is signed out or failed. The UI maps these to text.
++public enum SessionNotice: String, Equatable, Sendable {
++    case sessionExpired      // Bilibili rejected the saved login (-101)
++    case legacyNeedsLogin    // a v0.1.2 login could not be carried over
++    case qrExpired           // the QR code expired repeatedly without a scan
++    case noLiveRoom          // the account has no live room
++    case network             // could not reach Bilibili
++    case server              // Bilibili answered with an unexpected error
++    case keychain            // the login could not be read or saved locally
++}
++
++/// Login state as the dock shows it.
++///
++/// `ready` is only reached once identity AND room have loaded. Only an
++/// explicit "not logged in" answer from Bilibili returns to `signedOut`;
++/// every other problem stays in `failed` with the credentials kept, so a
++/// transient error never throws the user back to the login screen.
++public enum SessionState: Equatable, Sendable {
++    case signedOut(SessionNotice?)
++    case qrCode(url: String, scanned: Bool)
++    case verifying
++    case ready(LiveAccount)
++    case failed(SessionNotice, detail: String)
++}
++
++/// Network operations the coordinator needs; stubbed in tests.
++public protocol BilibiliAccountAPI: Sendable {
++    func generateQR() async throws -> (url: String, key: String)
++    func pollQR(key: String) async throws -> QRLoginPoll
++    func identity(cookieHeader: String) async throws -> BilibiliIdentity
++    func room(mid: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo
++}
++
++/// Reads cookies a previous app version left in its WebKit store.
++public protocol LegacySessionImporter: Sendable {
++    func importCookies() async -> [String: String]
++}
++
++@MainActor
++public final class SessionCoordinator {
++    public private(set) var state: SessionState = .signedOut(nil) {
++        didSet { if state != oldValue { onChange?(state) } }
++    }
++    public var onChange: ((SessionState) -> Void)?
++    /// Credentials of the ready account, for live start/stop requests.
++    public private(set) var credentials: SessionCredentials?
++
++    private let api: BilibiliAccountAPI
++    private let store: CredentialStore
++    private let importer: LegacySessionImporter?
++    private let pollInterval: Duration
++    private let maxAutoRefresh: Int
++    private var task: Task<Void, Never>?
++
++    public init(api: BilibiliAccountAPI, store: CredentialStore, importer: LegacySessionImporter? = nil,
++                pollInterval: Duration = .milliseconds(1500), maxAutoRefresh: Int = 2) {
++        self.api = api
++        self.store = store
++        self.importer = importer
++        self.pollInterval = pollInterval
++        self.maxAutoRefresh = maxAutoRefresh
++    }
++
++    // MARK: Actions
++
++    public func restore() {
++        run { await self.restoreSession() }
++    }
++
++    public func startQRLogin() {
++        run { await self.qrLogin() }
++    }
++
++    public func cancelQRLogin() {
++        task?.cancel()
++        task = nil
++        if case .qrCode = state { state = .signedOut(nil) }
++    }
++
++    /// Retries verification with the saved login, or starts a new QR login
++    /// when there is nothing saved.
++    public func retry() {
++        run {
++            if case .current(let saved)? = try? self.store.load() {
++                await self.verify(saved)
++            } else {
++                await self.qrLogin()
++            }
++        }
++    }
++
++    public func signOut() {
++        task?.cancel()
++        task = nil
++        credentials = nil
++        do {
++            try store.remove()
++            state = .signedOut(nil)
++        } catch {
++            state = .failed(.keychain, detail: "\(error)")
++        }
++    }
++
++    /// Awaits the running action; used by tests.
++    public func waitForIdle() async { await task?.value }
++
++    // MARK: Flow
++
++    private func run(_ body: @escaping @MainActor () async -> Void) {
++        task?.cancel()
++        task = Task { await body() }
++    }
++
++    private func restoreSession() async {
++        let stored: StoredCredentials
++        do { stored = try store.load() }
++        catch { state = .failed(.keychain, detail: "\(error)"); return }
++
++        switch stored {
++        case .none:
++            state = .signedOut(nil)
++        case .current(let saved):
++            await verify(saved)
++        case .legacy(let refreshToken, _):
++            state = .verifying
++            let cookies = await importer?.importCookies() ?? [:]
++            let migrated = SessionCredentials(cookies: cookies, refreshToken: refreshToken ?? "")
++            guard !Task.isCancelled else { return }
++            guard migrated.isComplete else { state = .signedOut(.legacyNeedsLogin); return }
++            do { try store.save(migrated) }
++            catch { state = .failed(.keychain, detail: "\(error)"); return }
++            await verify(migrated)
++        }
++    }
++
++    private func qrLogin() async {
++        credentials = nil
++        var refreshes = 0
++        do {
++            while !Task.isCancelled {
++                let code = try await api.generateQR()
++                state = .qrCode(url: code.url, scanned: false)
++                polling: while !Task.isCancelled {
++                    try await Task.sleep(for: pollInterval)
++                    switch try await api.pollQR(key: code.key) {
++                    case .waitingForScan:
++                        continue
++                    case .scanned:
++                        state = .qrCode(url: code.url, scanned: true)
++                    case .expired:
++                        guard refreshes < maxAutoRefresh else { state = .signedOut(.qrExpired); return }
++                        refreshes += 1
++                        break polling
++                    case .succeeded(let fresh):
++                        do { try store.save(fresh) }
++                        catch { state = .failed(.keychain, detail: "\(error)"); return }
++                        await verify(fresh)
++                        return
++                    }
++                }
++            }
++        } catch is CancellationError {
++            return
++        } catch {
++            guard !Task.isCancelled else { return }
++            state = .failed(Self.notice(for: error), detail: "\(error)")
++        }
++    }
++
++    private func verify(_ saved: SessionCredentials) async {
++        state = .verifying
++        do {
++            let identity = try await api.identity(cookieHeader: saved.cookieHeader)
++            guard identity.isLogin else { throw BilibiliControlError.notLoggedIn }
++            let room = try await api.room(mid: identity.mid, cookieHeader: saved.cookieHeader)
++            guard !Task.isCancelled else { return }
++            credentials = saved
++            state = .ready(LiveAccount(mid: identity.mid, username: identity.username, room: room))
++        } catch {
++            guard !Task.isCancelled else { return }
++            if Self.isSessionRejected(error) {
++                try? store.remove()
++                credentials = nil
++                state = .signedOut(.sessionExpired)
++            } else {
++                state = .failed(Self.notice(for: error), detail: "\(error)")
++            }
++        }
++    }
++
++    // MARK: Error mapping
++
++    static func isSessionRejected(_ error: Error) -> Bool {
++        (error as? BilibiliControlError) == .notLoggedIn || (error as? BilibiliLiveError) == .notLoggedIn
++    }
++
++    static func notice(for error: Error) -> SessionNotice {
++        switch error {
++        case BilibiliLiveError.missingRoom:
++            return .noLiveRoom
++        case BilibiliControlError.transport, BilibiliLiveError.transport, BilibiliLiveError.network,
++             QRLoginError.network:
++            return .network
++        case let error as URLError where error.code != .cancelled:
++            return .network
++        default:
++            return .server
++        }
++    }
++}
++
++/// Production implementation over the Bilibili web APIs.
++public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
++    let qr: QRLoginClient
++    let diagnostics: BilibiliDiagnosticStore?
++
++    public init(qr: QRLoginClient = QRLoginClient(), diagnostics: BilibiliDiagnosticStore? = nil) {
++        self.qr = qr
++        self.diagnostics = diagnostics
++    }
++
++    public func generateQR() async throws -> (url: String, key: String) { try await qr.generate() }
++    public func pollQR(key: String) async throws -> QRLoginPoll { try await qr.poll(key: key) }
++
++    public func identity(cookieHeader: String) async throws -> BilibiliIdentity {
++        try await BilibiliControlClient(session: BilibiliWeb.session, diagnostics: diagnostics).fetchIdentity(cookieHeader: cookieHeader)
++    }
++
++    public func room(mid: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo {
++        try await BilibiliLiveClient(cookieHeader: cookieHeader, session: BilibiliWeb.session, diagnostics: diagnostics).fetchCurrentRoom(mid: mid)
++    }
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/BilibiliControlClientTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/BilibiliControlClientTests.swift
+new file mode 100644
+index 000000000..7b8adc2c1
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/BilibiliControlClientTests.swift
+@@ -0,0 +1,127 @@
++import XCTest
++@testable import LiveHimeCore
++
++final class BilibiliControlClientTests: XCTestCase {
++    func testIdentitySuccessParsesFixtureWithoutNetwork() async throws {
++        let (client, store, session) = fixture(.success)
++        defer { session.invalidateAndCancel() }
++
++        let identity = try await client.fetchIdentity(cookieHeader: "SESSDATA=fixture")
++        XCTAssertEqual(identity, BilibiliIdentity(mid: 123, username: "fixture", isLogin: true))
++        XCTAssertEqual(ControlFixtureURLProtocol.paths, ["/x/web-interface/nav"])
++        XCTAssertEqual(store.snapshot().last?.stage, .identity)
++        XCTAssertNil(store.snapshot().last?.errorKind)
++    }
++
++    func testHTTP429PreservesStatusAndRetryHintWithoutReplay() async throws {
++        let (client, store, session) = fixture(.http429)
++        defer { session.invalidateAndCancel() }
++
++        do {
++            _ = try await client.fetchIdentity(cookieHeader: "SESSDATA=fixture")
++            XCTFail("Expected HTTP rejection")
++        } catch {
++            XCTAssertEqual(error as? BilibiliControlError, .http(status: 429, retryAfterSeconds: 17))
++        }
++        XCTAssertEqual(ControlFixtureURLProtocol.paths.count, 1)
++        XCTAssertEqual(store.snapshot().last?.httpStatus, 429)
++        XCTAssertEqual(store.snapshot().last?.retryAfterSeconds, 17)
++        XCTAssertEqual(store.snapshot().last?.errorKind, .http)
++    }
++
++    func testNotLoggedInAPIResponseIsDistinctFromTransportFailure() async throws {
++        let (client, store, session) = fixture(.notLoggedIn)
++        defer { session.invalidateAndCancel() }
++
++        do {
++            _ = try await client.fetchIdentity(cookieHeader: "SESSDATA=fixture")
++            XCTFail("Expected unauthenticated response")
++        } catch {
++            XCTAssertEqual(error as? BilibiliControlError, .notLoggedIn)
++        }
++        XCTAssertEqual(store.snapshot().last?.apiCode, -101)
++        XCTAssertEqual(store.snapshot().last?.errorKind, .auth)
++    }
++
++    func testMalformedIdentityBodyIsSchemaError() async throws {
++        let (client, store, session) = fixture(.malformed)
++        defer { session.invalidateAndCancel() }
++
++        do {
++            _ = try await client.fetchIdentity(cookieHeader: "SESSDATA=fixture")
++            XCTFail("Expected schema rejection")
++        } catch {
++            XCTAssertEqual(error as? BilibiliControlError, .invalidResponse)
++        }
++        XCTAssertEqual(store.snapshot().last?.errorKind, .schema)
++    }
++
++    func testTimeoutKeepsTransportCategoryAndNetworkCode() async throws {
++        let (client, store, session) = fixture(.timeout)
++        defer { session.invalidateAndCancel() }
++
++        do {
++            _ = try await client.fetchIdentity(cookieHeader: "SESSDATA=fixture")
++            XCTFail("Expected timeout")
++        } catch {
++            XCTAssertEqual(error as? BilibiliControlError, .transport)
++        }
++        XCTAssertEqual(store.snapshot().last?.errorKind, .timeout)
++        XCTAssertEqual(store.snapshot().last?.networkCode, URLError.timedOut.rawValue)
++        XCTAssertEqual(ControlFixtureURLProtocol.paths.count, 1)
++    }
++
++    private func fixture(_ scenario: ControlFixtureURLProtocol.Scenario) -> (BilibiliControlClient, BilibiliDiagnosticStore, URLSession) {
++        ControlFixtureURLProtocol.scenario = scenario
++        ControlFixtureURLProtocol.paths = []
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.protocolClasses = [ControlFixtureURLProtocol.self]
++        let session = URLSession(configuration: configuration)
++        let store = BilibiliDiagnosticStore()
++        return (BilibiliControlClient(session: session, diagnostics: store), store, session)
++    }
++}
++
++private final class ControlFixtureURLProtocol: URLProtocol {
++    enum Scenario { case success, http429, notLoggedIn, malformed, timeout }
++    static var scenario: Scenario = .success
++    static var paths: [String] = []
++
++    override class func canInit(with request: URLRequest) -> Bool { true }
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++
++    override func startLoading() {
++        guard let url = request.url else { return }
++        Self.paths.append(url.path)
++        if Self.scenario == .timeout {
++            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
++            return
++        }
++
++        let status: Int
++        let body: String
++        switch Self.scenario {
++        case .success:
++            status = 200
++            body = #"{"code":0,"data":{"isLogin":true,"mid":123,"uname":"fixture"}}"#
++        case .http429:
++            status = 429
++            body = #"{"code":-412,"message":"rate limited"}"#
++        case .notLoggedIn:
++            status = 200
++            body = #"{"code":-101,"message":"not login"}"#
++        case .malformed:
++            status = 200
++            body = #"{"code":0,"data":{"isLogin":true,"mid":"not-a-number"}}"#
++        case .timeout:
++            return
++        }
++        let headers = ["Content-Type": "application/json", "Retry-After": "17"]
++        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
++        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++        client?.urlProtocol(self, didLoad: Data(body.utf8))
++        client?.urlProtocolDidFinishLoading(self)
++    }
++
++    override func stopLoading() {}
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/BilibiliLiveClientTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/BilibiliLiveClientTests.swift
+new file mode 100644
+index 000000000..517087f91
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/BilibiliLiveClientTests.swift
+@@ -0,0 +1,139 @@
++import XCTest
++@testable import LiveHimeCore
++
++final class BilibiliLiveClientTests: XCTestCase {
++    func testFetchCurrentRoomSendsCookieAndParsesFixture() async throws {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.protocolClasses = [FixtureURLProtocol.self]
++        let session = URLSession(configuration: configuration)
++        let base = URL(string: "https://fixture.invalid")!
++        let endpoints = BilibiliLiveEndpoints(
++            roomInfoURL: base.appendingPathComponent("room"),
++            areaListURL: base.appendingPathComponent("areas"),
++            upstreamURL: base.appendingPathComponent("upstream"),
++            liveInfoURL: base.appendingPathComponent("liveinfo"))
++        let client = BilibiliLiveClient(cookieHeader: "SESSDATA=session", biliJct: "csrf", session: session, endpoints: endpoints)
++        let room = try await client.fetchCurrentRoom(mid: 42)
++        XCTAssertEqual(room.roomID, 123)
++        XCTAssertEqual(FixtureURLProtocol.lastRequest?.value(forHTTPHeaderField: "Cookie"), "SESSDATA=session; bili_jct=csrf")
++    }
++
++    func testParseStreamConfigFromUpstreamFixture() throws {
++        let data = Data(#"{"code":0,"message":"0","data":{"rtmp":{"addr":"rtmp://live.example/app/","code":"abc123"}}}"#.utf8)
++        XCTAssertEqual(try BilibiliLiveClient.parseStreamConfig(from: data),
++                       BilibiliStreamConfig(server: URL(string: "rtmp://live.example/app/")!, key: "abc123"))
++    }
++
++    func testParseStreamConfigFromStartLiveNestedFixture() throws {
++        let data = Data(#"{"code":0,"data":{"room_id":123,"rtmp":{"addr":"rtmp://x/live","code":"key"},"change":0}}"#.utf8)
++        XCTAssertEqual(try BilibiliLiveClient.parseStreamConfig(from: data).key, "key")
++    }
++
++    func testParseErrorsAreMapped() {
++        let data = Data(#"{"code":-101,"message":"账号未登录"}"#.utf8)
++        XCTAssertThrowsError(try BilibiliLiveClient.parseStreamConfig(from: data)) { error in
++            XCTAssertEqual(error as? BilibiliLiveError, .notLoggedIn)
++        }
++    }
++
++    func testFaceAuthErrorPreservesVoucher() {
++        let data = Data(#"{"code":60043,"message":"需要身份验证","data":{"risk_extra":{"v_voucher":"voucher-test"}}}"#.utf8)
++        XCTAssertThrowsError(try BilibiliLiveClient.parseStreamConfig(from: data)) { error in
++            XCTAssertEqual(error as? BilibiliLiveError, .faceAuthRequired(voucher: "voucher-test"))
++        }
++    }
++
++    func testRoomAndAreaModelsArePublicAndStable() {
++        let room = BilibiliRoomInfo(roomID: 1, title: "测试", liveStatus: 0)
++        XCTAssertEqual(room.roomID, 1)
++        let area = BilibiliLiveArea(areaID: 10, parentAreaID: 1, name: "游戏")
++        XCTAssertEqual(area.name, "游戏")
++    }
++
++    func testRoomInfoPrefersV2AreaForStartLive() async throws {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.protocolClasses = [V2AreaFixtureURLProtocol.self]
++        let session = URLSession(configuration: configuration)
++        let client = BilibiliLiveClient(cookieHeader: "SESSDATA=session; bili_jct=csrf", session: session,
++                                        endpoints: BilibiliLiveEndpoints(roomInfoURL: URL(string: "https://fixture.invalid/room")!))
++        let room = try await client.fetchCurrentRoom(mid: 42)
++        XCTAssertEqual(room.areaID, 86)
++    }
++
++    func testFetchCurrentRoomFallsBackThroughAuthenticatedLiveInfo() async throws {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.protocolClasses = [FallbackFixtureURLProtocol.self]
++        let session = URLSession(configuration: configuration)
++        let base = URL(string: "https://fixture.invalid")!
++        let endpoints = BilibiliLiveEndpoints(
++            roomInfoURL: base.appendingPathComponent("room"),
++            areaListURL: base.appendingPathComponent("areas"),
++            upstreamURL: base.appendingPathComponent("upstream"),
++            liveInfoURL: base.appendingPathComponent("liveinfo"))
++        let client = BilibiliLiveClient(cookieHeader: "SESSDATA=session", session: session, endpoints: endpoints)
++        let room = try await client.fetchCurrentRoom(mid: 42)
++        XCTAssertEqual(room.roomID, 9876)
++        XCTAssertEqual(room.title, "Fallback Room")
++        XCTAssertEqual(FallbackFixtureURLProtocol.paths, ["/room", "/room/v2/Room/room_id_by_uid", "/liveinfo", "/room/v1/Room/get_info"])
++    }
++}
++
++private final class V2AreaFixtureURLProtocol: URLProtocol {
++    override class func canInit(with request: URLRequest) -> Bool { true }
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++    override func startLoading() {
++        let path = request.url?.path ?? ""
++        let payload: Data
++        if path == "/room" {
++            payload = Data(#"{"code":0,"data":{"roomid":123,"title":"Legacy"}}"#.utf8)
++        } else {
++            payload = Data(#"{"code":0,"data":{"room_id":123,"title":"Canonical","area_id":2,"area_v2_id":86,"live_status":0}}"#.utf8)
++        }
++        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil,
++                                       headerFields: ["Content-Type":"application/json"])!
++        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++        client?.urlProtocol(self, didLoad: payload)
++        client?.urlProtocolDidFinishLoading(self)
++    }
++    override func stopLoading() {}
++}
++
++private final class FixtureURLProtocol: URLProtocol {
++    static var lastRequest: URLRequest?
++    override class func canInit(with request: URLRequest) -> Bool { true }
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++    override func startLoading() {
++        Self.lastRequest = request
++        // getRoomInfoOld's production response uses the legacy `roomid` key.
++        let payload = Data(#"{"code":0,"data":{"roomid":123,"uid":42,"title":"Fixture Room","liveStatus":0,"area_id":9}}"#.utf8)
++        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type":"application/json"])!
++        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++        client?.urlProtocol(self, didLoad: payload); client?.urlProtocolDidFinishLoading(self)
++    }
++    override func stopLoading() {}
++}
++
++private final class FallbackFixtureURLProtocol: URLProtocol {
++    static var paths: [String] = []
++    override class func canInit(with request: URLRequest) -> Bool { true }
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++    override func startLoading() {
++        let path = request.url?.path ?? ""
++        Self.paths.append(path)
++        let payload: Data
++        switch path {
++        case "/room":
++            payload = Data(#"{"code":0,"data":{"room_info":{"room_id":0}}}"#.utf8)
++        case "/room/v2/Room/room_id_by_uid":
++            payload = Data(#"{"code":-404,"message":"fixture fallback"}"#.utf8)
++        case "/liveinfo":
++            payload = Data(#"{"code":0,"data":{"roomid":9876}}"#.utf8)
++        default:
++            payload = Data(#"{"code":0,"data":{"room_id":9876,"title":"Fallback Room","live_status":0,"area_id":9}}"#.utf8)
++        }
++        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type":"application/json"])!
++        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++        client?.urlProtocol(self, didLoad: payload); client?.urlProtocolDidFinishLoading(self)
++    }
++    override func stopLoading() {}
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/DiagnosticsTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/DiagnosticsTests.swift
+new file mode 100644
+index 000000000..c1488b591
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/DiagnosticsTests.swift
+@@ -0,0 +1,158 @@
++import XCTest
++@testable import LiveHimeCore
++
++final class DiagnosticsTests: XCTestCase {
++    func testBoundedStoreExportUsesOnlyAllowedFields() throws {
++        let store = BilibiliDiagnosticStore(capacity: 2)
++        for code in [1, 2, 3] { store.record(.init(stage: .start, apiCode: code)) }
++        XCTAssertEqual(store.snapshot().compactMap(\.apiCode), [2, 3])
++        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(store.snapshot())) as? [[String: Any]])
++        let allowed: Set<String> = ["timestamp", "stage", "operation", "httpStatus", "apiCode", "networkCode", "durationMilliseconds", "errorKind", "retryAfterSeconds"]
++        XCTAssertTrue(object.allSatisfy { Set($0.keys).isSubset(of: allowed) })
++        store.clear()
++        XCTAssertTrue(store.snapshot().isEmpty)
++    }
++
++    func testHTTP429PreservesRetryHintWithoutReplayOrResponseLeak() async throws {
++        let (client, store, session) = fixture(.rateLimited)
++        defer { session.invalidateAndCancel() }
++        do { _ = try await client.fetchAreas(); XCTFail("Expected HTTP error") }
++        catch { XCTAssertEqual(error as? BilibiliLiveError, .http(status: 429, retryAfterSeconds: 30)) }
++        XCTAssertEqual(DiagnosticURLProtocol.paths.count, 1)
++        XCTAssertEqual(store.snapshot().last?.httpStatus, 429)
++        XCTAssertEqual(store.snapshot().last?.stage, .areas)
++        XCTAssertEqual(store.snapshot().last?.errorKind, .http)
++        let exported = String(decoding: try JSONEncoder().encode(store.snapshot()), as: UTF8.self)
++        for secret in ["private-cookie", "private-response", "fixture.invalid", "bili_jct"] {
++            XCTAssertFalse(exported.contains(secret))
++        }
++    }
++
++    func testTimeoutHasTransportCodeAndNoReplay() async throws {
++        let (client, store, session) = fixture(.timeout)
++        defer { session.invalidateAndCancel() }
++        do { _ = try await client.fetchAreas(); XCTFail("Expected timeout") }
++        catch { XCTAssertEqual(error as? BilibiliLiveError, .network(code: URLError.timedOut.rawValue)) }
++        XCTAssertEqual(store.snapshot().last?.errorKind, .timeout)
++        XCTAssertEqual(store.snapshot().last?.networkCode, URLError.timedOut.rawValue)
++        XCTAssertEqual(DiagnosticURLProtocol.paths.count, 1)
++    }
++
++    func testMalformedCodeCannotLookLikeSuccessfulResponse() async throws {
++        let (client, store, session) = fixture(.missingCode)
++        defer { session.invalidateAndCancel() }
++        do { _ = try await client.fetchAreas(); XCTFail("Expected schema failure") }
++        catch { XCTAssertEqual(error as? BilibiliLiveError, .invalidResponse) }
++        XCTAssertEqual(store.snapshot().last?.errorKind, .schema)
++        for code in ["null", "false", "\"0\"", "0.5"] {
++            let data = Data("{\"code\":\(code),\"data\":{\"rtmp\":{\"addr\":\"rtmp://fixture.invalid/live\",\"code\":\"fixture\"}}}".utf8)
++            XCTAssertThrowsError(try BilibiliLiveClient.parseStreamConfig(from: data))
++        }
++    }
++
++    func testStart400DoesNotChangeClientMarkerOrRepeatPOST() async throws {
++        let (client, store, session) = fixture(.badStart)
++        defer { session.invalidateAndCancel() }
++        do {
++            _ = try await client.startLive(roomID: 123, areaID: 86, cookieHeader: "bili_jct=fixture")
++            XCTFail("Expected explicit rejection")
++        } catch { XCTAssertEqual(error as? BilibiliLiveError, .api(code: -400, message: "fixture-rejection")) }
++        XCTAssertEqual(DiagnosticURLProtocol.paths.filter { $0.hasSuffix("startLive") }.count, 1)
++        XCTAssertEqual(store.snapshot().last?.stage, .start)
++        XCTAssertEqual(store.snapshot().last?.apiCode, -400)
++    }
++
++    func testFaceAuthIsDistinctAndVoucherNeverEntersDiagnostics() async throws {
++        let (client, store, session) = fixture(.faceAuth)
++        defer { session.invalidateAndCancel() }
++        do { _ = try await client.fetchAreas(); XCTFail("Expected challenge") }
++        catch { XCTAssertEqual(error as? BilibiliLiveError, .faceAuthRequired(voucher: "private-voucher")) }
++        XCTAssertEqual(store.snapshot().last?.errorKind, .faceAuth)
++        XCTAssertFalse(String(decoding: try JSONEncoder().encode(store.snapshot()), as: UTF8.self).contains("private-voucher"))
++    }
++
++    func testIdentitySchemaFailureIsRecordedWithoutExportingAccountData() async throws {
++        let (_, store, session) = fixture(.missingCode)
++        defer { session.invalidateAndCancel() }
++        do {
++            _ = try await BilibiliControlClient(session: session, diagnostics: store).fetchIdentity(cookieHeader: "SESSDATA=private-cookie")
++            XCTFail("Expected invalid identity response")
++        } catch { XCTAssertEqual(error as? BilibiliControlError, .invalidResponse) }
++        XCTAssertEqual(store.snapshot().last?.stage, .identity)
++        XCTAssertEqual(store.snapshot().last?.errorKind, .schema)
++    }
++
++    func testMissingStreamFieldsAreDiagnosedAfterHTTPBodyWasAccepted() async throws {
++        let (client, store, session) = fixture(.emptyStream)
++        defer { session.invalidateAndCancel() }
++        do { _ = try await client.fetchUpstream(); XCTFail("Expected missing stream config") }
++        catch { XCTAssertEqual(error as? BilibiliLiveError, .missingStreamConfig) }
++        XCTAssertEqual(store.snapshot().last?.stage, .upstream)
++        XCTAssertEqual(store.snapshot().last?.operation, .parse)
++        XCTAssertEqual(store.snapshot().last?.errorKind, .schema)
++    }
++
++    func testMissingRoomStateCannotBeMisreadAsConfirmedOffline() async throws {
++        let (client, store, session) = fixture(.missingRoomStatus)
++        defer { session.invalidateAndCancel() }
++        do { _ = try await client.fetchRoomInfo(roomID: 123, cookieHeader: "fixture"); XCTFail("Must not infer offline") }
++        catch { XCTAssertEqual(error as? BilibiliLiveError, .invalidResponse) }
++        XCTAssertEqual(store.snapshot().last?.stage, .room)
++        XCTAssertEqual(store.snapshot().last?.errorKind, .schema)
++    }
++
++    func testRetryAfterDateAndInvalidValues() {
++        let now = Date(timeIntervalSince1970: 0)
++        XCTAssertEqual(BilibiliLiveClient.retryAfterSeconds("Thu, 01 Jan 1970 00:01:00 GMT", now: now), 60)
++        XCTAssertEqual(BilibiliLiveClient.retryAfterSeconds("999999999", now: now), 86400)
++        XCTAssertNil(BilibiliLiveClient.retryAfterSeconds("-1"))
++        XCTAssertNil(BilibiliLiveClient.retryAfterSeconds("private-response"))
++    }
++
++    private func fixture(_ scenario: DiagnosticURLProtocol.Scenario) -> (BilibiliLiveClient, BilibiliDiagnosticStore, URLSession) {
++        DiagnosticURLProtocol.scenario = scenario
++        DiagnosticURLProtocol.paths = []
++        let config = URLSessionConfiguration.ephemeral
++        // Intercept every request, including fixed start/clock/version endpoints.
++        config.protocolClasses = [DiagnosticURLProtocol.self]
++        let session = URLSession(configuration: config)
++        let store = BilibiliDiagnosticStore()
++        let client = BilibiliLiveClient(cookieHeader: "SESSDATA=private-cookie", session: session, diagnostics: store)
++        return (client, store, session)
++    }
++}
++
++private final class DiagnosticURLProtocol: URLProtocol {
++    enum Scenario { case rateLimited, timeout, missingCode, badStart, faceAuth, emptyStream, missingRoomStatus }
++    static var scenario: Scenario = .missingCode
++    static var paths: [String] = []
++    override class func canInit(with request: URLRequest) -> Bool { true }
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++    override func startLoading() {
++        let path = request.url!.path
++        Self.paths.append(path)
++        if Self.scenario == .timeout {
++            client?.urlProtocol(self, didFailWithError: URLError(.timedOut)); return
++        }
++        var status = 200
++        let body: String
++        switch Self.scenario {
++        case .missingRoomStatus: body = #"{"code":0,"data":{"room_id":123}}"#
++        case .emptyStream: body = #"{"code":0,"data":{}}"#
++        case .rateLimited: status = 429; body = "private-response"
++        case .missingCode: body = #"{"data":[]}"#
++        case .faceAuth: body = #"{"code":60043,"data":{"risk_extra":{"v_voucher":"private-voucher"}}}"#
++        case .badStart:
++            if path.hasSuffix("getHomePageLiveVersion") { body = #"{"code":0,"data":{"curr_version":"8.6.0","build":11050}}"# }
++            else if path.hasSuffix("now") { body = #"{"code":0,"data":{"now":123456}}"# }
++            else { body = #"{"code":-400,"message":"fixture-rejection"}"# }
++        case .timeout: return
++        }
++        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil,
++            headerFields: ["Content-Type": "application/json", "Retry-After": "30"])!
++        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++        client?.urlProtocol(self, didLoad: Data(body.utf8))
++        client?.urlProtocolDidFinishLoading(self)
++    }
++    override func stopLoading() {}
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+new file mode 100644
+index 000000000..f77495894
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -0,0 +1,213 @@
++import XCTest
++@testable import LiveHimeCore
++
++private let completeCookies = ["SESSDATA": "s", "bili_jct": "csrf", "DedeUserID": "42"]
++private let fixtureRoom = BilibiliRoomInfo(roomID: 1001, uid: 42, title: "room", liveStatus: 0, areaID: 7)
++
++/// Scripted API: QR polls are consumed in order; identity/room results are
++/// returned (or thrown) per call.
++private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
++    var polls: [QRLoginPoll] = []
++    var generated = 0
++    var identityResults: [Result<BilibiliIdentity, Error>] = []
++    var roomResult: Result<BilibiliRoomInfo, Error> = .success(fixtureRoom)
++    var identityCookieHeaders: [String] = []
++
++    func generateQR() async throws -> (url: String, key: String) {
++        generated += 1
++        return ("https://qr.example/\(generated)", "key\(generated)")
++    }
++    func pollQR(key: String) async throws -> QRLoginPoll {
++        polls.isEmpty ? .waitingForScan : polls.removeFirst()
++    }
++    func identity(cookieHeader: String) async throws -> BilibiliIdentity {
++        identityCookieHeaders.append(cookieHeader)
++        let next = identityResults.isEmpty ? .success(BilibiliIdentity(mid: 42, username: "up", isLogin: true))
++                                           : identityResults.removeFirst()
++        return try next.get()
++    }
++    func room(mid: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo { try roomResult.get() }
++}
++
++private struct StubImporter: LegacySessionImporter {
++    let cookies: [String: String]
++    func importCookies() async -> [String: String] { cookies }
++}
++
++@MainActor
++final class SessionCoordinatorTests: XCTestCase {
++    private func make(_ api: StubAPI, _ store: CredentialStore, importer: LegacySessionImporter? = nil)
++        -> (SessionCoordinator, () -> [SessionState]) {
++        let coordinator = SessionCoordinator(api: api, store: store, importer: importer,
++                                             pollInterval: .milliseconds(1), maxAutoRefresh: 1)
++        var seen: [SessionState] = []
++        coordinator.onChange = { seen.append($0) }
++        return (coordinator, { seen })
++    }
++
++    func testRestoreWithNothingSavedIsSignedOut() async {
++        let (c, _) = make(StubAPI(), MemoryCredentialStore())
++        c.restore(); await c.waitForIdle()
++        XCTAssertEqual(c.state, .signedOut(nil))
++    }
++
++    func testQRLoginReachesReadyOnlyAfterIdentityAndRoom() async throws {
++        let api = StubAPI()
++        api.polls = [.waitingForScan, .scanned, .succeeded(SessionCredentials(cookies: completeCookies, refreshToken: "rt"))]
++        let store = MemoryCredentialStore()
++        let (c, states) = make(api, store)
++        c.startQRLogin(); await c.waitForIdle()
++
++        let account = LiveAccount(mid: 42, username: "up", room: fixtureRoom)
++        XCTAssertEqual(states(), [
++            .qrCode(url: "https://qr.example/1", scanned: false),
++            .qrCode(url: "https://qr.example/1", scanned: true),
++            .verifying,
++            .ready(account)
++        ])
++        guard case .current(let saved) = try store.load() else { return XCTFail("credentials not saved") }
++        XCTAssertEqual(saved.refreshToken, "rt")
++        XCTAssertEqual(c.credentials?.csrf, "csrf")
++        XCTAssertEqual(api.identityCookieHeaders, ["DedeUserID=42; SESSDATA=s; bili_jct=csrf"])
++    }
++
++    func testExpiredQRRefreshesThenGivesUp() async {
++        let api = StubAPI()
++        api.polls = [.expired, .expired]
++        let (c, _) = make(api, MemoryCredentialStore())
++        c.startQRLogin(); await c.waitForIdle()
++        XCTAssertEqual(api.generated, 2)
++        XCTAssertEqual(c.state, .signedOut(.qrExpired))
++    }
++
++    func testNetworkFailureKeepsLoginAndRetryRecovers() async throws {
++        let api = StubAPI()
++        api.identityResults = [.failure(BilibiliControlError.transport)]
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "")))
++        let (c, _) = make(api, store)
++        c.restore(); await c.waitForIdle()
++
++        guard case .failed(.network, _) = c.state else { return XCTFail("expected network failure, got \(c.state)") }
++        guard case .current = try store.load() else { return XCTFail("login must be kept after a network error") }
++
++        c.retry(); await c.waitForIdle()
++        guard case .ready = c.state else { return XCTFail("retry should reach ready, got \(c.state)") }
++    }
++
++    func testRejectedSessionIsRemovedAndSignedOut() async throws {
++        let api = StubAPI()
++        api.identityResults = [.failure(BilibiliControlError.notLoggedIn)]
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "")))
++        let (c, _) = make(api, store)
++        c.restore(); await c.waitForIdle()
++        XCTAssertEqual(c.state, .signedOut(.sessionExpired))
++        XCTAssertEqual(try store.load(), .none)
++    }
++
++    func testServerErrorStaysFailedNotSignedOut() async throws {
++        let api = StubAPI()
++        api.identityResults = [.failure(BilibiliControlError.http(status: 412, retryAfterSeconds: nil))]
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "")))
++        let (c, _) = make(api, store)
++        c.restore(); await c.waitForIdle()
++        guard case .failed(.server, _) = c.state else { return XCTFail("got \(c.state)") }
++        guard case .current = try store.load() else { return XCTFail("login must be kept") }
++    }
++
++    func testAccountWithoutRoomIsFailedNotSignedOut() async {
++        let api = StubAPI()
++        api.roomResult = .failure(BilibiliLiveError.missingRoom)
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "")))
++        let (c, _) = make(api, store)
++        c.restore(); await c.waitForIdle()
++        guard case .failed(.noLiveRoom, _) = c.state else { return XCTFail("got \(c.state)") }
++    }
++
++    func testLegacyLoginIsMigratedFromWebKitCookies() async throws {
++        let store = MemoryCredentialStore(.legacy(refreshToken: nil, sessdata: "s"))
++        let (c, _) = make(StubAPI(), store, importer: StubImporter(cookies: completeCookies))
++        c.restore(); await c.waitForIdle()
++        guard case .ready = c.state else { return XCTFail("got \(c.state)") }
++        guard case .current(let migrated) = try store.load() else { return XCTFail("not migrated") }
++        XCTAssertEqual(migrated.mid, 42)
++    }
++
++    func testLegacyLoginWithoutCookiesAsksToLogIn() async {
++        let store = MemoryCredentialStore(.legacy(refreshToken: nil, sessdata: "s"))
++        let (c, _) = make(StubAPI(), store, importer: StubImporter(cookies: [:]))
++        c.restore(); await c.waitForIdle()
++        XCTAssertEqual(c.state, .signedOut(.legacyNeedsLogin))
++    }
++
++    func testSignOutRemovesCredentials() async throws {
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "")))
++        let (c, _) = make(StubAPI(), store)
++        c.restore(); await c.waitForIdle()
++        c.signOut()
++        XCTAssertEqual(c.state, .signedOut(nil))
++        XCTAssertNil(c.credentials)
++        XCTAssertEqual(try store.load(), .none)
++    }
++}
++
++final class CredentialParsingTests: XCTestCase {
++    func testPollSuccessReadsSetCookieHeaders() throws {
++        let url = URL(string: "https://passport.bilibili.com/x/passport-login/web/qrcode/poll")!
++        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: [
++            "Set-Cookie": "SESSDATA=s1; Path=/; Domain=bilibili.com, bili_jct=c1; Path=/; Domain=bilibili.com, DedeUserID=7; Path=/; Domain=bilibili.com"
++        ])!
++        let creds = try QRLoginClient.credentials(from: ["refresh_token": "rt"], response: response)
++        XCTAssertEqual(creds.cookies, ["SESSDATA": "s1", "bili_jct": "c1", "DedeUserID": "7"])
++        XCTAssertEqual(creds.refreshToken, "rt")
++    }
++
++    func testPollSuccessFallsBackToCrossDomainURL() throws {
++        let url = URL(string: "https://passport.bilibili.com/x/passport-login/web/qrcode/poll")!
++        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: [:])!
++        let creds = try QRLoginClient.credentials(from: [
++            "url": "https://passport.biligame.com/x/passport-login/web/crossDomain?DedeUserID=9&SESSDATA=s2&bili_jct=c2&gourl=x",
++            "refresh_token": "rt"
++        ], response: response)
++        XCTAssertEqual(creds.mid, 9)
++        XCTAssertNil(creds.cookies["gourl"], "only session cookies are kept")
++    }
++
++    func testIncompleteCookiesAreRejected() {
++        let url = URL(string: "https://passport.bilibili.com/")!
++        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Set-Cookie": "SESSDATA=s"])!
++        XCTAssertThrowsError(try QRLoginClient.credentials(from: [:], response: response)) {
++            XCTAssertEqual($0 as? QRLoginError, .incompleteCredentials)
++        }
++    }
++
++    func testStoredDataVersions() throws {
++        let creds = SessionCredentials(cookies: ["SESSDATA": "s", "bili_jct": "c", "DedeUserID": "1"], refreshToken: "r",
++                                       savedAt: Date(timeIntervalSince1970: 0))
++        let v2 = try JSONEncoder().encode(CredentialEnvelope(schemaVersion: 2, credentials: creds))
++        XCTAssertEqual(decodeStoredCredentials(v2), .current(creds))
++        XCTAssertEqual(decodeStoredCredentials(Data(#"{"type":"cookie","refreshToken":"SESS"}"#.utf8)),
++                       .legacy(refreshToken: nil, sessdata: "SESS"))
++        XCTAssertEqual(decodeStoredCredentials(Data(#"{"type":"qr","refreshToken":"RT","timestamp":"1"}"#.utf8)),
++                       .legacy(refreshToken: "RT", sessdata: nil))
++        XCTAssertEqual(decodeStoredCredentials(Data("garbage".utf8)), .none)
++    }
++}
++
++@MainActor
++final class CoreBridgeJSONTests: XCTestCase {
++    func testReadyJSONCarriesRoomButNoSecrets() throws {
++        let account = LiveAccount(mid: 42, username: "up", room: BilibiliRoomInfo(roomID: 1001, title: "t", liveStatus: 1, areaID: 7))
++        let json = CoreBridge.json(for: .ready(account))
++        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
++        XCTAssertEqual(object["state"] as? String, "ready")
++        XCTAssertEqual(object["roomId"] as? Int, 1001)
++        XCTAssertFalse(json.contains("SESSDATA") || json.contains("bili_jct"))
++    }
++
++    func testQRCodeJSONHasPNG() throws {
++        let json = CoreBridge.json(for: .qrCode(url: "https://account.bilibili.com/h5/account-h5/auth/scan-web?qrcode_key=x", scanned: false))
++        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
++        let png = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(object["qrPng"] as? String)))
++        XCTAssertEqual(Array(png.prefix(4)), [0x89, 0x50, 0x4E, 0x47])
++    }
++}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+new file mode 100644
+index 000000000..1c4a46ceb
+--- /dev/null
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++/* C interface of the LiveHime Swift core (Sources/LiveHimeCore/CBridge.swift).
++ *
++ * Call from the main thread. State changes arrive on the main thread as a
++ * JSON object: {"state": "signedOut"|"qrCode"|"verifying"|"ready"|"failed",
++ * ...}. The JSON never contains cookies or tokens. */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef void (*livehime_state_callback)(const char *state_json, void *context);
++
++/* keychain_service may be NULL for the default "local.livehime.macos.session". */
++void livehime_core_start(const char *keychain_service, livehime_state_callback callback, void *context);
++void livehime_core_stop(void);
++
++void livehime_core_start_qr_login(void);
++void livehime_core_cancel_qr_login(void);
++void livehime_core_retry(void);
++void livehime_core_sign_out(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 40d75f2a0..d5e12f757 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -21,3 +21,20 @@ LiveHime.Error.Disconnected="Disconnected from the server."
+ LiveHime.Error.Unsupported="The encoder settings are not supported by this server."
+ LiveHime.Error.Encode="The encoder failed."
+ LiveHime.Error.Generic="Streaming stopped because of an error."
++LiveHime.Account.Group="Bilibili account"
++LiveHime.Account.SignedOut="Log in with the Bilibili app to use your live room."
++LiveHime.Account.LoginQR="Log in with QR code"
++LiveHime.Account.QR.Hint="Scan with the Bilibili app"
++LiveHime.Account.QR.Scanned="Scanned. Confirm the login on your phone."
++LiveHime.Account.Cancel="Cancel"
++LiveHime.Account.Verifying="Checking your account and live room..."
++LiveHime.Account.Room="Room"
++LiveHime.Account.SignOut="Log out"
++LiveHime.Account.Retry="Retry"
++LiveHime.Account.Notice.sessionExpired="Your login has expired. Please log in again."
++LiveHime.Account.Notice.legacyNeedsLogin="Your previous login could not be carried over. Please log in again."
++LiveHime.Account.Notice.qrExpired="The QR code expired. Start again when you are ready."
++LiveHime.Account.Notice.noLiveRoom="This account has no live room yet."
++LiveHime.Account.Notice.network="Could not reach Bilibili. Your login is kept; check the network and retry."
++LiveHime.Account.Notice.server="Bilibili returned an unexpected response. Your login is kept; retry later."
++LiveHime.Account.Notice.keychain="The login could not be read from or saved to the Keychain."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 5778c6568..bd816c3a8 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -21,3 +21,20 @@ LiveHime.Error.Disconnected="与服务器的连接已断开。"
+ LiveHime.Error.Unsupported="该服务器不支持当前编码设置。"
+ LiveHime.Error.Encode="编码器出错。"
+ LiveHime.Error.Generic="推流因错误停止。"
++LiveHime.Account.Group="哔哩哔哩账号"
++LiveHime.Account.SignedOut="用哔哩哔哩 App 扫码登录后即可使用你的直播间。"
++LiveHime.Account.LoginQR="扫码登录"
++LiveHime.Account.QR.Hint="请用哔哩哔哩 App 扫码"
++LiveHime.Account.QR.Scanned="已扫码，请在手机上确认登录。"
++LiveHime.Account.Cancel="取消"
++LiveHime.Account.Verifying="正在确认账号和直播间…"
++LiveHime.Account.Room="房间"
++LiveHime.Account.SignOut="退出登录"
++LiveHime.Account.Retry="重试"
++LiveHime.Account.Notice.sessionExpired="登录已失效，请重新登录。"
++LiveHime.Account.Notice.legacyNeedsLogin="旧版本的登录信息无法沿用，请重新登录。"
++LiveHime.Account.Notice.qrExpired="二维码已过期，准备好后请重新开始。"
++LiveHime.Account.Notice.noLiveRoom="该账号还没有开通直播间。"
++LiveHime.Account.Notice.network="无法连接哔哩哔哩。登录信息已保留，请检查网络后重试。"
++LiveHime.Account.Notice.server="哔哩哔哩返回了异常结果。登录信息已保留，请稍后重试。"
++LiveHime.Account.Notice.keychain="无法从钥匙串读取或保存登录信息。"
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+new file mode 100644
+index 000000000..ac3cf68fa
+--- /dev/null
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -0,0 +1,184 @@
++#include "account-panel.hpp"
++
++#include <livehime-core.h>
++#include <obs-module.h>
++
++#include <QByteArray>
++#include <cstdlib>
++#include <QHBoxLayout>
++#include <QJsonDocument>
++#include <QLabel>
++#include <QPixmap>
++#include <QPushButton>
++#include <QStackedWidget>
++#include <QVBoxLayout>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++
++QString noticeText(const QString &notice)
++{
++	if (notice.isEmpty())
++		return QString();
++	const QByteArray key = "LiveHime.Account.Notice." + notice.toUtf8();
++	return text(key.constData());
++}
++
++QLabel *wrapLabel(QWidget *parent, const QString &value = QString())
++{
++	auto *label = new QLabel(value, parent);
++	label->setWordWrap(true);
++	return label;
++}
++
++enum Page { SignedOut, QRCode, Verifying, Ready, Failed };
++} // namespace
++
++AccountPanel::AccountPanel(QWidget *parent) : QWidget(parent), pages_(new QStackedWidget(this))
++{
++	pages_->insertWidget(SignedOut, buildSignedOut());
++	pages_->insertWidget(QRCode, buildQRCode());
++	pages_->insertWidget(Verifying, buildVerifying());
++	pages_->insertWidget(Ready, buildReady());
++	pages_->insertWidget(Failed, buildFailed());
++	auto *layout = new QVBoxLayout(this);
++	layout->setContentsMargins(0, 0, 0, 0);
++	layout->addWidget(pages_);
++	pages_->setCurrentIndex(Verifying);
++
++	/* Development/testing override so automated runs never touch the real
++	 * login item. */
++	livehime_core_start(std::getenv("LIVEHIME_KEYCHAIN_SERVICE"), &AccountPanel::onCoreState, this);
++}
++
++AccountPanel::~AccountPanel()
++{
++	livehime_core_stop();
++}
++
++void AccountPanel::onCoreState(const char *json, void *context)
++{
++	/* Delivered on the main thread by the core. */
++	auto *self = static_cast<AccountPanel *>(context);
++	const QJsonDocument doc = QJsonDocument::fromJson(QByteArray(json));
++	if (doc.isObject())
++		self->applyState(doc.object());
++}
++
++void AccountPanel::applyState(const QJsonObject &state)
++{
++	state_ = state;
++	const QString name = state.value("state").toString();
++	blog(LOG_INFO, "[livehime] account state -> %s", name.toUtf8().constData());
++
++	if (name == "signedOut") {
++		signedOutNotice_->setText(noticeText(state.value("notice").toString()));
++		signedOutNotice_->setVisible(!signedOutNotice_->text().isEmpty());
++		pages_->setCurrentIndex(SignedOut);
++	} else if (name == "qrCode") {
++		QPixmap qr;
++		qr.loadFromData(QByteArray::fromBase64(state.value("qrPng").toString().toLatin1()), "PNG");
++		qrImage_->setPixmap(qr.scaled(200, 200, Qt::KeepAspectRatio, Qt::SmoothTransformation));
++		qrHint_->setText(text(state.value("scanned").toBool() ? "LiveHime.Account.QR.Scanned"
++								      : "LiveHime.Account.QR.Hint"));
++		pages_->setCurrentIndex(QRCode);
++	} else if (name == "verifying") {
++		pages_->setCurrentIndex(Verifying);
++	} else if (name == "ready") {
++		accountName_->setText(state.value("username").toString());
++		const qint64 shortId = state.value("shortRoomId").toVariant().toLongLong();
++		const qint64 roomId = state.value("roomId").toVariant().toLongLong();
++		roomLine_->setText(QStringLiteral("%1 %2 · %3")
++					   .arg(text("LiveHime.Account.Room"))
++					   .arg(shortId > 0 ? shortId : roomId)
++					   .arg(state.value("title").toString()));
++		pages_->setCurrentIndex(Ready);
++	} else if (name == "failed") {
++		failedNotice_->setText(noticeText(state.value("notice").toString()));
++		failedDetail_->setText(state.value("detail").toString());
++		pages_->setCurrentIndex(Failed);
++	}
++	emit stateChanged(state);
++}
++
++QWidget *AccountPanel::buildSignedOut()
++{
++	auto *page = new QWidget(this);
++	auto *layout = new QVBoxLayout(page);
++	signedOutNotice_ = wrapLabel(page);
++	signedOutNotice_->setStyleSheet(QStringLiteral("color: #e0a040;"));
++	auto *login = new QPushButton(text("LiveHime.Account.LoginQR"), page);
++	connect(login, &QPushButton::clicked, [] { livehime_core_start_qr_login(); });
++	layout->addWidget(wrapLabel(page, text("LiveHime.Account.SignedOut")));
++	layout->addWidget(signedOutNotice_);
++	layout->addWidget(login);
++	return page;
++}
++
++QWidget *AccountPanel::buildQRCode()
++{
++	auto *page = new QWidget(this);
++	auto *layout = new QVBoxLayout(page);
++	qrImage_ = new QLabel(page);
++	qrImage_->setAlignment(Qt::AlignCenter);
++	qrImage_->setMinimumSize(200, 200);
++	qrHint_ = wrapLabel(page);
++	qrHint_->setAlignment(Qt::AlignCenter);
++	auto *cancel = new QPushButton(text("LiveHime.Account.Cancel"), page);
++	connect(cancel, &QPushButton::clicked, [] { livehime_core_cancel_qr_login(); });
++	layout->addWidget(qrImage_);
++	layout->addWidget(qrHint_);
++	layout->addWidget(cancel);
++	return page;
++}
++
++QWidget *AccountPanel::buildVerifying()
++{
++	auto *page = new QWidget(this);
++	auto *layout = new QVBoxLayout(page);
++	layout->addWidget(wrapLabel(page, text("LiveHime.Account.Verifying")));
++	return page;
++}
++
++QWidget *AccountPanel::buildReady()
++{
++	auto *page = new QWidget(this);
++	auto *layout = new QVBoxLayout(page);
++	accountName_ = new QLabel(page);
++	accountName_->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 14px;"));
++	roomLine_ = wrapLabel(page);
++	roomLine_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++	auto *signOut = new QPushButton(text("LiveHime.Account.SignOut"), page);
++	connect(signOut, &QPushButton::clicked, [] { livehime_core_sign_out(); });
++	auto *row = new QHBoxLayout;
++	row->addWidget(accountName_, 1);
++	row->addWidget(signOut);
++	layout->addLayout(row);
++	layout->addWidget(roomLine_);
++	return page;
++}
++
++QWidget *AccountPanel::buildFailed()
++{
++	auto *page = new QWidget(this);
++	auto *layout = new QVBoxLayout(page);
++	failedNotice_ = wrapLabel(page);
++	failedNotice_->setStyleSheet(QStringLiteral("color: #e06c75;"));
++	failedDetail_ = wrapLabel(page);
++	failedDetail_->setStyleSheet(QStringLiteral("color: #9aa0ab; font-size: 11px;"));
++	failedDetail_->setTextInteractionFlags(Qt::TextSelectableByMouse);
++	auto *retry = new QPushButton(text("LiveHime.Account.Retry"), page);
++	connect(retry, &QPushButton::clicked, [] { livehime_core_retry(); });
++	auto *signOut = new QPushButton(text("LiveHime.Account.SignOut"), page);
++	connect(signOut, &QPushButton::clicked, [] { livehime_core_sign_out(); });
++	auto *row = new QHBoxLayout;
++	row->addWidget(retry);
++	row->addWidget(signOut);
++	layout->addWidget(failedNotice_);
++	layout->addWidget(failedDetail_);
++	layout->addLayout(row);
++	return page;
++}
+diff --git a/plugins/livehime/src/account-panel.hpp b/plugins/livehime/src/account-panel.hpp
+new file mode 100644
+index 000000000..5bfdaeb26
+--- /dev/null
++++ b/plugins/livehime/src/account-panel.hpp
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <QJsonObject>
++#include <QWidget>
++
++class QLabel;
++class QPushButton;
++class QStackedWidget;
++
++/* Bilibili account section of the LiveHime dock.
++ *
++ * Renders the Swift session core's state (see core/include/livehime-core.h):
++ * signed out -> QR code -> verifying -> ready, or failed with a retry. The
++ * panel never decides login state itself; it only shows what the core
++ * reports, so a transient error can never bounce the user back to login. */
++class AccountPanel : public QWidget {
++	Q_OBJECT
++
++public:
++	explicit AccountPanel(QWidget *parent = nullptr);
++	~AccountPanel() override;
++
++	/* Last reported state object; "state" is "ready" once a room is loaded. */
++	const QJsonObject &state() const { return state_; }
++
++signals:
++	void stateChanged(const QJsonObject &state);
++
++private:
++	static void onCoreState(const char *json, void *context);
++	void applyState(const QJsonObject &state);
++	QWidget *buildSignedOut();
++	QWidget *buildQRCode();
++	QWidget *buildVerifying();
++	QWidget *buildReady();
++	QWidget *buildFailed();
++
++	QJsonObject state_;
++	QStackedWidget *pages_;
++	QLabel *signedOutNotice_;
++	QLabel *qrImage_;
++	QLabel *qrHint_;
++	QLabel *accountName_;
++	QLabel *roomLine_;
++	QLabel *failedNotice_;
++	QLabel *failedDetail_;
++};
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 94a7841f0..7a3ea4bb0 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -1,9 +1,13 @@
+ #include "automation.hpp"
++#include "account-panel.hpp"
+ #include "livehime-dock.hpp"
+ 
++#include <livehime-core.h>
++
+ #include <obs-module.h>
+ #include <obs-websocket-api.h>
+ 
++#include <QJsonDocument>
+ #include <QMetaEnum>
+ #include <QMetaObject>
+ #include <QPointer>
+@@ -63,6 +67,29 @@ void stopStream(obs_data_t *, obs_data_t *response, void *)
+ 	    }))
+ 		obs_data_set_string(response, "error", "dock unavailable");
+ }
++void getAccountState(obs_data_t *, obs_data_t *response, void *)
++{
++	if (!onUiThread([response] {
++		    QJsonObject state = target->account()->state();
++		    /* Report whether a QR image exists instead of the image itself. */
++		    state.insert("hasQr", state.contains("qrPng"));
++		    state.remove("qrPng");
++		    const QByteArray json = QJsonDocument(state).toJson(QJsonDocument::Compact);
++		    OBSDataAutoRelease data = obs_data_create_from_json(json.constData());
++		    obs_data_apply(response, data);
++	    }))
++		obs_data_set_string(response, "error", "dock unavailable");
++}
++
++void startQRLogin(obs_data_t *, obs_data_t *, void *)
++{
++	onUiThread([] { livehime_core_start_qr_login(); });
++}
++
++void cancelQRLogin(obs_data_t *, obs_data_t *, void *)
++{
++	onUiThread([] { livehime_core_cancel_qr_login(); });
++}
+ } // namespace
+ 
+ void RegisterAutomation(LiveHimeDock *dock)
+@@ -76,6 +103,9 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "GetStreamState", getStreamState, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "StartManualStream", startManualStream, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "StopStream", stopStream, nullptr);
++	obs_websocket_vendor_register_request(vendor, "GetAccountState", getAccountState, nullptr);
++	obs_websocket_vendor_register_request(vendor, "StartQRLogin", startQRLogin, nullptr);
++	obs_websocket_vendor_register_request(vendor, "CancelQRLogin", cancelQRLogin, nullptr);
+ }
+ 
+ void UnregisterAutomation()
+@@ -84,6 +114,9 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "GetStreamState");
+ 		obs_websocket_vendor_unregister_request(vendor, "StartManualStream");
+ 		obs_websocket_vendor_unregister_request(vendor, "StopStream");
++		obs_websocket_vendor_unregister_request(vendor, "GetAccountState");
++		obs_websocket_vendor_unregister_request(vendor, "StartQRLogin");
++		obs_websocket_vendor_unregister_request(vendor, "CancelQRLogin");
+ 		vendor = nullptr;
+ 	}
+ 	target.clear();
+diff --git a/plugins/livehime/src/livehime-dock.cpp b/plugins/livehime/src/livehime-dock.cpp
+index 87f34ea01..be6bcb8a5 100644
+--- a/plugins/livehime/src/livehime-dock.cpp
++++ b/plugins/livehime/src/livehime-dock.cpp
+@@ -1,4 +1,5 @@
+ #include "livehime-dock.hpp"
++#include "account-panel.hpp"
+ 
+ #include <obs-module.h>
+ 
+@@ -81,7 +82,13 @@ LiveHimeDock::LiveHimeDock(QWidget *parent) : QWidget(parent), controller_(new S
+ 	hint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+ 	manualLayout->addWidget(hint);
+ 
++	auto *account = new QGroupBox(text("LiveHime.Account.Group"), this);
++	auto *accountLayout = new QVBoxLayout(account);
++	account_ = new AccountPanel(account);
++	accountLayout->addWidget(account_);
++
+ 	auto *layout = new QVBoxLayout(this);
++	layout->addWidget(account);
+ 	layout->addLayout(statusRow);
+ 	layout->addWidget(statusDetail_);
+ 	layout->addWidget(manual);
+diff --git a/plugins/livehime/src/livehime-dock.hpp b/plugins/livehime/src/livehime-dock.hpp
+index 1815fda25..e5c23a577 100644
+--- a/plugins/livehime/src/livehime-dock.hpp
++++ b/plugins/livehime/src/livehime-dock.hpp
+@@ -6,6 +6,7 @@
+ #include <QTimer>
+ #include <QWidget>
+ 
++class AccountPanel;
+ class QLabel;
+ class QLineEdit;
+ class QPushButton;
+@@ -22,6 +23,7 @@ public:
+ 	explicit LiveHimeDock(QWidget *parent = nullptr);
+ 
+ 	StreamController *controller() { return controller_; }
++	AccountPanel *account() { return account_; }
+ 
+ 	/* Same path as the dock's buttons; used by the automation interface.
+ 	 * Returns false with a localized reason when the request is rejected. */
+@@ -36,6 +38,7 @@ private slots:
+ 
+ private:
+ 	StreamController *controller_;
++	AccountPanel *account_;
+ 	QLabel *statusChip_;
+ 	QLabel *statusDetail_;
+ 	QLabel *stats_;

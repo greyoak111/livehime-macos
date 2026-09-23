@@ -1,0 +1,374 @@
+From b971c2bf247ae4912ff6bcb6dc15a9b67efbb5fa Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 02:47:38 +0800
+Subject: [PATCH 20/26] Show pre-live face verification as a native QR code
+
+startLive can ask for face verification with need_face_auth and a qr URL
+(the fields the Windows client's FaceAuthPresenter reads). That now
+becomes faceAuthQR: a native window shows the QR code for the Bilibili
+app, polls IsUserIdentifiedByFaceAuth every two seconds and retries Go
+live once verified, with a manual "verified, retry" fallback. Payloads
+carrying only a risk voucher keep using Bilibili's verification page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../LiveHimeCore/BilibiliLiveClient.swift     | 28 ++++--
+ .../LiveHimeCore/BilibiliPageWindow.swift     | 93 +++++++++++++++++++
+ .../core/Sources/LiveHimeCore/CBridge.swift   |  2 +
+ .../LiveHimeCore/LiveRoomActions.swift        | 22 +++++
+ .../LiveHimeCore/SessionCoordinator.swift     | 10 ++
+ .../DanmakuProtocolTests.swift                | 33 +++++++
+ .../SessionCoordinatorTests.swift             |  2 +
+ plugins/livehime/core/include/livehime-core.h |  4 +
+ plugins/livehime/data/locale/en-US.ini        |  1 +
+ plugins/livehime/data/locale/zh-CN.ini        |  1 +
+ plugins/livehime/src/account-panel.cpp        |  6 +-
+ 11 files changed, 195 insertions(+), 7 deletions(-)
+
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+index fbb871f55..72b0b8df0 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+@@ -82,6 +82,8 @@ public enum BilibiliLiveError: Error, Equatable {
+     case notLoggedIn
+     case missingStreamConfig
+     case faceAuthRequired(voucher: String?)
++    /// Pre-live face verification by QR code: scan `url` with the Bilibili app.
++    case faceAuthQR(url: String)
+ }
+ 
+ /// Cookie-authenticated live-room operations. The mutating methods are kept
+@@ -300,9 +302,7 @@ public struct BilibiliLiveClient: Sendable {
+         if code != 0 {
+             if code == -101 { throw BilibiliLiveError.notLoggedIn }
+             if code == 60043 || code == 60024 {
+-                let data = root["data"] as? [String: Any]
+-                let risk = data?["risk_extra"] as? [String: Any]
+-                throw BilibiliLiveError.faceAuthRequired(voucher: risk?["v_voucher"] as? String)
++                throw Self.faceAuthError(root["data"] as? [String: Any], required: true)!
+             }
+             throw BilibiliLiveError.api(code: code, message: root["message"] as? String ?? root["msg"] as? String ?? "Bilibili 接口返回失败")
+         }
+@@ -314,7 +314,25 @@ public struct BilibiliLiveClient: Sendable {
+     /// look at the known RTMP locations first, then collect every candidate
+     /// in a stable order and take the first rtmp/rtmps one. Dictionary
+     /// iteration order is random, so "first match wins" must never decide.
++    /// Face verification the payload asks for: a QR code for the phone app
++    /// (`need_face_auth` + `qr`, shown natively like the Windows client) or a
++    /// risk voucher for Bilibili's verification page. `required` forces an
++    /// answer for the face-auth error codes even without either field.
++    static func faceAuthError(_ data: [String: Any]?, required: Bool) -> BilibiliLiveError? {
++        let flagged: Bool = {
++            if let flag = data?["need_face_auth"] as? Bool { return flag }
++            return (data?["need_face_auth"] as? NSNumber)?.intValue == 1
++        }()
++        if let qr = data?["qr"] as? String, !qr.isEmpty, flagged || required {
++            return .faceAuthQR(url: qr)
++        }
++        let voucher = (data?["risk_extra"] as? [String: Any])?["v_voucher"] as? String
++        if required || flagged { return .faceAuthRequired(voucher: voucher) }
++        return nil
++    }
++
+     private static func parseStreamConfig(_ root: [String: Any]) throws -> BilibiliStreamConfig {
++        if let faceAuth = faceAuthError(root["data"] as? [String: Any], required: false) { throw faceAuth }
+         func pair(_ d: [String: Any]) -> (String, String)? {
+             let a = d["addr"] as? String ?? d["server"] as? String ?? d["rtmp_addr"] as? String
+             let k = d["code"] as? String ?? d["key"] as? String ?? d["stream_code"] as? String
+@@ -413,9 +431,7 @@ public struct BilibiliLiveClient: Sendable {
+             record(kind, http: http.statusCode, api: code)
+             if code == -101 { throw BilibiliLiveError.notLoggedIn }
+             if code == 60043 || code == 60024 {
+-                let data = root["data"] as? [String: Any]
+-                let risk = data?["risk_extra"] as? [String: Any]
+-                throw BilibiliLiveError.faceAuthRequired(voucher: risk?["v_voucher"] as? String)
++                throw Self.faceAuthError(root["data"] as? [String: Any], required: true)!
+             }
+             throw BilibiliLiveError.api(code: code, message: root["message"] as? String ?? root["msg"] as? String ?? "Bilibili 接口返回失败")
+         }
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+index d081fb9c0..3fc6a66b6 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+@@ -224,3 +224,96 @@ public func livehime_core_open_cover_page() {
+         }
+     }
+ }
++
++/// Native pre-live face verification, as the Windows client's FaceAuthView:
++/// show Bilibili's QR code for the phone app, poll whether the account has
++/// been verified and retry Go live once it has. The verification itself
++/// happens in the Bilibili app; nothing here completes or bypasses it.
++@MainActor
++final class FaceAuthQRWindow: NSObject, NSWindowDelegate {
++    private static var current: FaceAuthQRWindow?
++
++    private let window: NSWindow
++    private let status: NSTextField
++    private let onVerified: () -> Void
++    private var poll: Task<Void, Never>?
++
++    static func present(url: String, isVerified: @escaping () async -> Bool, onVerified: @escaping () -> Void) {
++        current?.window.close()
++        current = FaceAuthQRWindow(url: url, isVerified: isVerified, onVerified: onVerified)
++    }
++
++    private init(url: String, isVerified: @escaping () async -> Bool, onVerified: @escaping () -> Void) {
++        self.onVerified = onVerified
++        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 460),
++                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
++        status = NSTextField(wrappingLabelWithString: "请用哔哩哔哩 App 扫码，按提示完成人脸认证。")
++        super.init()
++
++        let image = NSImageView()
++        if let png = QRImage.png(for: url, pixels: 560) { image.image = NSImage(data: png) }
++        image.imageScaling = .scaleProportionallyUpOrDown
++        image.translatesAutoresizingMaskIntoConstraints = false
++        image.widthAnchor.constraint(equalToConstant: 280).isActive = true
++        image.heightAnchor.constraint(equalToConstant: 280).isActive = true
++        status.alignment = .center
++        let retry = NSButton(title: "验证完成，重试开播", target: self, action: #selector(retryTapped))
++        retry.keyEquivalent = "\r"
++        let close = NSButton(title: "关闭", target: self, action: #selector(closeTapped))
++        let buttons = NSStackView(views: [close, retry])
++        let root = NSStackView(views: [image, status, buttons])
++        root.orientation = .vertical
++        root.alignment = .centerX
++        root.spacing = 14
++        root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
++
++        window.title = "开播人脸认证"
++        window.contentView = root
++        window.isReleasedWhenClosed = false
++        window.delegate = self
++        window.center()
++        window.makeKeyAndOrderFront(nil)
++        NSApp.activate(ignoringOtherApps: true)
++
++        poll = Task { [weak self] in
++            while !Task.isCancelled {
++                try? await Task.sleep(for: .seconds(2))
++                guard !Task.isCancelled else { return }
++                if await isVerified() {
++                    self?.status.stringValue = "认证已通过，正在重试开播…"
++                    self?.finish()
++                    return
++                }
++            }
++        }
++    }
++
++    private func finish() {
++        let verified = onVerified
++        window.close()
++        verified()
++    }
++
++    @objc private func retryTapped() { finish() }
++    @objc private func closeTapped() { window.close() }
++
++    func windowWillClose(_ notification: Notification) {
++        poll?.cancel()
++        if Self.current === self { Self.current = nil }
++    }
++}
++
++/// Shows the native face verification QR code for the ready account and
++/// emits {"event":"faceAuthRetry"} once it is verified (or confirmed).
++@_cdecl("livehime_core_open_face_auth_qr")
++public func livehime_core_open_face_auth_qr(_ url: UnsafePointer<CChar>?) {
++    guard let url = url.map({ String(cString: $0) }), !url.isEmpty else { return }
++    DispatchQueue.main.async {
++        MainActor.assumeIsolated {
++            guard CoreBridge.shared != nil else { return }
++            FaceAuthQRWindow.present(url: url, isVerified: {
++                (try? await CoreBridge.shared?.coordinator.isIdentifiedByFaceAuth()) ?? false
++            }, onVerified: { CoreBridge.shared?.emit(["event": "faceAuthRetry"]) })
++        }
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index 2560a2809..bacc98df3 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -179,6 +179,8 @@ extension CoreBridge {
+             var fields: [String: Any] = ["kind": "faceAuth"]
+             if let voucher { fields["voucher"] = voucher }
+             return fields
++        case BilibiliLiveError.faceAuthQR(let url):
++            return ["kind": "faceAuthQR", "qr": url]
+         case BilibiliLiveError.notLoggedIn, BilibiliControlError.notLoggedIn:
+             return ["kind": "sessionExpired"]
+         case BilibiliLiveError.missingRoom:
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+index 19368d02d..35d79ab16 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+@@ -85,6 +85,28 @@ extension BilibiliLiveClient {
+                                               ("csrf", csrf), ("csrf_token", csrf)]))
+     }
+ 
++    /// Whether the account has passed pre-live face verification. The response
++    /// shape is not documented; any truthy "identified"/"is_face"/"status"
++    /// style field counts, anything else reads as "not yet".
++    public func isIdentifiedByFaceAuth(roomID: Int64, cookieHeader: String) async throws -> Bool {
++        let root = try await requestJSON(
++            url: withQuery(URL(string: "https://api.live.bilibili.com/xlive/app-blink/v1/preLive/IsUserIdentifiedByFaceAuth")!,
++                           [URLQueryItem(name: "room_id", value: String(roomID))]),
++            cookieHeader: cookieHeader, body: nil)
++        return Self.identified(root["data"])
++    }
++
++    static func identified(_ value: Any?) -> Bool {
++        guard let data = value as? [String: Any] else { return (value as? Bool) ?? false }
++        for (key, raw) in data {
++            let name = key.lowercased()
++            guard name.contains("identif") || name.contains("is_face") || name == "is_auth" || name == "face_auth" else { continue }
++            if let flag = raw as? Bool, flag { return true }
++            if let number = raw as? NSNumber, number.intValue == 1 { return true }
++        }
++        return false
++    }
++
+     /// Room moderation (the requests the live room page makes).
+     /// `hours`: -1 permanent, 0 for the current live session, otherwise hours.
+     public func muteUser(roomID: Int64, uid: Int64, hours: Int, cookieHeader: String) async throws {
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+index 06cffaf9f..57a6ad9c0 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -50,6 +50,7 @@ public protocol BilibiliAccountAPI: Sendable {
+     func muteUser(roomID: Int64, uid: Int64, hours: Int, cookieHeader: String) async throws
+     func shieldKeywords(roomID: Int64, cookieHeader: String) async throws -> [String]
+     func setShieldKeyword(roomID: Int64, keyword: String, add: Bool, cookieHeader: String) async throws
++    func isIdentifiedByFaceAuth(roomID: Int64, cookieHeader: String) async throws -> Bool
+ }
+ 
+ /// Reads cookies a previous app version left in its WebKit store.
+@@ -250,6 +251,11 @@ public final class SessionCoordinator {
+         await refreshRoom()
+     }
+ 
++    public func isIdentifiedByFaceAuth() async throws -> Bool {
++        let (saved, account) = try readyAccount()
++        return try await guarded { try await self.api.isIdentifiedByFaceAuth(roomID: account.room.roomID, cookieHeader: saved.cookieHeader) }
++    }
++
+     public func muteUser(uid: Int64, hours: Int) async throws {
+         let (saved, account) = try readyAccount()
+         try await guarded { try await self.api.muteUser(roomID: account.room.roomID, uid: uid, hours: hours, cookieHeader: saved.cookieHeader) }
+@@ -468,6 +474,10 @@ public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
+         try await SessionMaintenance().logout(current)
+     }
+ 
++    public func isIdentifiedByFaceAuth(roomID: Int64, cookieHeader: String) async throws -> Bool {
++        try await live(cookieHeader).isIdentifiedByFaceAuth(roomID: roomID, cookieHeader: cookieHeader)
++    }
++
+     public func muteUser(roomID: Int64, uid: Int64, hours: Int, cookieHeader: String) async throws {
+         try await live(cookieHeader).muteUser(roomID: roomID, uid: uid, hours: hours, cookieHeader: cookieHeader)
+     }
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+index effd7bb89..19a782f8a 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+@@ -103,3 +103,36 @@ final class StreamConfigParsingTests: XCTestCase {
+         }
+     }
+ }
++
++final class FaceAuthParsingTests: XCTestCase {
++    private func parse(_ object: [String: Any]) -> Error? {
++        do { _ = try BilibiliLiveClient.parseStreamConfig(from: try JSONSerialization.data(withJSONObject: object)); return nil }
++        catch { return error }
++    }
++
++    func testNeedFaceAuthWithQRIsNativeQR() {
++        let error = parse(["code": 0, "data": ["need_face_auth": true, "qr": "https://www.bilibili.com/h5/face?x=1"]])
++        XCTAssertEqual(error as? BilibiliLiveError, .faceAuthQR(url: "https://www.bilibili.com/h5/face?x=1"))
++    }
++
++    func testFaceAuthCodeWithVoucherUsesRiskPage() {
++        let error = parse(["code": 60024, "data": ["risk_extra": ["v_voucher": "v"]]])
++        XCTAssertEqual(error as? BilibiliLiveError, .faceAuthRequired(voucher: "v"))
++    }
++
++    func testFaceAuthCodeWithQRPrefersQR() {
++        let error = parse(["code": 60024, "data": ["qr": "https://q", "risk_extra": ["v_voucher": "v"]]])
++        XCTAssertEqual(error as? BilibiliLiveError, .faceAuthQR(url: "https://q"))
++    }
++
++    func testNormalPayloadIsNotFaceAuth() {
++        XCTAssertNil(parse(["code": 0, "data": ["need_face_auth": false, "rtmp": ["addr": "rtmp://a/live/", "code": "k"]]]))
++    }
++
++    func testIdentifiedFlagParsing() {
++        XCTAssertTrue(BilibiliLiveClient.identified(["is_identified": true]))
++        XCTAssertTrue(BilibiliLiveClient.identified(["is_face_auth": 1]))
++        XCTAssertFalse(BilibiliLiveClient.identified(["is_identified": false]))
++        XCTAssertFalse(BilibiliLiveClient.identified(["other": 1]))
++    }
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+index 7c98f5c26..9a32f80f1 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -57,6 +57,8 @@ private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
+     }
+     func confirmRefresh(renewed: SessionCredentials, previousRefreshToken: String) async throws { confirmed.append(previousRefreshToken) }
+     func logout(_ current: SessionCredentials) async throws { loggedOut.append(current) }
++    var identified = false
++    func isIdentifiedByFaceAuth(roomID: Int64, cookieHeader: String) async throws -> Bool { identified }
+     var muted: [(Int64, Int)] = []
+     var keywords: [String] = ["刷屏"]
+     func muteUser(roomID: Int64, uid: Int64, hours: Int, cookieHeader: String) async throws { muted.append((uid, hours)) }
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index dee5292c4..8dff0ddfe 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -39,6 +39,10 @@ void livehime_core_stop_live(void);
+  * ready account, using the voucher from a "faceAuth" liveError (may be NULL).
+  * When the user confirms, {"event":"faceAuthRetry"} is emitted. */
+ void livehime_core_open_face_auth(const char *voucher);
++/* Native face verification: shows the QR code from a "faceAuthQR" liveError
++ * ({"kind":"faceAuthQR","qr":url}), polls the status and emits
++ * {"event":"faceAuthRetry"} when verified. */
++void livehime_core_open_face_auth_qr(const char *url);
+ 
+ /* Opens Bilibili's live cover manager (upload, crop, history, review) for
+  * the ready account; emits {"event":"coverWindowClosed"} when it closes. */
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 9cba19fbc..d44dcffe3 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -119,3 +119,4 @@ LiveHime.Feature.RemoveKeyword="Remove selected"
+ LiveHime.Feature.KeywordHint="Bilibili hides danmaku containing these words for everyone in your room."
+ LiveHime.Feature.KeywordFailed="Blocked words could not be updated."
+ LiveHime.Account.LoginWeb="Log in with password or SMS..."
++LiveHime.Live.FaceAuthQROpened="Bilibili requires face verification. Scan the QR code in the window that opened with the Bilibili app; going live resumes automatically."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index b1b8732f4..bb566e4f9 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -119,3 +119,4 @@ LiveHime.Feature.RemoveKeyword="删除所选"
+ LiveHime.Feature.KeywordHint="哔哩哔哩会为直播间里所有人隐藏包含这些词的弹幕。"
+ LiveHime.Feature.KeywordFailed="屏蔽词未能更新。"
+ LiveHime.Account.LoginWeb="改用密码或短信登录…"
++LiveHime.Live.FaceAuthQROpened="哔哩哔哩要求人脸认证。请用哔哩哔哩 App 扫描弹出窗口里的二维码，完成后会自动继续开播。"
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index 32484b66a..cc80d4c3c 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -218,7 +218,11 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 			setLiveStatus(stream_->lastError() + QStringLiteral("\n") + text("LiveHime.Live.RoomStillOpen"), true);
+ 	} else if (name == "liveError") {
+ 		requesting_ = false;
+-		if (event.value("kind").toString() == "faceAuth") {
++		if (event.value("kind").toString() == "faceAuthQR") {
++			blog(LOG_INFO, "[livehime] face verification required (QR)");
++			setLiveStatus(text("LiveHime.Live.FaceAuthQROpened"), true);
++			livehime_core_open_face_auth_qr(event.value("qr").toString().toUtf8().constData());
++		} else if (event.value("kind").toString() == "faceAuth") {
+ 			/* The voucher is a one-time risk token, not a credential; log
+ 			 * only whether Bilibili sent one. */
+ 			blog(LOG_INFO, "[livehime] face verification required (voucher: %s)",

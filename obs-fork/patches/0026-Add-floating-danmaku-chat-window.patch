@@ -1,0 +1,1820 @@
+From dca0e48dce7db0e577bb36b252e18b726fa8fd41 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 04:28:10 +0800
+Subject: [PATCH 26/26] Add floating danmaku chat window
+
+A frameless window with the live feed and send box, opened from the
+dock or a hotkey. It can stay on top, be pinned in place, run at
+50-100% opacity, and is left out of OBS's screen capture unless the
+user allows it.
+
+mac-capture asks the host through the global procedure
+hide_obs_window_exceptions for windows to keep visible while Hide OBS
+is on and windows to leave out while it is off, and rebuilds the
+stream when that list changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md          |  10 +
+ build-aux/livehime/tests/e2e-floating.mjs   | 160 +++++++++++
+ plugins/livehime/CMakeLists.txt             |  10 +
+ plugins/livehime/data/locale/en-US.ini      |  13 +
+ plugins/livehime/data/locale/zh-CN.ini      |  13 +
+ plugins/livehime/src/account-panel.hpp      |   4 +
+ plugins/livehime/src/automation.cpp         |  53 +++-
+ plugins/livehime/src/danmaku-feed.cpp       | 205 ++++++++++++++
+ plugins/livehime/src/danmaku-feed.hpp       |  46 +++
+ plugins/livehime/src/feature-panel.cpp      | 197 +++----------
+ plugins/livehime/src/feature-panel.hpp      |  18 +-
+ plugins/livehime/src/floating-chat.cpp      | 296 ++++++++++++++++++++
+ plugins/livehime/src/floating-chat.hpp      |  67 +++++
+ plugins/livehime/src/livehime-dock.hpp      |   1 +
+ plugins/livehime/src/plugin-main.cpp        |  49 +++-
+ plugins/livehime/src/plugin-settings.cpp    |  24 ++
+ plugins/livehime/src/plugin-settings.hpp    |   9 +
+ plugins/livehime/src/window-native.hpp      |  19 ++
+ plugins/livehime/src/window-native.mm       |  68 +++++
+ plugins/mac-capture/mac-sck-common.h        |   6 +
+ plugins/mac-capture/mac-sck-video-capture.m |  79 +++++-
+ 21 files changed, 1170 insertions(+), 177 deletions(-)
+ create mode 100644 build-aux/livehime/tests/e2e-floating.mjs
+ create mode 100644 plugins/livehime/src/danmaku-feed.cpp
+ create mode 100644 plugins/livehime/src/danmaku-feed.hpp
+ create mode 100644 plugins/livehime/src/floating-chat.cpp
+ create mode 100644 plugins/livehime/src/floating-chat.hpp
+ create mode 100644 plugins/livehime/src/plugin-settings.cpp
+ create mode 100644 plugins/livehime/src/plugin-settings.hpp
+ create mode 100644 plugins/livehime/src/window-native.hpp
+ create mode 100644 plugins/livehime/src/window-native.mm
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 5c4665e50..31012862d 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -45,3 +45,13 @@ public live room id is given:
+ ```sh
+ LIVEHIME_LIVE_ROOM=<room id> swift test --filter DanmakuLiveIntegrationTests
+ ```
++
++`e2e-floating.mjs` checks the floating chat window (position, opacity
++limits, feed) and that OBS's screen capture shows it only when "允许被屏幕采集"
++is on, both with and without the capture's "Hide OBS" option. It needs an
++active display capture in the program scene and saves crops of the window
++area to the given directory:
++
++```bash
++node e2e-floating.mjs <websocket password> <screen width> <screen height> <crop dir>
++```
+diff --git a/build-aux/livehime/tests/e2e-floating.mjs b/build-aux/livehime/tests/e2e-floating.mjs
+new file mode 100644
+index 000000000..20f5b3307
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-floating.mjs
+@@ -0,0 +1,160 @@
++// Floating chat: options, feed, and whether screen capture sees the window.
++// Usage: node e2e-floating.mjs <ws password> <screen width pt> <screen height pt> <crop dir>
++// Needs an active "macOS 屏幕采集" source in the program scene.
++import { createHash } from 'node:crypto';
++import zlib from 'node:zlib';
++import { writeFileSync } from 'node:fs';
++
++const [password, screenW, screenH] = [process.argv[2], Number(process.argv[3]), Number(process.argv[4])];
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const ws = new WebSocket('ws://127.0.0.1:4466');
++let id = 1;
++const pend = new Map();
++const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: t, requestData: d })).responseData?.responseData;
++let fails = 0;
++const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
++
++function decode(png) {
++  let o = 8, w = 0, h = 0; const idat = [];
++  while (o < png.length) {
++    const len = png.readUInt32BE(o), type = png.toString('ascii', o + 4, o + 8), data = png.subarray(o + 8, o + 8 + len);
++    if (type === 'IHDR') { w = data.readUInt32BE(0); h = data.readUInt32BE(4); }
++    if (type === 'IDAT') idat.push(data);
++    o += 12 + len;
++  }
++  const raw = zlib.inflateSync(Buffer.concat(idat)), stride = w * 4, out = Buffer.alloc(w * h * 4); let prev = Buffer.alloc(stride);
++  for (let y = 0; y < h; y++) {
++    const f = raw[y * (stride + 1)], line = Buffer.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
++    for (let x = 0; x < stride; x++) {
++      const a = x >= 4 ? line[x - 4] : 0, b = prev[x], c = x >= 4 ? prev[x - 4] : 0;
++      const p = f === 1 ? a : f === 2 ? b : f === 3 ? (a + b) >> 1 : f === 4 ? (() => { const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c); return pa <= pb && pa <= pc ? a : pb <= pc ? b : c; })() : 0;
++      line[x] = (line[x] + p) & 255;
++    }
++    line.copy(out, y * stride); prev = line;
++  }
++  return { w, h, px: out };
++}
++// Mean per-pixel difference (0-255) between two captures over a rectangle in screen points.
++function pixdiff(a, b, x, y, w, h) {
++  const sx = a.w / screenW, sy = a.h / screenH; let sum = 0, n = 0;
++  for (let py = Math.round(y * sy); py < Math.round((y + h) * sy); py += 2)
++    for (let px = Math.round(x * sx); px < Math.round((x + w) * sx); px += 2) {
++      const i = (py * a.w + px) * 4;
++      sum += (Math.abs(a.px[i] - b.px[i]) + Math.abs(a.px[i + 1] - b.px[i + 1]) + Math.abs(a.px[i + 2] - b.px[i + 2])) / 3; n++;
++    }
++  return sum / n;
++}
++// Mean luminance of a rectangle given in screen points.
++function luma(img, x, y, w, h) {
++  const sx = img.w / screenW, sy = img.h / screenH; let sum = 0, n = 0;
++  for (let py = Math.round(y * sy); py < Math.round((y + h) * sy); py += 2)
++    for (let px = Math.round(x * sx); px < Math.round((x + w) * sx); px += 2) {
++      const i = (py * img.w + px) * 4; sum += 0.2126 * img.px[i] + 0.7152 * img.px[i + 1] + 0.0722 * img.px[i + 2]; n++;
++    }
++  return sum / n;
++}
++async function capture(input) {
++  // Screen capture needs a moment to deliver its first frame.
++  let last;
++  for (let i = 0; i < 20; i++) {
++    const r = await req('GetSourceScreenshot', { sourceName: input, imageFormat: 'png' });
++    if (r.requestStatus.result) return decode(Buffer.from(r.responseData.imageData.split(',')[1], 'base64'));
++    last = r.requestStatus.comment; await sleep(500);
++  }
++  throw new Error('screenshot failed: ' + last);
++}
++
++ws.onmessage = async (ev) => {
++  const m = JSON.parse(ev.data);
++  if (m.op === 0) { const { challenge, salt } = m.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + salt) + challenge), eventSubscriptions: 0 } })); }
++  else if (m.op === 7) pend.get(m.d.requestId)?.(m.d);
++  else if (m.op === 2) {
++    for (let i = 0; i < 40 && !(await req('GetVersion')).requestStatus.result; i++) await sleep(500);
++    const win = { x: 120, y: 140, w: 360, h: 460 };
++    let s = await vendor('FloatingChat', { visible: true, ...win, on_top: true, pinned: false, capturable: false, opacity: 85 });
++    check('floating chat opens at the requested place', s.visible && s.x === win.x && s.w === win.w, JSON.stringify({ x: s.x, y: s.y, w: s.w, h: s.h }));
++    check('opacity 85% applied', Math.abs(s.window_opacity - 0.85) < 0.01, String(s.window_opacity));
++    s = await vendor('FloatingChat', { opacity: 20 });
++    check('opacity clamps to 50%', s.opacity === 50, String(s.opacity));
++    s = await vendor('FloatingChat', { opacity: 85 });
++
++    const before = s.lines;
++    for (const [user, text] of [['观众A', '主播晚上好'], ['观众B', '悬浮窗测试']]) await vendor('InjectOverlayEvent', { kind: 'chat', user, text, uid: 7 });
++    await vendor('InjectOverlayEvent', { kind: 'superChat', user: '观众C', text: '加油', price: 30, seconds: 60 });
++    await sleep(300);
++    s = await vendor('FloatingChat', {});
++    check('floating feed receives room events', s.lines - before === 3, `${s.lines - before} new lines`);
++
++    // Screen capture only delivers frames while active, so use the program
++    // scene's existing screen capture source (read-only screenshots).
++    const inputs = (await req('GetInputList', { inputKind: 'screen_capture' })).responseData.inputs;
++    const inner = { x: win.x + 20, y: win.y + 60, w: win.w - 40, h: win.h - 120 };
++    const L = (img) => luma(img, inner.x, inner.y, inner.w, inner.h);
++    try {
++    if (!inputs.length) throw new Error('no screen capture source in the profile');
++    const input = inputs[0].inputName;
++    check('using active screen capture source', true, input);
++
++    const shots = {};
++    const settle = () => sleep(2500);
++    await vendor('FloatingChat', { visible: false }); await settle();
++    shots.A_closed = await capture(input);
++    await vendor('FloatingChat', { visible: true, capturable: false }); await settle();
++    shots.B_hidden = await capture(input);
++    await vendor('FloatingChat', { capturable: true }); await settle();
++    shots.C_shown = await capture(input);
++    await vendor('FloatingChat', { capturable: false }); await settle();
++    shots.D_hidden = await capture(input);
++    for (const [k, img] of Object.entries(shots)) {
++      // Save the window area (raw RGBA) for inspection.
++      const sx = img.w / screenW, x0 = Math.round(win.x * sx), y0 = Math.round(win.y * sx), w = Math.round(win.w * sx), h = Math.round(win.h * sx);
++      const crop = Buffer.alloc(w * h * 4);
++      for (let y = 0; y < h; y++) img.px.copy(crop, y * w * 4, ((y0 + y) * img.w + x0) * 4, ((y0 + y) * img.w + x0 + w) * 4);
++      writeFileSync(process.argv[5] + '/' + k + '.rgba', crop); writeFileSync(process.argv[5] + '/' + k + '.size', `${w}x${h}`);
++      console.log(k, 'window-area luminance', L(img).toFixed(1));
++    }
++    const d = (a, b) => Math.abs(L(a) - L(b));
++    check('hidden: capture shows the desktop, not the window', d(shots.B_hidden, shots.A_closed) < 12, d(shots.B_hidden, shots.A_closed).toFixed(1));
++    check('allowed: capture shows the window', d(shots.C_shown, shots.A_closed) > 30, d(shots.C_shown, shots.A_closed).toFixed(1));
++    check('hidden again after toggling back', d(shots.D_hidden, shots.A_closed) < 12, d(shots.D_hidden, shots.A_closed).toFixed(1));
++    } catch (e) { check('capture comparison', false, e.message); }
++    finally {}
++
++    // Same check through a capture that does NOT hide LiveHime: the
++    // per-window override must still leave the window out unless allowed.
++    // Temporary source in the program scene, always removed. Whatever lies
++    // behind the window differs from it pixel by pixel, so compare pixels.
++    const scene = (await req('GetCurrentProgramScene')).responseData.currentProgramSceneName;
++    const probe = 'livehime-e2e-nohide';
++    const template = (await req('GetInputSettings', { inputName: inputs[0].inputName })).responseData.inputSettings;
++    try {
++      const made = await req('CreateInput', { sceneName: scene, inputName: probe, inputKind: 'screen_capture', inputSettings: { ...template, hide_obs: false } });
++      check('temporary no-hide capture created', made.requestStatus.result, made.requestStatus.comment);
++      await vendor('FloatingChat', { visible: false }); await sleep(2500);
++      const a = await capture(probe);
++      await vendor('FloatingChat', { visible: true, capturable: false }); await sleep(2500);
++      const b = await capture(probe);
++      await vendor('FloatingChat', { capturable: true }); await sleep(2500);
++      const c = await capture(probe);
++      await vendor('FloatingChat', { capturable: false }); await sleep(2500);
++      const d = await capture(probe);
++      const P = (x, y) => pixdiff(x, y, inner.x, inner.y, inner.w, inner.h);
++      console.log(`no-hide capture pixel diff vs closed: notAllowed=${P(b, a).toFixed(1)} allowed=${P(c, a).toFixed(1)} notAllowedAgain=${P(d, a).toFixed(1)}`);
++      check('no-hide capture: window hidden when not allowed', P(b, a) < 4, P(b, a).toFixed(1));
++      check('no-hide capture: window shown when allowed', P(c, a) > 10, P(c, a).toFixed(1));
++      check('no-hide capture: hidden again after toggling back', P(d, a) < 4, P(d, a).toFixed(1));
++    } catch (e) { check('no-hide capture comparison', false, e.message); }
++    finally { await req('RemoveInput', { inputName: probe }); }
++    let left = [];
++    for (let i = 0; i < 20; i++) { // removal completes asynchronously
++      left = (await req('GetInputList', { inputKind: 'screen_capture' })).responseData.inputs.map((i) => i.inputName);
++      if (!left.includes(probe)) break; await sleep(250);
++    }
++    check('temporary source removed', !left.includes(probe), left.join(','));
++    s = await vendor('FloatingChat', { visible: false });
++    check('floating chat closes', !s.visible);
++    console.log(fails ? `${fails} failed` : 'all passed'); process.exit(fails ? 1 : 0);
++  }
++};
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 75cf6666a..d07ae3c70 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -29,15 +29,23 @@ target_sources(
+     src/account-panel.hpp
+     src/automation.cpp
+     src/automation.hpp
++    src/danmaku-feed.cpp
++    src/danmaku-feed.hpp
+     src/danmaku-overlay.cpp
+     src/danmaku-overlay.hpp
+     src/feature-panel.cpp
+     src/feature-panel.hpp
++    src/floating-chat.cpp
++    src/floating-chat.hpp
+     src/livehime-dock.cpp
+     src/livehime-dock.hpp
+     src/plugin-main.cpp
++    src/plugin-settings.cpp
++    src/plugin-settings.hpp
+     src/stream-controller.cpp
+     src/stream-controller.hpp
++    src/window-native.hpp
++    src/window-native.mm
+ )
+ 
+ target_compile_options(
+@@ -69,3 +77,5 @@ set_target_properties_obs(livehime PROPERTIES FOLDER plugins/livehime PREFIX ""
+ # The Swift session core (core/) is compiled into the plugin; it is also a
+ # standalone Swift package for `swift test`.
+ set_target_xcode_properties(livehime PROPERTIES SWIFT_VERSION 5.0 SWIFT_MODULE_NAME LiveHimeCore)
++
++set_source_files_properties(src/window-native.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index d44dcffe3..c9c17479d 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -120,3 +120,16 @@ LiveHime.Feature.KeywordHint="Bilibili hides danmaku containing these words for
+ LiveHime.Feature.KeywordFailed="Blocked words could not be updated."
+ LiveHime.Account.LoginWeb="Log in with password or SMS..."
+ LiveHime.Live.FaceAuthQROpened="Bilibili requires face verification. Scan the QR code in the window that opened with the Bilibili app; going live resumes automatically."
++LiveHime.Floating.Title="Danmaku"
++LiveHime.Floating.Open="Floating chat"
++LiveHime.Floating.OpenTip="Open a floating danmaku window for replying from anywhere"
++LiveHime.Floating.OnTop="On top"
++LiveHime.Floating.OnTopTip="Keep above other apps, including full-screen ones"
++LiveHime.Floating.Pin="Pin"
++LiveHime.Floating.PinTip="Lock the window's position and size"
++LiveHime.Floating.More="Opacity and capture"
++LiveHime.Floating.Close="Close"
++LiveHime.Floating.Opacity="Opacity"
++LiveHime.Floating.Capturable="Allow screen capture"
++LiveHime.Floating.CapturableTip="When off, screen capture (and your stream) does not show this window."
++LiveHime.Floating.Hotkey="LiveHime: toggle floating chat"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index bb566e4f9..4788063a6 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -120,3 +120,16 @@ LiveHime.Feature.KeywordHint="哔哩哔哩会为直播间里所有人隐藏包
+ LiveHime.Feature.KeywordFailed="屏蔽词未能更新。"
+ LiveHime.Account.LoginWeb="改用密码或短信登录…"
+ LiveHime.Live.FaceAuthQROpened="哔哩哔哩要求人脸认证。请用哔哩哔哩 App 扫描弹出窗口里的二维码，完成后会自动继续开播。"
++LiveHime.Floating.Title="弹幕"
++LiveHime.Floating.Open="悬浮聊天"
++LiveHime.Floating.OpenTip="打开悬浮弹幕窗口，在任何界面都能回复"
++LiveHime.Floating.OnTop="置顶"
++LiveHime.Floating.OnTopTip="保持在其他应用上方，包括全屏应用"
++LiveHime.Floating.Pin="钉住"
++LiveHime.Floating.PinTip="锁定窗口位置和大小"
++LiveHime.Floating.More="不透明度与采集"
++LiveHime.Floating.Close="关闭"
++LiveHime.Floating.Opacity="不透明度"
++LiveHime.Floating.Capturable="允许被屏幕采集"
++LiveHime.Floating.CapturableTip="关闭时，屏幕采集（以及你的直播画面）中看不到这个窗口。"
++LiveHime.Floating.Hotkey="直播姬：打开/关闭悬浮聊天"
+diff --git a/plugins/livehime/src/account-panel.hpp b/plugins/livehime/src/account-panel.hpp
+index a17020d37..62cb615cf 100644
+--- a/plugins/livehime/src/account-panel.hpp
++++ b/plugins/livehime/src/account-panel.hpp
+@@ -34,6 +34,10 @@ public:
+ 	 * is still open, close it and wait briefly (bounded) for Bilibili. */
+ 	void closeRoomBeforeExit();
+ 
++	/* Automation/testing: delivers an event as if the core had sent it
++	 * (feeds, overlays). Never reaches Bilibili. */
++	void injectEvent(const QJsonObject &event) { emit eventReceived(event); }
++
+ signals:
+ 	void stateChanged(const QJsonObject &state);
+ 	void eventReceived(const QJsonObject &event);
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 7a3ddb390..495949e11 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -1,6 +1,9 @@
+ #include "automation.hpp"
+ #include "account-panel.hpp"
+ #include "danmaku-overlay.hpp"
++#include "feature-panel.hpp"
++#include "floating-chat.hpp"
++#include "danmaku-feed.hpp"
+ #include "livehime-dock.hpp"
+ 
+ #include <livehime-core.h>
+@@ -106,8 +109,9 @@ void getBrandingState(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
+-/* Test hook: feeds a room event ({"kind","user","text",...}) to the danmaku
+- * overlays only. Nothing is sent to Bilibili. */
++/* Test hook: delivers a room event ({"kind","user","text",...}) to the
++ * feeds and overlays through the normal event path. Nothing reaches
++ * Bilibili. */
+ void injectOverlayEvent(obs_data_t *request, obs_data_t *response, void *)
+ {
+ 	const char *json = obs_data_get_json(request);
+@@ -115,12 +119,51 @@ void injectOverlayEvent(obs_data_t *request, obs_data_t *response, void *)
+ 	const bool ran = onUiThread([&] {
+ 		QJsonObject room = event;
+ 		room.insert("event", "room");
+-		if (DanmakuOverlayHub *hub = DanmakuOverlayHub::instance())
+-			hub->push(room);
++		target->account()->injectEvent(room);
+ 	});
+ 	obs_data_set_bool(response, "accepted", ran);
+ }
+ 
++/* Floating chat control for tests: optional visible, on_top, pinned,
++ * capturable, opacity, and geometry x/y/w/h (points). Replies with the
++ * resulting state. */
++void floatingChat(obs_data_t *request, obs_data_t *response, void *)
++{
++	onUiThread([&] {
++		FloatingChat *chat = target->features()->floatingChat();
++		FloatingChat::Options options = chat->options();
++		if (obs_data_has_user_value(request, "on_top"))
++			options.onTop = obs_data_get_bool(request, "on_top");
++		if (obs_data_has_user_value(request, "pinned"))
++			options.pinned = obs_data_get_bool(request, "pinned");
++		if (obs_data_has_user_value(request, "capturable"))
++			options.capturable = obs_data_get_bool(request, "capturable");
++		if (obs_data_has_user_value(request, "opacity"))
++			options.opacity = static_cast<int>(obs_data_get_int(request, "opacity"));
++		if (obs_data_has_user_value(request, "w"))
++			chat->setGeometry(static_cast<int>(obs_data_get_int(request, "x")),
++					  static_cast<int>(obs_data_get_int(request, "y")),
++					  static_cast<int>(obs_data_get_int(request, "w")),
++					  static_cast<int>(obs_data_get_int(request, "h")));
++		if (obs_data_has_user_value(request, "visible"))
++			chat->setVisible(obs_data_get_bool(request, "visible"));
++		chat->setOptions(options);
++		options = chat->options();
++		const QRect geometry = chat->geometry();
++		obs_data_set_bool(response, "visible", chat->isVisible());
++		obs_data_set_bool(response, "on_top", options.onTop);
++		obs_data_set_bool(response, "pinned", options.pinned);
++		obs_data_set_bool(response, "capturable", options.capturable);
++		obs_data_set_int(response, "opacity", options.opacity);
++		obs_data_set_double(response, "window_opacity", chat->windowOpacity());
++		obs_data_set_int(response, "lines", chat->feed()->lineCount());
++		obs_data_set_int(response, "x", geometry.x());
++		obs_data_set_int(response, "y", geometry.y());
++		obs_data_set_int(response, "w", geometry.width());
++		obs_data_set_int(response, "h", geometry.height());
++	});
++}
++
+ void startQRLogin(obs_data_t *, obs_data_t *, void *)
+ {
+ 	onUiThread([] { livehime_core_start_qr_login(); });
+@@ -146,6 +189,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "GetAccountState", getAccountState, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "GetBrandingState", getBrandingState, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "InjectOverlayEvent", injectOverlayEvent, nullptr);
++	obs_websocket_vendor_register_request(vendor, "FloatingChat", floatingChat, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "StartQRLogin", startQRLogin, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "CancelQRLogin", cancelQRLogin, nullptr);
+ }
+@@ -159,6 +203,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "GetAccountState");
+ 		obs_websocket_vendor_unregister_request(vendor, "GetBrandingState");
+ 		obs_websocket_vendor_unregister_request(vendor, "InjectOverlayEvent");
++		obs_websocket_vendor_unregister_request(vendor, "FloatingChat");
+ 		obs_websocket_vendor_unregister_request(vendor, "StartQRLogin");
+ 		obs_websocket_vendor_unregister_request(vendor, "CancelQRLogin");
+ 		vendor = nullptr;
+diff --git a/plugins/livehime/src/danmaku-feed.cpp b/plugins/livehime/src/danmaku-feed.cpp
+new file mode 100644
+index 000000000..1c8167913
+--- /dev/null
++++ b/plugins/livehime/src/danmaku-feed.cpp
+@@ -0,0 +1,205 @@
++#include "danmaku-feed.hpp"
++
++#include <livehime-core.h>
++#include <obs-module.h>
++
++#include <QApplication>
++#include <QClipboard>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QLineEdit>
++#include <QListWidget>
++#include <QMenu>
++#include <QPushButton>
++#include <QScrollBar>
++#include <QTimer>
++#include <QVBoxLayout>
++
++#include <algorithm>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++
++constexpr int kMaxFeedItems = 300;
++} // namespace
++
++DanmakuFeed::DanmakuFeed(bool compact, QWidget *parent) : QWidget(parent)
++{
++	pinned_ = new QLabel(this);
++	pinned_->setWordWrap(true);
++	pinned_->setStyleSheet(QStringLiteral(
++		"QLabel { background: #3a2226; color: #ffd7da; border-left: 3px solid #fb4d5a; padding: 6px; }"));
++	pinned_->hide();
++	pinnedTimer_ = new QTimer(this);
++	pinnedTimer_->setSingleShot(true);
++	connect(pinnedTimer_, &QTimer::timeout, pinned_, &QLabel::hide);
++
++	list_ = new QListWidget(this);
++	list_->setWordWrap(true);
++	list_->setUniformItemSizes(false);
++	list_->setSelectionMode(QAbstractItemView::ExtendedSelection);
++	list_->setContextMenuPolicy(Qt::CustomContextMenu);
++	connect(list_, &QListWidget::customContextMenuRequested, this, &DanmakuFeed::showMenu);
++	if (compact)
++		list_->setFrameShape(QFrame::NoFrame);
++
++	message_ = new QLineEdit(this);
++	message_->setPlaceholderText(text("LiveHime.Feature.MessagePlaceholder"));
++	message_->setMaxLength(40);
++	send_ = new QPushButton(text("LiveHime.Feature.Send"), this);
++	connect(send_, &QPushButton::clicked, this, &DanmakuFeed::send);
++	connect(message_, &QLineEdit::returnPressed, this, &DanmakuFeed::send);
++	auto *sendRow = new QHBoxLayout;
++	sendRow->addWidget(message_, 1);
++	sendRow->addWidget(send_);
++
++	auto *layout = new QVBoxLayout(this);
++	layout->setContentsMargins(0, 0, 0, 0);
++	layout->setSpacing(compact ? 4 : 6);
++	layout->addWidget(pinned_);
++	layout->addWidget(list_, 1);
++	layout->addLayout(sendRow);
++	setReady(false);
++}
++
++void DanmakuFeed::setFilters(bool showEntries, bool giftsOnly)
++{
++	showEntries_ = showEntries;
++	giftsOnly_ = giftsOnly;
++}
++
++void DanmakuFeed::setReady(bool ready)
++{
++	if (ready_ && !ready) {
++		list_->clear();
++		pinned_->hide();
++	}
++	ready_ = ready;
++	message_->setEnabled(ready);
++	send_->setEnabled(ready && !sending_);
++}
++
++void DanmakuFeed::handleEvent(const QJsonObject &event)
++{
++	const QString name = event.value("event").toString();
++	if (name == "danmakuSent") {
++		/* Only the feed that sent reacts; the other keeps its draft. */
++		if (!sending_)
++			return;
++		sending_ = false;
++		send_->setEnabled(ready_);
++		if (event.value("ok").toBool()) {
++			message_->clear();
++		} else {
++			const QString detail = event.value("message").toString();
++			append(text("LiveHime.Feature.SendFailed") + (detail.isEmpty() ? QString() : QStringLiteral("：") + detail),
++			       QStringLiteral("#e06c75"));
++		}
++		return;
++	}
++	if (name == "userMuted") {
++		const bool ok = event.value("ok").toBool();
++		const QString detail = event.value("message").toString();
++		append(ok ? text("LiveHime.Feature.Muted")
++			  : text("LiveHime.Feature.MuteFailed") + (detail.isEmpty() ? QString() : QStringLiteral("：") + detail),
++		       ok ? QStringLiteral("#9aa0ab") : QStringLiteral("#e06c75"));
++		return;
++	}
++	if (name != "room")
++		return;
++
++	const QString kind = event.value("kind").toString();
++	const QString user = event.value("user").toString();
++	if (kind == "chat") {
++		if (giftsOnly_)
++			return;
++		const QString medal = event.value("medal").toString();
++		append((medal.isEmpty() ? QString() : QStringLiteral("[%1] ").arg(medal)) + user + QStringLiteral("：") +
++			       event.value("text").toString(),
++		       QString(), event.value("uid").toVariant().toLongLong(), user);
++	} else if (kind == "gift") {
++		append(text("LiveHime.Feature.Gift").arg(user, event.value("name").toString()).arg(event.value("count").toInt()),
++		       QStringLiteral("#e0a040"));
++	} else if (kind == "superChat") {
++		const QString line =
++			text("LiveHime.Feature.SuperChat").arg(event.value("price").toInt()).arg(user, event.value("text").toString());
++		append(line, QStringLiteral("#fb4d5a"));
++		pinSuperChat(line, event.value("seconds").toInt());
++	} else if (kind == "guard") {
++		append(text("LiveHime.Feature.Guard").arg(user, event.value("name").toString()), QStringLiteral("#8994ee"));
++	} else if (kind == "enter" || kind == "follow" || kind == "share") {
++		if (!giftsOnly_ && (showEntries_ || kind == "follow")) {
++			const QByteArray key = "LiveHime.Feature.Interact." + kind.toUtf8();
++			append(text(key.constData()).arg(user), QStringLiteral("#6c717b"));
++		}
++	} else if (kind == "liveStarted" || kind == "liveEnded") {
++		append(text(kind == "liveStarted" ? "LiveHime.Feature.LiveStarted" : "LiveHime.Feature.LiveEnded"),
++		       QStringLiteral("#9aa0ab"));
++	}
++}
++
++int DanmakuFeed::lineCount() const
++{
++	return list_->count();
++}
++
++void DanmakuFeed::append(const QString &line, const QString &color, qint64 uid, const QString &user)
++{
++	QScrollBar *bar = list_->verticalScrollBar();
++	const bool atBottom = bar->value() >= bar->maximum() - 4;
++	auto *item = new QListWidgetItem(line);
++	if (!color.isEmpty())
++		item->setForeground(QColor(color));
++	if (uid > 0) {
++		item->setData(Qt::UserRole, uid);
++		item->setData(Qt::UserRole + 1, user);
++	}
++	list_->addItem(item);
++	while (list_->count() > kMaxFeedItems)
++		delete list_->takeItem(0);
++	/* Keep following new messages unless the user scrolled up to read. */
++	if (atBottom)
++		list_->scrollToBottom();
++}
++
++void DanmakuFeed::pinSuperChat(const QString &line, int seconds)
++{
++	/* Keep the latest Super Chat above the feed for its paid duration. */
++	pinned_->setText(line);
++	pinned_->show();
++	pinnedTimer_->start(std::max(seconds, 10) * 1000);
++}
++
++void DanmakuFeed::showMenu(const QPoint &pos)
++{
++	QListWidgetItem *item = list_->itemAt(pos);
++	if (!item)
++		return;
++	QMenu menu(this);
++	const QString line = item->text();
++	menu.addAction(text("LiveHime.Feature.Copy"), this, [line] { QApplication::clipboard()->setText(line); });
++	const qint64 uid = item->data(Qt::UserRole).toLongLong();
++	const QString user = item->data(Qt::UserRole + 1).toString();
++	if (uid > 0) {
++		QMenu *mute = menu.addMenu(text("LiveHime.Feature.MuteUser").arg(user));
++		const std::pair<const char *, int> choices[] = {{"LiveHime.Feature.MuteSession", 0},
++								{"LiveHime.Feature.MuteHour", 1},
++								{"LiveHime.Feature.MuteForever", -1}};
++		for (const auto &[label, hours] : choices)
++			mute->addAction(text(label), this, [uid, hours = hours] { livehime_core_mute_user(uid, hours); });
++	}
++	menu.exec(list_->viewport()->mapToGlobal(pos));
++}
++
++void DanmakuFeed::send()
++{
++	const QByteArray message = message_->text().trimmed().toUtf8();
++	if (!ready_ || sending_ || message.isEmpty())
++		return;
++	sending_ = true;
++	send_->setEnabled(false);
++	livehime_core_send_danmaku(message.constData());
++}
+diff --git a/plugins/livehime/src/danmaku-feed.hpp b/plugins/livehime/src/danmaku-feed.hpp
+new file mode 100644
+index 000000000..fd6799b7d
+--- /dev/null
++++ b/plugins/livehime/src/danmaku-feed.hpp
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include <QJsonObject>
++#include <QWidget>
++
++class QLabel;
++class QLineEdit;
++class QListWidget;
++class QPushButton;
++class QTimer;
++
++/* The live danmaku feed with its send box: chat, gifts, Super Chats (the
++ * latest one pinned for its paid duration), guards and entries, a right-
++ * click menu to copy or mute, and sending. Used by the dock's danmaku tab
++ * and by the floating chat window, both fed from the same core events. */
++class DanmakuFeed : public QWidget {
++	Q_OBJECT
++
++public:
++	explicit DanmakuFeed(bool compact, QWidget *parent = nullptr);
++
++	void setFilters(bool showEntries, bool giftsOnly);
++	void setReady(bool ready);
++	/* Room events ("room"), and replies to this feed's actions
++	 * ("danmakuSent", "userMuted"). */
++	void handleEvent(const QJsonObject &event);
++	int lineCount() const;
++
++private:
++	void append(const QString &line, const QString &color = QString(), qint64 uid = 0,
++		    const QString &user = QString());
++	void pinSuperChat(const QString &line, int seconds);
++	void showMenu(const QPoint &pos);
++	void send();
++
++	bool showEntries_ = false;
++	bool giftsOnly_ = false;
++	bool ready_ = false;
++	bool sending_ = false;
++
++	QLabel *pinned_;
++	QTimer *pinnedTimer_;
++	QListWidget *list_;
++	QLineEdit *message_;
++	QPushButton *send_;
++};
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 761664b24..1892a5c3b 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -1,4 +1,7 @@
+ #include "feature-panel.hpp"
++#include "danmaku-feed.hpp"
++#include "floating-chat.hpp"
++#include "plugin-settings.hpp"
+ 
+ #include <livehime-core.h>
+ #include <obs-module.h>
+@@ -42,7 +45,6 @@ QString countText(int value)
+ 	return QString::number(value);
+ }
+ 
+-constexpr int kMaxFeedItems = 300;
+ } // namespace
+ 
+ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+@@ -55,41 +57,24 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 
+ 	/* Danmaku tab */
+ 	auto *danmakuPage = new QWidget(this);
+-	feed_ = new QListWidget(danmakuPage);
+-	feed_->setWordWrap(true);
+-	feed_->setUniformItemSizes(false);
+-	feed_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+-	feed_->setContextMenuPolicy(Qt::CustomContextMenu);
+-	connect(feed_, &QListWidget::customContextMenuRequested, this, &FeaturePanel::showFeedMenu);
+-	pinned_ = new QLabel(danmakuPage);
+-	pinned_->setWordWrap(true);
+-	pinned_->setStyleSheet(QStringLiteral(
+-		"QLabel { background: #3a2226; color: #ffd7da; border-left: 3px solid #fb4d5a; padding: 6px; }"));
+-	pinned_->hide();
+-	pinnedTimer_ = new QTimer(this);
+-	pinnedTimer_->setSingleShot(true);
+-	connect(pinnedTimer_, &QTimer::timeout, pinned_, &QLabel::hide);
++	feed_ = new DanmakuFeed(false, danmakuPage);
++	floating_ = new FloatingChat(this); /* a separate tool window, owned by the panel */
+ 	showEntries_ = new QCheckBox(text("LiveHime.Feature.ShowEntries"), danmakuPage);
+ 	readAloud_ = new QCheckBox(text("LiveHime.Feature.ReadAloud"), danmakuPage);
+ 	giftsOnly_ = new QCheckBox(text("LiveHime.Feature.GiftsOnly"), danmakuPage);
++	floatingButton_ = new QPushButton(text("LiveHime.Floating.Open"), danmakuPage);
++	floatingButton_->setToolTip(text("LiveHime.Floating.OpenTip"));
++	connect(floatingButton_, &QPushButton::clicked, floating_, &FloatingChat::toggle);
+ 	auto *options = new QHBoxLayout;
+ 	options->addWidget(showEntries_);
+ 	options->addWidget(giftsOnly_);
+ 	options->addWidget(readAloud_);
+ 	options->addStretch(1);
+-	message_ = new QLineEdit(danmakuPage);
+-	message_->setPlaceholderText(text("LiveHime.Feature.MessagePlaceholder"));
+-	message_->setMaxLength(40);
+-	send_ = new QPushButton(text("LiveHime.Feature.Send"), danmakuPage);
+-	auto *sendRow = new QHBoxLayout;
+-	sendRow->addWidget(message_, 1);
+-	sendRow->addWidget(send_);
++	options->addWidget(floatingButton_);
+ 	auto *danmakuLayout = new QVBoxLayout(danmakuPage);
+ 	danmakuLayout->setContentsMargins(0, 6, 0, 0);
+-	danmakuLayout->addWidget(pinned_);
+ 	danmakuLayout->addWidget(feed_, 1);
+ 	danmakuLayout->addLayout(options);
+-	danmakuLayout->addLayout(sendRow);
+ 
+ 	/* Room tab */
+ 	auto *roomPage = new QWidget(this);
+@@ -164,16 +149,20 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	layout->addWidget(signedOutHint_);
+ 	layout->addWidget(tabs_, 1);
+ 
+-	connect(send_, &QPushButton::clicked, this, &FeaturePanel::sendDanmaku);
+-	connect(message_, &QLineEdit::returnPressed, this, &FeaturePanel::sendDanmaku);
+ 	connect(saveTitle_, &QPushButton::clicked, this, &FeaturePanel::saveTitle);
+ 	connect(cover_, &QPushButton::clicked, this, [] { livehime_core_open_cover_page(); });
+ 	connect(readAloud_, &QCheckBox::toggled, this, [this](bool on) {
+ 		livehime_core_set_tts(on ? 1 : 0);
+ 		saveSettings();
+ 	});
+-	connect(showEntries_, &QCheckBox::toggled, this, &FeaturePanel::saveSettings);
+-	connect(giftsOnly_, &QCheckBox::toggled, this, &FeaturePanel::saveSettings);
++	connect(showEntries_, &QCheckBox::toggled, this, [this] {
++		applyFilters();
++		saveSettings();
++	});
++	connect(giftsOnly_, &QCheckBox::toggled, this, [this] {
++		applyFilters();
++		saveSettings();
++	});
+ 
+ 	loadSettings();
+ 	applyState(QJsonObject());
+@@ -188,13 +177,13 @@ void FeaturePanel::applyState(const QJsonObject &state)
+ 		ready_ = ready;
+ 		if (!ready) {
+ 			watched_ = likes_ = onlineRank_ = -1;
+-			feed_->clear();
+ 			keywords_->clear();
+ 			keywordsLoaded_ = false;
+-			pinned_->hide();
+ 		}
+ 	}
+ 	tabs_->setEnabled(ready);
++	feed_->setReady(ready);
++	floating_->feed()->setReady(ready);
+ 	if (ready && !keywordsLoaded_) {
+ 		keywordsLoaded_ = true;
+ 		livehime_core_load_shield_keywords();
+@@ -206,28 +195,15 @@ void FeaturePanel::applyState(const QJsonObject &state)
+ void FeaturePanel::applyEvent(const QJsonObject &event)
+ {
+ 	const QString name = event.value("event").toString();
++	feed_->handleEvent(event);
++	floating_->feed()->handleEvent(event);
+ 	if (name == "room") {
+ 		onRoomEvent(event);
+ 	} else if (name == "danmakuStatus") {
+ 		danmakuStatus_ = event.value("status").toString();
+ 		updateStats();
+-	} else if (name == "danmakuSent") {
+-		send_->setEnabled(true);
+-		if (event.value("ok").toBool()) {
+-			message_->clear();
+-		} else {
+-			const QString detail = event.value("message").toString();
+-			appendFeed(text("LiveHime.Feature.SendFailed") + (detail.isEmpty() ? QString() : QStringLiteral("：") + detail),
+-				   QStringLiteral("#e06c75"));
+-		}
+ 	} else if (name == "shieldKeywords") {
+ 		showKeywords(event);
+-	} else if (name == "userMuted") {
+-		const bool ok = event.value("ok").toBool();
+-		const QString detail = event.value("message").toString();
+-		appendFeed(ok ? text("LiveHime.Feature.Muted")
+-			      : text("LiveHime.Feature.MuteFailed") + (detail.isEmpty() ? QString() : QStringLiteral("：") + detail),
+-			   ok ? QStringLiteral("#9aa0ab") : QStringLiteral("#e06c75"));
+ 	} else if (name == "titleUpdated") {
+ 		saveTitle_->setEnabled(true);
+ 		const bool ok = event.value("ok").toBool();
+@@ -241,76 +217,23 @@ void FeaturePanel::applyEvent(const QJsonObject &event)
+ 
+ void FeaturePanel::onRoomEvent(const QJsonObject &event)
+ {
++	/* Feed lines are handled by the feeds; the panel keeps the stats. */
+ 	const QString kind = event.value("kind").toString();
+-	const QString user = event.value("user").toString();
+-	const bool giftsOnly = giftsOnly_->isChecked();
+-	if (kind == "chat") {
+-		if (giftsOnly)
+-			return;
+-		const QString medal = event.value("medal").toString();
+-		appendFeed((medal.isEmpty() ? QString() : QStringLiteral("[%1] ").arg(medal)) + user + QStringLiteral("：") +
+-				   event.value("text").toString(),
+-			   QString(), event.value("uid").toVariant().toLongLong(), user);
+-	} else if (kind == "gift") {
+-		appendFeed(text("LiveHime.Feature.Gift")
+-				   .arg(user, event.value("name").toString())
+-				   .arg(event.value("count").toInt()),
+-			   QStringLiteral("#e0a040"));
+-	} else if (kind == "superChat") {
+-		const QString line =
+-			text("LiveHime.Feature.SuperChat").arg(event.value("price").toInt()).arg(user, event.value("text").toString());
+-		appendFeed(line, QStringLiteral("#fb4d5a"));
+-		pinSuperChat(line, event.value("seconds").toInt());
+-	} else if (kind == "guard") {
+-		appendFeed(text("LiveHime.Feature.Guard").arg(user, event.value("name").toString()),
+-			   QStringLiteral("#8994ee"));
+-	} else if (kind == "enter" || kind == "follow" || kind == "share") {
+-		if (!giftsOnly && (showEntries_->isChecked() || kind == "follow")) {
+-			const QByteArray key = "LiveHime.Feature.Interact." + kind.toUtf8();
+-			appendFeed(text(key.constData()).arg(user), QStringLiteral("#6c717b"));
+-		}
+-	} else if (kind == "watched") {
++	if (kind == "watched")
+ 		watched_ = event.value("value").toInt();
+-		updateStats();
+-	} else if (kind == "likes") {
++	else if (kind == "likes")
+ 		likes_ = event.value("value").toInt();
+-		updateStats();
+-	} else if (kind == "onlineRank") {
++	else if (kind == "onlineRank")
+ 		onlineRank_ = event.value("value").toInt();
+-		updateStats();
+-	} else if (kind == "liveStarted" || kind == "liveEnded") {
+-		appendFeed(text(kind == "liveStarted" ? "LiveHime.Feature.LiveStarted" : "LiveHime.Feature.LiveEnded"),
+-			   QStringLiteral("#9aa0ab"));
+-	}
+-}
+-
+-void FeaturePanel::pinSuperChat(const QString &line, int seconds)
+-{
+-	/* Keep the latest Super Chat above the feed for its paid duration. */
+-	pinned_->setText(line);
+-	pinned_->show();
+-	pinnedTimer_->start(std::max(seconds, 10) * 1000);
++	else
++		return;
++	updateStats();
+ }
+ 
+-void FeaturePanel::showFeedMenu(const QPoint &pos)
++void FeaturePanel::applyFilters()
+ {
+-	QListWidgetItem *item = feed_->itemAt(pos);
+-	if (!item)
+-		return;
+-	QMenu menu(this);
+-	const QString line = item->text();
+-	menu.addAction(text("LiveHime.Feature.Copy"), this, [line] { QApplication::clipboard()->setText(line); });
+-	const qint64 uid = item->data(Qt::UserRole).toLongLong();
+-	const QString user = item->data(Qt::UserRole + 1).toString();
+-	if (uid > 0) {
+-		QMenu *mute = menu.addMenu(text("LiveHime.Feature.MuteUser").arg(user));
+-		const std::pair<const char *, int> choices[] = {{"LiveHime.Feature.MuteSession", 0},
+-								{"LiveHime.Feature.MuteHour", 1},
+-								{"LiveHime.Feature.MuteForever", -1}};
+-		for (const auto &[label, hours] : choices)
+-			mute->addAction(text(label), this, [uid, hours = hours] { livehime_core_mute_user(uid, hours); });
+-	}
+-	menu.exec(feed_->viewport()->mapToGlobal(pos));
++	feed_->setFilters(showEntries_->isChecked(), giftsOnly_->isChecked());
++	floating_->feed()->setFilters(showEntries_->isChecked(), giftsOnly_->isChecked());
+ }
+ 
+ void FeaturePanel::showKeywords(const QJsonObject &event)
+@@ -332,25 +255,6 @@ void FeaturePanel::showKeywords(const QJsonObject &event)
+ 	keywordStatus_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+ }
+ 
+-void FeaturePanel::appendFeed(const QString &line, const QString &color, qint64 uid, const QString &user)
+-{
+-	QScrollBar *bar = feed_->verticalScrollBar();
+-	const bool atBottom = bar->value() >= bar->maximum() - 4;
+-	auto *item = new QListWidgetItem(line);
+-	if (!color.isEmpty())
+-		item->setForeground(QColor(color));
+-	if (uid > 0) {
+-		item->setData(Qt::UserRole, uid);
+-		item->setData(Qt::UserRole + 1, user);
+-	}
+-	feed_->addItem(item);
+-	while (feed_->count() > kMaxFeedItems)
+-		delete feed_->takeItem(0);
+-	/* Keep following new messages unless the user scrolled up to read. */
+-	if (atBottom)
+-		feed_->scrollToBottom();
+-}
+-
+ void FeaturePanel::updateStats()
+ {
+ 	if (!ready_) {
+@@ -365,15 +269,6 @@ void FeaturePanel::updateStats()
+ 	stats_->setVisible(true);
+ }
+ 
+-void FeaturePanel::sendDanmaku()
+-{
+-	const QByteArray message = message_->text().trimmed().toUtf8();
+-	if (!ready_ || message.isEmpty())
+-		return;
+-	send_->setEnabled(false);
+-	livehime_core_send_danmaku(message.constData());
+-}
+-
+ void FeaturePanel::saveTitle()
+ {
+ 	const QByteArray title = title_->text().trimmed().toUtf8();
+@@ -387,30 +282,22 @@ void FeaturePanel::saveTitle()
+ 
+ void FeaturePanel::loadSettings()
+ {
+-	BPtr<char> path = obs_module_config_path("features.json");
+-	OBSDataAutoRelease data = path ? obs_data_create_from_json_file_safe(path, "bak") : nullptr;
+-	const bool entries = data ? obs_data_get_bool(data, "show_entries") : false;
+-	const bool tts = data ? obs_data_get_bool(data, "read_aloud") : false;
+-	const bool giftsOnly = data ? obs_data_get_bool(data, "gifts_only") : false;
++	OBSDataAutoRelease data = LoadPluginSettings();
+ 	QSignalBlocker blockGifts(giftsOnly_);
+-	giftsOnly_->setChecked(giftsOnly);
+ 	QSignalBlocker blockEntries(showEntries_);
+ 	QSignalBlocker blockTts(readAloud_);
+-	showEntries_->setChecked(entries);
+-	readAloud_->setChecked(tts);
+-	livehime_core_set_tts(tts ? 1 : 0);
++	giftsOnly_->setChecked(obs_data_get_bool(data, "gifts_only"));
++	showEntries_->setChecked(obs_data_get_bool(data, "show_entries"));
++	readAloud_->setChecked(obs_data_get_bool(data, "read_aloud"));
++	livehime_core_set_tts(readAloud_->isChecked() ? 1 : 0);
++	applyFilters();
+ }
+ 
+ void FeaturePanel::saveSettings()
+ {
+-	BPtr<char> dir = obs_module_config_path("");
+-	BPtr<char> path = obs_module_config_path("features.json");
+-	if (!dir || !path)
+-		return;
+-	os_mkdirs(dir);
+-	OBSDataAutoRelease data = obs_data_create();
+-	obs_data_set_bool(data, "show_entries", showEntries_->isChecked());
+-	obs_data_set_bool(data, "read_aloud", readAloud_->isChecked());
+-	obs_data_set_bool(data, "gifts_only", giftsOnly_->isChecked());
+-	obs_data_save_json_safe(data, path, "tmp", "bak");
++	OBSDataAutoRelease changes = obs_data_create();
++	obs_data_set_bool(changes, "show_entries", showEntries_->isChecked());
++	obs_data_set_bool(changes, "read_aloud", readAloud_->isChecked());
++	obs_data_set_bool(changes, "gifts_only", giftsOnly_->isChecked());
++	SavePluginSettings(changes);
+ }
+diff --git a/plugins/livehime/src/feature-panel.hpp b/plugins/livehime/src/feature-panel.hpp
+index 39634bd2b..6b7e30ccd 100644
+--- a/plugins/livehime/src/feature-panel.hpp
++++ b/plugins/livehime/src/feature-panel.hpp
+@@ -3,6 +3,8 @@
+ #include <QJsonObject>
+ #include <QWidget>
+ 
++class DanmakuFeed;
++class FloatingChat;
+ class QCheckBox;
+ class QLabel;
+ class QLineEdit;
+@@ -21,19 +23,17 @@ class FeaturePanel : public QWidget {
+ public:
+ 	explicit FeaturePanel(QWidget *parent = nullptr);
+ 
++	FloatingChat *floatingChat() { return floating_; }
++
+ public slots:
+ 	void applyState(const QJsonObject &state);
+ 	void applyEvent(const QJsonObject &event);
+ 
+ private:
+-	void appendFeed(const QString &line, const QString &color = QString(), qint64 uid = 0,
+-			const QString &user = QString());
+-	void showFeedMenu(const QPoint &pos);
+-	void pinSuperChat(const QString &line, int seconds);
+ 	void showKeywords(const QJsonObject &event);
++	void applyFilters();
+ 	void onRoomEvent(const QJsonObject &event);
+ 	void updateStats();
+-	void sendDanmaku();
+ 	void saveTitle();
+ 	void loadSettings();
+ 	void saveSettings();
+@@ -46,20 +46,18 @@ private:
+ 
+ 	QLabel *stats_;
+ 	QTabWidget *tabs_;
+-	QListWidget *feed_;
++	DanmakuFeed *feed_;
++	FloatingChat *floating_;
++	QPushButton *floatingButton_;
+ 	QCheckBox *showEntries_;
+ 	QCheckBox *readAloud_;
+ 	QCheckBox *giftsOnly_;
+-	QLabel *pinned_;
+-	QTimer *pinnedTimer_;
+ 	QListWidget *keywords_;
+ 	QLineEdit *newKeyword_;
+ 	QPushButton *addKeyword_;
+ 	QPushButton *removeKeyword_;
+ 	QLabel *keywordStatus_;
+ 	bool keywordsLoaded_ = false;
+-	QLineEdit *message_;
+-	QPushButton *send_;
+ 	QLineEdit *title_;
+ 	QPushButton *saveTitle_;
+ 	QPushButton *cover_;
+diff --git a/plugins/livehime/src/floating-chat.cpp b/plugins/livehime/src/floating-chat.cpp
+new file mode 100644
+index 000000000..3f6d1b465
+--- /dev/null
++++ b/plugins/livehime/src/floating-chat.cpp
+@@ -0,0 +1,296 @@
++#include "floating-chat.hpp"
++#include "danmaku-feed.hpp"
++#include "plugin-settings.hpp"
++#include "window-native.hpp"
++
++#include <obs-module.h>
++
++#include <QCheckBox>
++#include <QGuiApplication>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QMenu>
++#include <QMouseEvent>
++#include <QScreen>
++#include <QSizeGrip>
++#include <QSlider>
++#include <QToolButton>
++#include <QVBoxLayout>
++#include <QWidgetAction>
++
++#include <algorithm>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++
++constexpr int kMinOpacity = 50;
++constexpr int kMaxOpacity = 100;
++
++QToolButton *titleButton(QWidget *parent, const QString &label, const QString &tip, bool checkable)
++{
++	auto *button = new QToolButton(parent);
++	button->setText(label);
++	button->setToolTip(tip);
++	button->setCheckable(checkable);
++	button->setAutoRaise(true);
++	button->setFocusPolicy(Qt::NoFocus);
++	return button;
++}
++} // namespace
++
++FloatingChat::FloatingChat(QWidget *parent) : QWidget(parent, Qt::Tool | Qt::FramelessWindowHint)
++{
++	setObjectName(QStringLiteral("LiveHimeFloatingChat"));
++	setWindowTitle(text("LiveHime.Floating.Title"));
++	setAttribute(Qt::WA_MacAlwaysShowToolWindow);
++	setMinimumSize(260, 220);
++	setStyleSheet(QStringLiteral("#LiveHimeFloatingChat { background: #1d2025; border: 1px solid #3a3f48; border-radius: 6px; }"
++				     "#LiveHimeFloatingTitle { background: #252931; border-top-left-radius: 6px;"
++				     " border-top-right-radius: 6px; }"));
++
++	titleBar_ = new QWidget(this);
++	titleBar_->setObjectName(QStringLiteral("LiveHimeFloatingTitle"));
++	titleBar_->setCursor(Qt::OpenHandCursor);
++	auto *title = new QLabel(text("LiveHime.Floating.Title"), titleBar_);
++	title->setStyleSheet(QStringLiteral("font-weight: 600;"));
++	onTop_ = titleButton(titleBar_, text("LiveHime.Floating.OnTop"), text("LiveHime.Floating.OnTopTip"), true);
++	pin_ = titleButton(titleBar_, text("LiveHime.Floating.Pin"), text("LiveHime.Floating.PinTip"), true);
++	more_ = titleButton(titleBar_, QStringLiteral("⋯"), text("LiveHime.Floating.More"), false);
++	auto *close = titleButton(titleBar_, QStringLiteral("✕"), text("LiveHime.Floating.Close"), false);
++	auto *titleLayout = new QHBoxLayout(titleBar_);
++	titleLayout->setContentsMargins(10, 4, 6, 4);
++	titleLayout->addWidget(title, 1);
++	titleLayout->addWidget(onTop_);
++	titleLayout->addWidget(pin_);
++	titleLayout->addWidget(more_);
++	titleLayout->addWidget(close);
++
++	/* "⋯" menu: opacity and screen-capture visibility. */
++	auto *menu = new QMenu(this);
++	auto *opacityRow = new QWidget(menu);
++	auto *opacityLayout = new QHBoxLayout(opacityRow);
++	opacityLayout->setContentsMargins(12, 6, 12, 6);
++	opacityLayout->addWidget(new QLabel(text("LiveHime.Floating.Opacity"), opacityRow));
++	opacity_ = new QSlider(Qt::Horizontal, opacityRow);
++	opacity_->setRange(kMinOpacity, kMaxOpacity);
++	opacity_->setMinimumWidth(140);
++	opacityValue_ = new QLabel(opacityRow);
++	opacityValue_->setMinimumWidth(38);
++	opacityLayout->addWidget(opacity_, 1);
++	opacityLayout->addWidget(opacityValue_);
++	auto *opacityAction = new QWidgetAction(menu);
++	opacityAction->setDefaultWidget(opacityRow);
++	menu->addAction(opacityAction);
++	auto *captureRow = new QWidget(menu);
++	auto *captureLayout = new QHBoxLayout(captureRow);
++	captureLayout->setContentsMargins(12, 2, 12, 6);
++	capturable_ = new QCheckBox(text("LiveHime.Floating.Capturable"), captureRow);
++	capturable_->setToolTip(text("LiveHime.Floating.CapturableTip"));
++	captureLayout->addWidget(capturable_);
++	auto *captureAction = new QWidgetAction(menu);
++	captureAction->setDefaultWidget(captureRow);
++	menu->addAction(captureAction);
++	connect(more_, &QToolButton::clicked, this,
++		[this, menu] { menu->exec(more_->mapToGlobal(QPoint(0, more_->height()))); });
++
++	feed_ = new DanmakuFeed(true, this);
++	grip_ = new QSizeGrip(this);
++
++	auto *body = new QVBoxLayout;
++	body->setContentsMargins(8, 6, 8, 2);
++	body->addWidget(feed_, 1);
++	auto *gripRow = new QHBoxLayout;
++	gripRow->setContentsMargins(0, 0, 2, 2);
++	gripRow->addStretch(1);
++	gripRow->addWidget(grip_, 0, Qt::AlignBottom | Qt::AlignRight);
++	auto *layout = new QVBoxLayout(this);
++	layout->setContentsMargins(1, 1, 1, 1);
++	layout->setSpacing(0);
++	layout->addWidget(titleBar_);
++	layout->addLayout(body, 1);
++	layout->addLayout(gripRow);
++
++	connect(close, &QToolButton::clicked, this, &QWidget::hide);
++	connect(onTop_, &QToolButton::toggled, this, [this](bool on) {
++		options_.onTop = on;
++		applyOptions();
++		save();
++	});
++	connect(pin_, &QToolButton::toggled, this, [this](bool on) {
++		options_.pinned = on;
++		applyOptions();
++		save();
++	});
++	connect(opacity_, &QSlider::valueChanged, this, [this](int value) {
++		options_.opacity = value;
++		applyOptions();
++	});
++	connect(opacity_, &QSlider::sliderReleased, this, &FloatingChat::save);
++	connect(capturable_, &QCheckBox::toggled, this, [this](bool on) {
++		options_.capturable = on;
++		applyOptions();
++		save();
++	});
++
++	saveTimer_.setSingleShot(true);
++	saveTimer_.setInterval(400);
++	connect(&saveTimer_, &QTimer::timeout, this, &FloatingChat::save);
++
++	load();
++}
++
++void FloatingChat::toggle()
++{
++	if (isVisible()) {
++		hide();
++	} else {
++		show();
++		raise();
++		activateWindow();
++	}
++}
++
++void FloatingChat::setOptions(const Options &options)
++{
++	options_ = options;
++	applyOptions();
++	save();
++}
++
++void FloatingChat::applyOptions()
++{
++	options_.opacity = std::clamp(options_.opacity, kMinOpacity, kMaxOpacity);
++	QSignalBlocker blockTop(onTop_);
++	QSignalBlocker blockPin(pin_);
++	QSignalBlocker blockOpacity(opacity_);
++	QSignalBlocker blockCapture(capturable_);
++	onTop_->setChecked(options_.onTop);
++	pin_->setChecked(options_.pinned);
++	opacity_->setValue(options_.opacity);
++	capturable_->setChecked(options_.capturable);
++	opacityValue_->setText(QStringLiteral("%1%").arg(options_.opacity));
++
++	setWindowOpacity(options_.opacity / 100.0);
++	grip_->setVisible(!options_.pinned);
++	titleBar_->setCursor(options_.pinned ? Qt::ArrowCursor : Qt::OpenHandCursor);
++	if (windowHandle())
++		ApplyNativeWindowOptions(this, options_.onTop, options_.capturable);
++	updateCaptureException();
++}
++
++void FloatingChat::updateCaptureException()
++{
++	/* OBS's screen capture follows the user's choice either way: shown when
++	 * allowed even if the capture hides LiveHime, left out when not allowed
++	 * even if it does not. */
++	const unsigned int id = isVisible() && windowHandle() ? NativeWindowNumber(this) : 0;
++	SetCaptureException("floating_chat", id, options_.capturable);
++}
++
++void FloatingChat::mousePressEvent(QMouseEvent *event)
++{
++	if (!options_.pinned && event->button() == Qt::LeftButton && titleBar_->geometry().contains(event->pos())) {
++		dragging_ = true;
++		dragOffset_ = event->globalPosition().toPoint() - frameGeometry().topLeft();
++		titleBar_->setCursor(Qt::ClosedHandCursor);
++		event->accept();
++		return;
++	}
++	QWidget::mousePressEvent(event);
++}
++
++void FloatingChat::mouseMoveEvent(QMouseEvent *event)
++{
++	if (dragging_) {
++		move(event->globalPosition().toPoint() - dragOffset_);
++		event->accept();
++		return;
++	}
++	QWidget::mouseMoveEvent(event);
++}
++
++void FloatingChat::mouseReleaseEvent(QMouseEvent *event)
++{
++	if (dragging_) {
++		dragging_ = false;
++		titleBar_->setCursor(options_.pinned ? Qt::ArrowCursor : Qt::OpenHandCursor);
++		save();
++		event->accept();
++		return;
++	}
++	QWidget::mouseReleaseEvent(event);
++}
++
++void FloatingChat::showEvent(QShowEvent *event)
++{
++	QWidget::showEvent(event);
++	/* The native window exists once shown; apply level/sharing to it. */
++	applyOptions();
++	save();
++}
++
++void FloatingChat::hideEvent(QHideEvent *event)
++{
++	QWidget::hideEvent(event);
++	updateCaptureException();
++	save();
++}
++
++void FloatingChat::resizeEvent(QResizeEvent *event)
++{
++	QWidget::resizeEvent(event);
++	if (isVisible())
++		saveTimer_.start();
++}
++
++void FloatingChat::load()
++{
++	OBSDataAutoRelease settings = LoadPluginSettings();
++	OBSDataAutoRelease floating = obs_data_get_obj(settings, "floating_chat");
++	if (floating) {
++		options_.onTop = !obs_data_has_user_value(floating, "on_top") || obs_data_get_bool(floating, "on_top");
++		options_.pinned = obs_data_get_bool(floating, "pinned");
++		options_.capturable = obs_data_get_bool(floating, "capturable");
++		if (obs_data_has_user_value(floating, "opacity"))
++			options_.opacity = static_cast<int>(obs_data_get_int(floating, "opacity"));
++	}
++	QRect geometry(0, 0, 340, 460);
++	if (floating && obs_data_has_user_value(floating, "w")) {
++		geometry = QRect(static_cast<int>(obs_data_get_int(floating, "x")),
++				 static_cast<int>(obs_data_get_int(floating, "y")),
++				 static_cast<int>(obs_data_get_int(floating, "w")),
++				 static_cast<int>(obs_data_get_int(floating, "h")));
++	}
++	/* Keep it reachable if the saved screen is gone. */
++	QScreen *screen = QGuiApplication::screenAt(geometry.center());
++	if (!screen) {
++		screen = QGuiApplication::primaryScreen();
++		const QRect area = screen->availableGeometry();
++		geometry.moveTopLeft(QPoint(area.right() - geometry.width() - 40, area.top() + 80));
++	}
++	setGeometry(geometry);
++	applyOptions();
++	loaded_ = true;
++}
++
++void FloatingChat::save()
++{
++	if (!loaded_)
++		return;
++	OBSDataAutoRelease floating = obs_data_create();
++	const QRect geometry = this->geometry();
++	obs_data_set_int(floating, "x", geometry.x());
++	obs_data_set_int(floating, "y", geometry.y());
++	obs_data_set_int(floating, "w", geometry.width());
++	obs_data_set_int(floating, "h", geometry.height());
++	obs_data_set_bool(floating, "on_top", options_.onTop);
++	obs_data_set_bool(floating, "pinned", options_.pinned);
++	obs_data_set_bool(floating, "capturable", options_.capturable);
++	obs_data_set_int(floating, "opacity", options_.opacity);
++	OBSDataAutoRelease changes = obs_data_create();
++	obs_data_set_obj(changes, "floating_chat", floating);
++	SavePluginSettings(changes);
++}
+diff --git a/plugins/livehime/src/floating-chat.hpp b/plugins/livehime/src/floating-chat.hpp
+new file mode 100644
+index 000000000..ce24c1ed5
+--- /dev/null
++++ b/plugins/livehime/src/floating-chat.hpp
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include <QJsonObject>
++#include <QPoint>
++#include <QTimer>
++#include <QWidget>
++
++class DanmakuFeed;
++class QCheckBox;
++class QLabel;
++class QSizeGrip;
++class QSlider;
++class QToolButton;
++
++/* Floating danmaku window for replying without switching to OBS.
++ *
++ * Frameless; drag the title strip to move and the corner grip to resize.
++ * "On top" keeps it above other apps, including full-screen ones; "Pin"
++ * locks its position and size. Opacity is 50-100 %. Screen capture does not
++ * see it unless "Allow screen capture" is on. All of this is remembered. */
++class FloatingChat : public QWidget {
++	Q_OBJECT
++
++public:
++	explicit FloatingChat(QWidget *parent = nullptr);
++
++	DanmakuFeed *feed() { return feed_; }
++	void toggle();
++
++	struct Options {
++		bool onTop = true;
++		bool pinned = false;
++		bool capturable = false;
++		int opacity = 85;
++	};
++	Options options() const { return options_; }
++	void setOptions(const Options &options);
++
++protected:
++	void mousePressEvent(QMouseEvent *event) override;
++	void mouseMoveEvent(QMouseEvent *event) override;
++	void mouseReleaseEvent(QMouseEvent *event) override;
++	void showEvent(QShowEvent *event) override;
++	void hideEvent(QHideEvent *event) override;
++	void resizeEvent(QResizeEvent *event) override;
++
++private:
++	void applyOptions();
++	void updateCaptureException();
++	void load();
++	void save();
++
++	Options options_;
++	DanmakuFeed *feed_;
++	QWidget *titleBar_;
++	QToolButton *onTop_;
++	QToolButton *pin_;
++	QToolButton *more_;
++	QSlider *opacity_;
++	QLabel *opacityValue_;
++	QCheckBox *capturable_;
++	QSizeGrip *grip_;
++	QPoint dragOffset_;
++	bool dragging_ = false;
++	bool loaded_ = false;
++	QTimer saveTimer_; /* debounces geometry saves while resizing */
++};
+diff --git a/plugins/livehime/src/livehime-dock.hpp b/plugins/livehime/src/livehime-dock.hpp
+index 0d4dfa1ed..7135b7e4c 100644
+--- a/plugins/livehime/src/livehime-dock.hpp
++++ b/plugins/livehime/src/livehime-dock.hpp
+@@ -21,6 +21,7 @@ public:
+ 
+ 	StreamController *controller() { return controller_; }
+ 	AccountPanel *account() { return account_; }
++	FeaturePanel *features() { return features_; }
+ 
+ 	/* Same path as the dock's buttons; used by the automation interface.
+ 	 * Returns false with a localized reason when the request is rejected. */
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index 81f01ebb6..d43d1023c 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -1,6 +1,10 @@
+ #include "account-panel.hpp"
+ #include "automation.hpp"
+ #include "danmaku-overlay.hpp"
++#include "feature-panel.hpp"
++#include "floating-chat.hpp"
++#include "plugin-settings.hpp"
++#include "window-native.hpp"
+ #include "livehime-dock.hpp"
+ 
+ #include <obs-frontend-api.h>
+@@ -67,6 +71,43 @@ void hideUpstreamMenuItems()
+ 	}
+ }
+ 
++obs_hotkey_id floatingHotkey = OBS_INVALID_HOTKEY_ID;
++
++void onFloatingHotkey(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed)
++{
++	if (!pressed)
++		return;
++	/* Hotkeys fire on OBS's hotkey thread. */
++	QMetaObject::invokeMethod(
++		dock,
++		[] {
++			if (dock)
++				dock->features()->floatingChat()->toggle();
++		},
++		Qt::QueuedConnection);
++}
++
++void registerFloatingHotkey()
++{
++	floatingHotkey = obs_hotkey_register_frontend("livehime.toggle_floating_chat",
++						      obs_module_text("LiveHime.Floating.Hotkey"), onFloatingHotkey,
++						      nullptr);
++	OBSDataAutoRelease settings = LoadPluginSettings();
++	OBSDataArrayAutoRelease bindings = obs_data_get_array(settings, "floating_chat_hotkey");
++	if (bindings)
++		obs_hotkey_load(floatingHotkey, bindings);
++}
++
++void saveFloatingHotkey()
++{
++	if (floatingHotkey == OBS_INVALID_HOTKEY_ID)
++		return;
++	OBSDataArrayAutoRelease bindings = obs_hotkey_save(floatingHotkey);
++	OBSDataAutoRelease changes = obs_data_create();
++	obs_data_set_array(changes, "floating_chat_hotkey", bindings);
++	SavePluginSettings(changes);
++}
++
+ void onFrontendEvent(enum obs_frontend_event event, void *)
+ {
+ 	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+@@ -75,8 +116,10 @@ void onFrontendEvent(enum obs_frontend_event event, void *)
+ 	}
+ 	/* Still inside the frontend's shutdown with its API alive: close a room
+ 	 * this app opened so quitting never leaves it live. */
+-	if (event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN && dock)
++	if (event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN && dock) {
++		saveFloatingHotkey();
+ 		dock->account()->closeRoomBeforeExit();
++	}
+ 	if (dock)
+ 		dock->controller()->handleFrontendEvent(event);
+ }
+@@ -86,6 +129,7 @@ bool obs_module_load(void)
+ {
+ 	DanmakuOverlayHub::create();
+ 	RegisterDanmakuOverlaySource();
++	RegisterCaptureExceptionProcedure();
+ 
+ 	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+ 	dock = new LiveHimeDock(mainWindow);
+@@ -97,6 +141,7 @@ bool obs_module_load(void)
+ 	QObject::connect(dock->account(), &AccountPanel::eventReceived, DanmakuOverlayHub::instance(),
+ 			 &DanmakuOverlayHub::push);
+ 	obs_frontend_add_event_callback(onFrontendEvent, nullptr);
++	registerFloatingHotkey();
+ 	blog(LOG_INFO, "[livehime] control dock loaded");
+ 	return true;
+ }
+@@ -109,6 +154,8 @@ void obs_module_post_load(void)
+ void obs_module_unload(void)
+ {
+ 	UnregisterAutomation();
++	if (floatingHotkey != OBS_INVALID_HOTKEY_ID)
++		obs_hotkey_unregister(floatingHotkey);
+ 	obs_frontend_remove_event_callback(onFrontendEvent, nullptr);
+ 	DanmakuOverlayHub::destroy();
+ }
+diff --git a/plugins/livehime/src/plugin-settings.cpp b/plugins/livehime/src/plugin-settings.cpp
+new file mode 100644
+index 000000000..9e365cdaf
+--- /dev/null
++++ b/plugins/livehime/src/plugin-settings.cpp
+@@ -0,0 +1,24 @@
++#include "plugin-settings.hpp"
++
++#include <obs-module.h>
++#include <util/platform.h>
++#include <util/util.hpp>
++
++OBSDataAutoRelease LoadPluginSettings()
++{
++	BPtr<char> path = obs_module_config_path("features.json");
++	obs_data_t *data = path ? obs_data_create_from_json_file_safe(path, "bak") : nullptr;
++	return OBSDataAutoRelease(data ? data : obs_data_create());
++}
++
++void SavePluginSettings(obs_data_t *changes)
++{
++	BPtr<char> dir = obs_module_config_path("");
++	BPtr<char> path = obs_module_config_path("features.json");
++	if (!dir || !path)
++		return;
++	os_mkdirs(dir);
++	OBSDataAutoRelease data = LoadPluginSettings();
++	obs_data_apply(data, changes);
++	obs_data_save_json_safe(data, path, "tmp", "bak");
++}
+diff --git a/plugins/livehime/src/plugin-settings.hpp b/plugins/livehime/src/plugin-settings.hpp
+new file mode 100644
+index 000000000..d25dad2ad
+--- /dev/null
++++ b/plugins/livehime/src/plugin-settings.hpp
+@@ -0,0 +1,9 @@
++#pragma once
++
++#include <obs.hpp>
++
++/* The plugin's own settings file (plugin_config/livehime/features.json),
++ * shared by the dock and the floating chat. Saving merges the given keys
++ * into the file so one part never drops another part's settings. */
++OBSDataAutoRelease LoadPluginSettings();
++void SavePluginSettings(obs_data_t *changes);
+diff --git a/plugins/livehime/src/window-native.hpp b/plugins/livehime/src/window-native.hpp
+new file mode 100644
+index 000000000..be8e9cd24
+--- /dev/null
++++ b/plugins/livehime/src/window-native.hpp
+@@ -0,0 +1,19 @@
++#pragma once
++
++class QWidget;
++
++/* macOS window behaviour Qt does not expose. `floating`: stay above other
++ * apps, including full-screen ones and every Space, and stay visible when
++ * LiveHime is not the active app. `capturable`: whether screen capture may
++ * record the window (NSWindow sharingType). */
++void ApplyNativeWindowOptions(QWidget *window, bool floating, bool capturable);
++
++/* The window-server id (CGWindowID) of a shown window, or 0. */
++unsigned int NativeWindowNumber(QWidget *window);
++
++/* Per-window overrides for OBS's screen capture, answered through the
++ * global procedure "hide_obs_window_exceptions": `visible` windows stay in
++ * the capture even when its "Hide OBS" option is on; the others are left
++ * out even when it is off. `id` 0 removes the entry for `key`. */
++void RegisterCaptureExceptionProcedure();
++void SetCaptureException(const char *key, unsigned int id, bool visible);
+diff --git a/plugins/livehime/src/window-native.mm b/plugins/livehime/src/window-native.mm
+new file mode 100644
+index 000000000..ba72c8e19
+--- /dev/null
++++ b/plugins/livehime/src/window-native.mm
+@@ -0,0 +1,68 @@
++#include "window-native.hpp"
++
++#import <AppKit/AppKit.h>
++#include <QWidget>
++
++#include <obs.h>
++
++#include <map>
++#include <mutex>
++#include <string>
++
++void ApplyNativeWindowOptions(QWidget *window, bool floating, bool capturable)
++{
++	NSView *view = (__bridge NSView *)reinterpret_cast<void *>(window->winId());
++	NSWindow *nswindow = view.window;
++	if (!nswindow)
++		return;
++	nswindow.hidesOnDeactivate = NO;
++	nswindow.level = floating ? NSFloatingWindowLevel : NSNormalWindowLevel;
++	NSWindowCollectionBehavior behavior = NSWindowCollectionBehaviorFullScreenAuxiliary;
++	if (floating)
++		behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces;
++	nswindow.collectionBehavior = behavior;
++	nswindow.sharingType = capturable ? NSWindowSharingReadOnly : NSWindowSharingNone;
++}
++
++unsigned int NativeWindowNumber(QWidget *window)
++{
++	NSView *view = (__bridge NSView *)reinterpret_cast<void *>(window->winId());
++	return view.window ? static_cast<unsigned int>(view.window.windowNumber) : 0;
++}
++
++namespace {
++std::mutex exceptionsMutex;
++std::map<std::string, std::pair<unsigned int, bool>> exceptions; /* key -> (id, visible) */
++
++void exceptionProcedure(void *, calldata_t *cd)
++{
++	std::string visible, hidden;
++	{
++		std::lock_guard lock(exceptionsMutex);
++		for (const auto &[key, entry] : exceptions) {
++			std::string &list = entry.second ? visible : hidden;
++			if (!list.empty())
++				list += ",";
++			list += std::to_string(entry.first);
++		}
++	}
++	calldata_set_string(cd, "window_ids", visible.c_str());
++	calldata_set_string(cd, "hidden_window_ids", hidden.c_str());
++}
++} // namespace
++
++void RegisterCaptureExceptionProcedure()
++{
++	proc_handler_add(obs_get_proc_handler(),
++			 "void hide_obs_window_exceptions(out string window_ids, out string hidden_window_ids)",
++			 exceptionProcedure, nullptr);
++}
++
++void SetCaptureException(const char *key, unsigned int id, bool visible)
++{
++	std::lock_guard lock(exceptionsMutex);
++	if (id)
++		exceptions[key] = {id, visible};
++	else
++		exceptions.erase(key);
++}
+diff --git a/plugins/mac-capture/mac-sck-common.h b/plugins/mac-capture/mac-sck-common.h
+index 9c9ee0890..138774fa3 100644
+--- a/plugins/mac-capture/mac-sck-common.h
++++ b/plugins/mac-capture/mac-sck-common.h
+@@ -43,6 +43,12 @@ struct API_AVAILABLE(macos(12.5)) screen_capture {
+     NSRect frame;
+     bool hide_cursor;
+     bool hide_obs;
++    /* Per-window overrides from the "hide_obs_window_exceptions" global
++     * procedure: "<visible ids>|<hidden ids>" (comma-separated CGWindowIDs).
++     * Visible ids stay in the capture while hide_obs is on; hidden ids are
++     * left out while it is off. Re-checked on a timer. */
++    char *hide_obs_exceptions;
++    float hide_obs_exceptions_timer;
+     bool show_hidden_windows;
+     bool show_empty_names;
+     bool audio_only;
+diff --git a/plugins/mac-capture/mac-sck-video-capture.m b/plugins/mac-capture/mac-sck-video-capture.m
+index c4baaec35..268049dc1 100644
+--- a/plugins/mac-capture/mac-sck-video-capture.m
++++ b/plugins/mac-capture/mac-sck-video-capture.m
+@@ -1,4 +1,5 @@
+ #include "mac-sck-common.h"
++#include <util/dstr.h>
+ #include "window-utils.h"
+ 
+ API_AVAILABLE(macos(12.5)) static void destroy_screen_stream(struct screen_capture *sc)
+@@ -65,12 +66,52 @@
+     if (sc->capture_delegate) {
+         [sc->capture_delegate release];
+     }
++    bfree(sc->hide_obs_exceptions);
+     [sc->application_id release];
+ 
+     pthread_mutex_destroy(&sc->mutex);
+     bfree(sc);
+ }
+ 
++/* Asks the host application for per-window capture overrides. Returns a
++ * newly allocated "<visible ids>|<hidden ids>" string, or NULL when no
++ * application provides the "hide_obs_window_exceptions" procedure. */
++static char *query_hide_obs_exceptions(void)
++{
++    char *ids = NULL;
++    calldata_t cd = {0};
++    if (proc_handler_call(obs_get_proc_handler(), "hide_obs_window_exceptions", &cd)) {
++        const char *visible = calldata_string(&cd, "window_ids");
++        const char *hidden = calldata_string(&cd, "hidden_window_ids");
++        struct dstr joined = {0};
++        dstr_printf(&joined, "%s|%s", visible ? visible : "", hidden ? hidden : "");
++        ids = joined.array;
++    }
++    calldata_free(&cd);
++    return ids;
++}
++
++/* Windows from one half ("visible" = 0, "hidden" = 1) of the override list. */
++API_AVAILABLE(macos(12.5)) static NSArray *hide_obs_exception_windows(struct screen_capture *sc, int half)
++{
++    NSMutableArray *windows = [[NSMutableArray alloc] init];
++    if (!sc->hide_obs_exceptions)
++        return windows;
++    NSArray *halves = [[NSString stringWithUTF8String:sc->hide_obs_exceptions] componentsSeparatedByString:@"|"];
++    if ((NSInteger) halves.count <= half)
++        return windows;
++    NSString *list = halves[half];
++    NSMutableSet *ids = [NSMutableSet set];
++    for (NSString *part in [list componentsSeparatedByString:@","])
++        if (part.integerValue > 0)
++            [ids addObject:@(part.integerValue)];
++    for (SCWindow *window in sc->shareable_content.windows) {
++        if ([ids containsObject:@(window.windowID)])
++            [windows addObject:window];
++    }
++    return windows;
++}
++
+ API_AVAILABLE(macos(12.5)) static bool init_screen_stream(struct screen_capture *sc)
+ {
+     SCContentFilter *content_filter;
+@@ -120,16 +161,20 @@
+                     }
+                 }
+                 NSArray *exclusions = [[NSArray alloc] initWithObjects:obsApp, nil];
+-                NSArray *empty = [[NSArray alloc] init];
++                bfree(sc->hide_obs_exceptions);
++                sc->hide_obs_exceptions = query_hide_obs_exceptions();
++                NSArray *excepted = hide_obs_exception_windows(sc, 0);
+                 content_filter = [[SCContentFilter alloc] initWithDisplay:target_display
+                                                     excludingApplications:exclusions
+-                                                         exceptingWindows:empty];
+-                [empty release];
++                                                         exceptingWindows:excepted];
++                [excepted release];
+                 [exclusions release];
+             } else {
+-                NSArray *empty = [[NSArray alloc] init];
+-                content_filter = [[SCContentFilter alloc] initWithDisplay:target_display excludingWindows:empty];
+-                [empty release];
++                bfree(sc->hide_obs_exceptions);
++                sc->hide_obs_exceptions = query_hide_obs_exceptions();
++                NSArray *excluded = hide_obs_exception_windows(sc, 1);
++                content_filter = [[SCContentFilter alloc] initWithDisplay:target_display excludingWindows:excluded];
++                [excluded release];
+             }
+ 
+             set_display_mode(sc, target_display);
+@@ -317,10 +362,30 @@
+     return NULL;
+ }
+ 
+-API_AVAILABLE(macos(12.5)) static void sck_video_capture_tick(void *data, float seconds __unused)
++API_AVAILABLE(macos(12.5)) static void sck_video_capture_tick(void *data, float seconds)
+ {
+     struct screen_capture *sc = data;
+ 
++    /* Rebuild the display stream when the application's per-window capture
++     * overrides change (checked about once a second). */
++    if (sc->capture_type == ScreenCaptureDisplayStream && sc->disp) {
++        sc->hide_obs_exceptions_timer += seconds;
++        if (sc->hide_obs_exceptions_timer >= 1.0f) {
++            sc->hide_obs_exceptions_timer = 0.0f;
++            char *current = query_hide_obs_exceptions();
++            const bool changed = (current == NULL) != (sc->hide_obs_exceptions == NULL) ||
++                                 (current && strcmp(current, sc->hide_obs_exceptions) != 0);
++            bfree(current);
++            if (changed) {
++                screen_capture_build_content_list(sc, true);
++                obs_enter_graphics();
++                destroy_screen_stream(sc);
++                init_screen_stream(sc);
++                obs_leave_graphics();
++            }
++        }
++    }
++
+     if (!sc->current)
+         return;
+     if (!obs_source_showing(sc->source))

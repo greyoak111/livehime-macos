@@ -1,0 +1,64 @@
+From 9fcb26625808e92152fef4d6e43815e31029697c Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 03:03:36 +0800
+Subject: [PATCH 21/26] Fix false "room still open" warning after End live
+
+When Bilibili confirmed the room was closed before OBS reported its own
+stop, the Idle transition still looked like a stream stopped outside End
+live while the cached room status read live, so the dock warned that the
+room was open although it was already offline. A confirmed End live now
+ends the session's ownership, and any room-open warning clears as soon as
+the refreshed room reads offline.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/src/account-panel.cpp | 8 ++++++++
+ plugins/livehime/src/account-panel.hpp | 1 +
+ 2 files changed, 9 insertions(+)
+
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index cc80d4c3c..78bbee824 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -161,6 +161,10 @@ void AccountPanel::applyState(const QJsonObject &state)
+ 		const qint64 shortId = state.value("shortRoomId").toVariant().toLongLong();
+ 		const qint64 roomId = state.value("roomId").toVariant().toLongLong();
+ 		const bool live = state.value("liveStatus").toInt() == 1;
++		/* The panel follows Bilibili: once the room reads offline, a
++		 * leftover "room still open" warning is no longer true. */
++		if (!live && roomOpenWarning_)
++			setLiveStatus(text("LiveHime.Live.Ended"));
+ 		roomLine_->setText(QStringLiteral("%1 %2 · %3 · %4")
+ 					   .arg(text("LiveHime.Account.Room"))
+ 					   .arg(shortId > 0 ? shortId : roomId)
+@@ -239,7 +243,10 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 	} else if (name == "liveStopped") {
+ 		stopping_ = false;
+ 		if (event.value("ok").toBool()) {
++			/* Bilibili confirmed the room is closed. OBS may report its own
++			 * stop after this; that must not read as "stopped elsewhere". */
+ 			roomOpenedHere_ = false;
++			ownStream_ = false;
+ 			setLiveStatus(text("LiveHime.Live.Ended"));
+ 		}
+ 		else
+@@ -339,6 +346,7 @@ void AccountPanel::updateLiveControls()
+ 
+ void AccountPanel::setLiveStatus(const QString &message, bool warning)
+ {
++	roomOpenWarning_ = warning && message.contains(text("LiveHime.Live.RoomStillOpen"));
+ 	liveStatus_->setText(message);
+ 	liveStatus_->setStyleSheet(warning ? QStringLiteral("color: #e06c75;") : QStringLiteral("color: #9aa0ab;"));
+ }
+diff --git a/plugins/livehime/src/account-panel.hpp b/plugins/livehime/src/account-panel.hpp
+index 3f6ec4307..a17020d37 100644
+--- a/plugins/livehime/src/account-panel.hpp
++++ b/plugins/livehime/src/account-panel.hpp
+@@ -62,6 +62,7 @@ private:
+ 	bool stopping_ = false;
+ 	bool ownStream_ = false;      /* the running stream was started by Go live */
+ 	bool roomOpenedHere_ = false; /* Go live opened the room; End live not yet confirmed */
++	bool roomOpenWarning_ = false; /* the "room still open" warning is showing */
+ 
+ 	QStackedWidget *pages_;
+ 	QLabel *signedOutNotice_;

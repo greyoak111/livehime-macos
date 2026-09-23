@@ -1,0 +1,293 @@
+From fb1686e2a753c164da9c432a0d3c52f6defe70a9 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 00:18:28 +0800
+Subject: [PATCH 12/26] Route OBS's own Start/Stop Streaming through the
+ LiveHime session
+
+Add obs_frontend_set_start_streaming_override(): a plugin may take over
+user-initiated Start Streaming (controls button, hotkeys, tray, frontend
+API). OBSBasic::StartStreaming consults it before setting up the output.
+
+With a ready Bilibili account the LiveHime plugin turns OBS's Start into
+Go live, so the stream always uses the room's current endpoint; signed
+out, OBS streams with the user's own settings. Starts issued by the
+plugin itself pass through. Stopping a Go live stream from OBS's own
+controls now also closes the Bilibili room, as End live does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md         |  4 ++++
+ build-aux/livehime/tests/e2e-stream.mjs    |  7 ++++++
+ frontend/OBSStudioAPI.cpp                  |  6 +++++
+ frontend/OBSStudioAPI.hpp                  |  2 ++
+ frontend/api/obs-frontend-api.cpp          |  7 ++++++
+ frontend/api/obs-frontend-api.h            |  8 +++++++
+ frontend/api/obs-frontend-internal.hpp     |  2 ++
+ frontend/widgets/OBSBasic.hpp              |  8 +++++++
+ frontend/widgets/OBSBasic_Streaming.cpp    |  3 +++
+ plugins/livehime/src/account-panel.cpp     | 27 ++++++++++++++++++++++
+ plugins/livehime/src/account-panel.hpp     |  1 +
+ plugins/livehime/src/stream-controller.cpp |  2 ++
+ plugins/livehime/src/stream-controller.hpp |  4 ++++
+ 13 files changed, 81 insertions(+)
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 51c4ac331..5c4665e50 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -32,6 +32,10 @@ node e2e-account.mjs <websocket password>
+   open, which blocks a normal quit. Terminate the test instance afterwards
+   (only the one started with `LIVEHIME_KEYCHAIN_SERVICE`), and switch the
+   websocket server back off.
++- A forced termination can leave `~/Library/Application Support/LiveHime/
++  obs-studio/.sentinel/run_*` behind; the next launch then blocks on OBS's
++  "not shut down properly / safe mode" dialog. Remove the stale marker after
++  terminating the test instance.
+ 
+ ## Danmaku integration test
+ 
+diff --git a/build-aux/livehime/tests/e2e-stream.mjs b/build-aux/livehime/tests/e2e-stream.mjs
+index 2ef119c31..a0d81661e 100644
+--- a/build-aux/livehime/tests/e2e-stream.mjs
++++ b/build-aux/livehime/tests/e2e-stream.mjs
+@@ -85,6 +85,13 @@ async function run() {
+   check('unreachable server ends in Failed with reason', failed.state === 'Failed' && failed.lastError.length > 0, failed.lastError.replace(/\n/g, ' | '));
+   check('user service restored after failure', (await service()).server === userServer);
+ 
++  // OBS's own Start Streaming while signed out must not be taken over:
++  // OBS streams with the user's own service (unreachable here, so it fails).
++  await request('StartStream');
++  const native = await waitState(['Starting', 'Failed', 'Live'], 5000);
++  check('signed out: OBS start is not taken over', native.ownsSession === false && native.state !== 'Idle', native.state);
++  await waitState(['Failed', 'Idle'], 30000);
++
+   const passed = results.filter((r) => r.ok).length;
+   console.log(`\n${passed}/${results.length} checks passed`);
+   ws.close();
+diff --git a/frontend/OBSStudioAPI.cpp b/frontend/OBSStudioAPI.cpp
+index 242d230d2..d4227960d 100644
+--- a/frontend/OBSStudioAPI.cpp
++++ b/frontend/OBSStudioAPI.cpp
+@@ -221,6 +221,12 @@ void OBSStudioAPI::obs_frontend_delete_profile(const char *profile)
+ 	QMetaObject::invokeMethod(main, "DeleteProfile", Q_ARG(QString, profile));
+ }
+ 
++void OBSStudioAPI::obs_frontend_set_start_streaming_override(obs_frontend_start_streaming_override_cb callback,
++							     void *private_data)
++{
++	main->SetStartStreamingOverride(callback, private_data);
++}
++
+ void OBSStudioAPI::obs_frontend_streaming_start()
+ {
+ 	QMetaObject::invokeMethod(main, "StartStreaming");
+diff --git a/frontend/OBSStudioAPI.hpp b/frontend/OBSStudioAPI.hpp
+index 21a9e78a3..5eb536195 100644
+--- a/frontend/OBSStudioAPI.hpp
++++ b/frontend/OBSStudioAPI.hpp
+@@ -86,6 +86,8 @@ struct OBSStudioAPI : obs_frontend_callbacks {
+ 
+ 	void obs_frontend_delete_profile(const char *profile) override;
+ 
++	void obs_frontend_set_start_streaming_override(obs_frontend_start_streaming_override_cb callback,
++						       void *private_data) override;
+ 	void obs_frontend_streaming_start(void) override;
+ 
+ 	void obs_frontend_streaming_stop(void) override;
+diff --git a/frontend/api/obs-frontend-api.cpp b/frontend/api/obs-frontend-api.cpp
+index 9c861ed5d..1d497e8aa 100644
+--- a/frontend/api/obs-frontend-api.cpp
++++ b/frontend/api/obs-frontend-api.cpp
+@@ -239,6 +239,13 @@ void obs_frontend_delete_profile(const char *profile)
+ 	}
+ }
+ 
++void obs_frontend_set_start_streaming_override(obs_frontend_start_streaming_override_cb callback, void *private_data)
++{
++	if (callbacks_valid()) {
++		c->obs_frontend_set_start_streaming_override(callback, private_data);
++	}
++}
++
+ void obs_frontend_streaming_start(void)
+ {
+ 	if (callbacks_valid()) {
+diff --git a/frontend/api/obs-frontend-api.h b/frontend/api/obs-frontend-api.h
+index 46713fbcb..86dcdc3f5 100644
+--- a/frontend/api/obs-frontend-api.h
++++ b/frontend/api/obs-frontend-api.h
+@@ -183,6 +183,14 @@ EXPORT void obs_frontend_streaming_start(void);
+ EXPORT void obs_frontend_streaming_stop(void);
+ EXPORT bool obs_frontend_streaming_active(void);
+ 
++/* Lets a plugin take over user-initiated "Start Streaming" (the controls
++ * button, hotkeys, tray menu, obs_frontend_streaming_start). The callback
++ * returns true when it handles the start itself, false to let OBS start
++ * streaming normally. One override at a time; pass NULL to clear it. */
++typedef bool (*obs_frontend_start_streaming_override_cb)(void *private_data);
++EXPORT void obs_frontend_set_start_streaming_override(obs_frontend_start_streaming_override_cb callback,
++						      void *private_data);
++
+ EXPORT void obs_frontend_recording_start(void);
+ EXPORT void obs_frontend_recording_stop(void);
+ EXPORT bool obs_frontend_recording_active(void);
+diff --git a/frontend/api/obs-frontend-internal.hpp b/frontend/api/obs-frontend-internal.hpp
+index eac64bcfd..0ad1df53d 100644
+--- a/frontend/api/obs-frontend-internal.hpp
++++ b/frontend/api/obs-frontend-internal.hpp
+@@ -37,6 +37,8 @@ struct obs_frontend_callbacks {
+ 	virtual void obs_frontend_duplicate_profile(const char *name) = 0;
+ 	virtual void obs_frontend_delete_profile(const char *profile) = 0;
+ 
++	virtual void obs_frontend_set_start_streaming_override(obs_frontend_start_streaming_override_cb callback,
++							       void *private_data) = 0;
+ 	virtual void obs_frontend_streaming_start(void) = 0;
+ 	virtual void obs_frontend_streaming_stop(void) = 0;
+ 	virtual bool obs_frontend_streaming_active(void) = 0;
+diff --git a/frontend/widgets/OBSBasic.hpp b/frontend/widgets/OBSBasic.hpp
+index 4343e1605..14a5e5172 100644
+--- a/frontend/widgets/OBSBasic.hpp
++++ b/frontend/widgets/OBSBasic.hpp
+@@ -241,6 +241,9 @@ class OBSBasic : public OBSMainWindow {
+ 	 * -------------------------------------
+ 	 */
+ private:
++	obs_frontend_start_streaming_override_cb startStreamingOverride = nullptr;
++	void *startStreamingOverrideData = nullptr;
++
+ 	obs_frontend_callbacks *api = nullptr;
+ 	std::vector<OBSSignal> signalHandlers;
+ 
+@@ -1380,6 +1383,11 @@ private:
+ public slots:
+ 	void DisplayStreamStartError();
+ 	void StartStreaming();
++	void SetStartStreamingOverride(obs_frontend_start_streaming_override_cb callback, void *data)
++	{
++		startStreamingOverride = callback;
++		startStreamingOverrideData = data;
++	}
+ 	void StopStreaming();
+ 	void ForceStopStreaming();
+ 
+diff --git a/frontend/widgets/OBSBasic_Streaming.cpp b/frontend/widgets/OBSBasic_Streaming.cpp
+index 4111677e6..c8898574c 100644
+--- a/frontend/widgets/OBSBasic_Streaming.cpp
++++ b/frontend/widgets/OBSBasic_Streaming.cpp
+@@ -53,6 +53,9 @@ void OBSBasic::StartStreaming()
+ 	if (disableOutputsRef) {
+ 		return;
+ 	}
++	if (startStreamingOverride && startStreamingOverride(startStreamingOverrideData)) {
++		return;
++	}
+ 
+ 	if (auth && auth->broadcastFlow()) {
+ 		if (!broadcastActive && !broadcastReady) {
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index b8b6b2156..2ee7b7111 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -1,6 +1,7 @@
+ #include "account-panel.hpp"
+ 
+ #include <livehime-core.h>
++#include <obs-frontend-api.h>
+ #include <obs-module.h>
+ 
+ #include <QByteArray>
+@@ -92,13 +93,32 @@ AccountPanel::AccountPanel(StreamController *stream, QWidget *parent)
+ 	/* LIVEHIME_KEYCHAIN_SERVICE is a development/testing override so
+ 	 * automated runs never touch the real login item. */
+ 	livehime_core_start(std::getenv("LIVEHIME_KEYCHAIN_SERVICE"), &AccountPanel::onCoreMessage, this);
++	obs_frontend_set_start_streaming_override(&AccountPanel::onStartStreamingRequest, this);
+ }
+ 
+ AccountPanel::~AccountPanel()
+ {
++	obs_frontend_set_start_streaming_override(nullptr, nullptr);
+ 	livehime_core_stop();
+ }
+ 
++/* OBS's own Start Streaming (button, hotkey, tray). With a ready Bilibili
++ * account it becomes Go live, so the stream always carries the room's
++ * current endpoint; signed out, OBS streams with the user's own settings. */
++bool AccountPanel::onStartStreamingRequest(void *context)
++{
++	if (StreamController::isStartingInternally())
++		return false;
++	auto *self = static_cast<AccountPanel *>(context);
++	if (self->state_.value("state").toString() != "ready")
++		return false;
++	if (self->goLive_->isEnabled()) {
++		blog(LOG_INFO, "[livehime] OBS start streaming -> Go live");
++		self->onGoLive();
++	}
++	return true;
++}
++
+ void AccountPanel::onCoreMessage(const char *json, void *context)
+ {
+ 	/* Delivered on the main thread by the core. Never log the raw JSON:
+@@ -245,6 +265,13 @@ void AccountPanel::onStreamStateChanged(StreamController::State state)
+ 	const bool roomOpen = state_.value("liveStatus").toInt() == 1;
+ 	if (state == State::Live && stream_->ownsSession()) {
+ 		setLiveStatus(text("LiveHime.Live.OnAir"));
++	} else if (state == State::Stopping && ownStream_ && !stopping_) {
++		/* Stopped from OBS's own controls: end the live session like End
++		 * live does, so the Bilibili room does not stay open. */
++		blog(LOG_INFO, "[livehime] OBS stop streaming -> End live");
++		stopping_ = true;
++		setLiveStatus(text("LiveHime.Live.Ending"));
++		livehime_core_stop_live();
+ 	} else if ((state == State::Idle || state == State::Failed) && ownStream_) {
+ 		/* Stopped outside End live (OBS's own button, or an output error):
+ 		 * the Bilibili room is still open. */
+diff --git a/plugins/livehime/src/account-panel.hpp b/plugins/livehime/src/account-panel.hpp
+index 1f2171098..80450f63a 100644
+--- a/plugins/livehime/src/account-panel.hpp
++++ b/plugins/livehime/src/account-panel.hpp
+@@ -36,6 +36,7 @@ signals:
+ 
+ private:
+ 	static void onCoreMessage(const char *json, void *context);
++	static bool onStartStreamingRequest(void *context);
+ 	void applyState(const QJsonObject &state);
+ 	void applyEvent(const QJsonObject &event);
+ 	void onGoLive();
+diff --git a/plugins/livehime/src/stream-controller.cpp b/plugins/livehime/src/stream-controller.cpp
+index 1690422b7..f8b07260d 100644
+--- a/plugins/livehime/src/stream-controller.cpp
++++ b/plugins/livehime/src/stream-controller.cpp
+@@ -79,7 +79,9 @@ bool StreamController::start(const QString &server, const QString &key)
+ 	setState(State::Starting);
+ 	startClock_.start();
+ 	startWatchdog_.start();
++	startingInternally_ = true;
+ 	obs_frontend_streaming_start();
++	startingInternally_ = false;
+ 	return true;
+ }
+ 
+diff --git a/plugins/livehime/src/stream-controller.hpp b/plugins/livehime/src/stream-controller.hpp
+index ea45049d4..dcbae22d6 100644
+--- a/plugins/livehime/src/stream-controller.hpp
++++ b/plugins/livehime/src/stream-controller.hpp
+@@ -30,6 +30,9 @@ public:
+ 	/* Localized description of the last failure; empty unless state is Failed. */
+ 	QString lastError() const { return lastError_; }
+ 	uint64_t totalBytes() const;
++	/* True while start() itself is asking OBS to start streaming, so a
++	 * start-streaming override can let that request through. */
++	static bool isStartingInternally() { return startingInternally_; }
+ 
+ 	/* Installs server/key as a temporary service and starts streaming.
+ 	 * Returns false (with lastError set) if a stream is already active. */
+@@ -55,6 +58,7 @@ private:
+ 	static void onReconnectSuccess(void *data, calldata_t *cd);
+ 	static void onStop(void *data, calldata_t *cd);
+ 
++	static inline bool startingInternally_ = false;
+ 	State state_ = State::Idle;
+ 	QString lastError_;
+ 	obs_service_t *previousService_ = nullptr;

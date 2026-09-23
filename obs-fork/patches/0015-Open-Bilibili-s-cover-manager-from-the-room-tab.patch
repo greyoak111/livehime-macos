@@ -1,0 +1,489 @@
+From 054f05e008a8929b530ee4e2517491ba51c6c998 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 00:33:03 +0800
+Subject: [PATCH 15/26] Open Bilibili's cover manager from the room tab
+
+The Windows client manages the live cover in a web page
+(hime-live-cover): upload, crop, history, quality advice and review.
+Generalize the face-verification window into BilibiliPageWindow, which
+hosts such pages with the session in a non-persistent WebKit store and
+provides the web-mode pieces they fall back to without biliBridgePc: a
+file picker for uploads, page-initiated close, alerts and confirms. The
+room tab gains "Manage cover...".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/CMakeLists.txt               |   2 +-
+ .../LiveHimeCore/BilibiliPageWindow.swift     | 226 ++++++++++++++++++
+ .../Sources/LiveHimeCore/FaceAuthWindow.swift | 132 ----------
+ plugins/livehime/core/include/livehime-core.h |   4 +
+ plugins/livehime/data/locale/en-US.ini        |   2 +
+ plugins/livehime/data/locale/zh-CN.ini        |   2 +
+ plugins/livehime/src/feature-panel.cpp        |   6 +
+ plugins/livehime/src/feature-panel.hpp        |   1 +
+ 8 files changed, 242 insertions(+), 133 deletions(-)
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+ delete mode 100644 plugins/livehime/core/Sources/LiveHimeCore/FaceAuthWindow.swift
+
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 8a72c545f..18cf70be1 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -10,13 +10,13 @@ target_sources(
+   PRIVATE
+     core/include/livehime-core.h
+     core/Sources/LiveHimeCore/BilibiliControlClient.swift
++    core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+     core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+     core/Sources/LiveHimeCore/CBridge.swift
+     core/Sources/LiveHimeCore/CredentialStore.swift
+     core/Sources/LiveHimeCore/DanmakuClient.swift
+     core/Sources/LiveHimeCore/DanmakuProtocol.swift
+     core/Sources/LiveHimeCore/Diagnostics.swift
+-    core/Sources/LiveHimeCore/FaceAuthWindow.swift
+     core/Sources/LiveHimeCore/LiveRoomActions.swift
+     core/Sources/LiveHimeCore/PlatformSupport.swift
+     core/Sources/LiveHimeCore/QRLogin.swift
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+new file mode 100644
+index 000000000..d081fb9c0
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+@@ -0,0 +1,226 @@
++import AppKit
++import UniformTypeIdentifiers
++import WebKit
++
++/// Hosts one of Bilibili's own web pages for the logged-in account: the
++/// pre-live verification page and the live cover manager (the same pages the
++/// Windows client opens in CEF). Without the client's `biliBridgePc` the
++/// pages run in their standard web mode, so the window only needs the usual
++/// browser pieces: a file picker for uploads and page-initiated close.
++///
++/// The session cookies are copied into a non-persistent WebKit store that
++/// disappears with the window. The app never completes or bypasses anything
++/// on these pages itself.
++@MainActor
++final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
++    struct Options {
++        var title: String
++        var url: URL
++        var size: NSSize
++        var loadingText: String
++        var readyText: String
++        /// When set, a default button that closes the window and calls back.
++        var confirmTitle: String?
++    }
++
++    private static var open: [String: BilibiliPageWindow] = [:]
++
++    private let key: String
++    private let options: Options
++    private let window: NSWindow
++    private let webView: WKWebView
++    private let status: NSTextField
++    private let onConfirm: (() -> Void)?
++    private let onClose: (() -> Void)?
++
++    /// Shows the page for `key`, reusing an open window for the same key.
++    static func present(key: String, options: Options, credentials: SessionCredentials,
++                        onConfirm: (() -> Void)? = nil, onClose: (() -> Void)? = nil) {
++        if let existing = open[key] {
++            existing.window.makeKeyAndOrderFront(nil)
++            return
++        }
++        let controller = BilibiliPageWindow(key: key, options: options, onConfirm: onConfirm, onClose: onClose)
++        open[key] = controller
++        controller.load(credentials: credentials)
++    }
++
++    private init(key: String, options: Options, onConfirm: (() -> Void)?, onClose: (() -> Void)?) {
++        self.key = key
++        self.options = options
++        self.onConfirm = onConfirm
++        self.onClose = onClose
++        let configuration = WKWebViewConfiguration()
++        configuration.websiteDataStore = .nonPersistent()
++        webView = WKWebView(frame: .zero, configuration: configuration)
++        status = NSTextField(labelWithString: options.loadingText)
++        window = NSWindow(contentRect: NSRect(origin: .zero, size: options.size),
++                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
++        super.init()
++
++        var buttons: [NSView] = [status, NSView()]
++        let close = NSButton(title: "关闭", target: self, action: #selector(closeTapped))
++        buttons.append(close)
++        if let confirmTitle = options.confirmTitle {
++            let confirm = NSButton(title: confirmTitle, target: self, action: #selector(confirmTapped))
++            confirm.keyEquivalent = "\r"
++            buttons.append(confirm)
++        }
++        let bar = NSStackView(views: buttons)
++        bar.orientation = .horizontal
++        let root = NSStackView(views: [webView, bar])
++        root.orientation = .vertical
++        root.spacing = 10
++        root.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 12, right: 12)
++        webView.translatesAutoresizingMaskIntoConstraints = false
++        webView.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
++        webView.heightAnchor.constraint(greaterThanOrEqualToConstant: options.size.height - 60).isActive = true
++        webView.navigationDelegate = self
++        webView.uiDelegate = self
++
++        window.title = options.title
++        window.contentView = root
++        window.isReleasedWhenClosed = false
++        window.delegate = self
++        window.center()
++        window.makeKeyAndOrderFront(nil)
++        NSApp.activate(ignoringOtherApps: true)
++    }
++
++    private func load(credentials: SessionCredentials) {
++        let store = webView.configuration.websiteDataStore.httpCookieStore
++        Task { @MainActor in
++            for (name, value) in credentials.cookies {
++                if let cookie = HTTPCookie(properties: [.domain: ".bilibili.com", .path: "/", .name: name,
++                                                        .value: value, .secure: "TRUE"]) {
++                    await store.setCookie(cookie)
++                }
++            }
++            webView.load(URLRequest(url: options.url))
++        }
++    }
++
++    @objc private func confirmTapped() {
++        let confirm = onConfirm
++        window.close()
++        confirm?()
++    }
++
++    @objc private func closeTapped() {
++        window.close()
++    }
++
++    func windowWillClose(_ notification: Notification) {
++        webView.stopLoading()
++        Self.open[key] = nil
++        onClose?()
++    }
++
++    // MARK: WKNavigationDelegate
++
++    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
++        status.stringValue = options.readyText
++    }
++
++    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
++        status.stringValue = "页面加载失败，请关闭后重试"
++    }
++
++    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
++        status.stringValue = "页面加载失败，请关闭后重试"
++    }
++
++    // MARK: WKUIDelegate
++
++    /// `<input type="file">` for cover uploads.
++    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
++                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
++        let panel = NSOpenPanel()
++        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
++        panel.canChooseDirectories = false
++        panel.allowedContentTypes = [.jpeg, .png]
++        panel.beginSheetModal(for: window) { response in
++            completionHandler(response == .OK ? panel.urls : nil)
++        }
++    }
++
++    /// The page's own close action (`window.close()` in web mode).
++    func webViewDidClose(_ webView: WKWebView) {
++        window.close()
++    }
++
++    /// Links that open a new window stay inside this window.
++    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
++                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
++        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
++        return nil
++    }
++
++    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
++                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
++        let alert = NSAlert()
++        alert.messageText = message
++        alert.beginSheetModal(for: window) { _ in completionHandler() }
++    }
++
++    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
++                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
++        let alert = NSAlert()
++        alert.messageText = message
++        alert.addButton(withTitle: "确定")
++        alert.addButton(withTitle: "取消")
++        alert.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn) }
++    }
++}
++
++enum BilibiliPages {
++    static func faceAuth(voucher: String?) -> BilibiliPageWindow.Options {
++        var components = URLComponents(string: "https://live.bilibili.com/p/html/bilili-page-face-auth/index.html")!
++        components.queryItems = [
++            URLQueryItem(name: "is_live_webview", value: "1"),
++            URLQueryItem(name: "app_common", value: "open"),
++            URLQueryItem(name: "pc_ui", value: "500,428,17181a,2")
++        ]
++        if let voucher, !voucher.isEmpty {
++            components.queryItems?.append(URLQueryItem(name: "v_voucher", value: voucher))
++        }
++        return .init(title: "哔哩哔哩开播身份验证", url: components.url!, size: NSSize(width: 560, height: 640),
++                     loadingText: "正在载入哔哩哔哩官方验证页面…",
++                     readyText: "请按页面提示完成验证，然后点击「验证完成，重试开播」",
++                     confirmTitle: "验证完成，重试开播")
++    }
++
++    /// The Windows client's cover manager (upload, crop, history, review).
++    static let cover = BilibiliPageWindow.Options(
++        title: "直播间封面", url: URL(string: "https://live.bilibili.com/p/html/live-pc-blink/hime-live-cover/?pc_ui=680,566,0,1")!,
++        size: NSSize(width: 720, height: 660), loadingText: "正在载入哔哩哔哩封面管理…",
++        readyText: "封面修改后可能需要哔哩哔哩审核", confirmTitle: nil)
++}
++
++/// Opens the verification window for the ready account. When the user
++/// confirms, emits {"event":"faceAuthRetry"} so the dock retries Go live.
++@_cdecl("livehime_core_open_face_auth")
++public func livehime_core_open_face_auth(_ voucher: UnsafePointer<CChar>?) {
++    let voucherText = voucher.map { String(cString: $0) }
++    DispatchQueue.main.async {
++        MainActor.assumeIsolated {
++            guard let bridge = CoreBridge.shared, let credentials = bridge.coordinator.credentials else { return }
++            BilibiliPageWindow.present(key: "faceAuth", options: BilibiliPages.faceAuth(voucher: voucherText),
++                                       credentials: credentials,
++                                       onConfirm: { CoreBridge.shared?.emit(["event": "faceAuthRetry"]) })
++        }
++    }
++}
++
++/// Opens Bilibili's cover manager for the ready account. Emits
++/// {"event":"coverWindowClosed"} when it closes.
++@_cdecl("livehime_core_open_cover_page")
++public func livehime_core_open_cover_page() {
++    DispatchQueue.main.async {
++        MainActor.assumeIsolated {
++            guard let bridge = CoreBridge.shared, let credentials = bridge.coordinator.credentials else { return }
++            BilibiliPageWindow.present(key: "cover", options: BilibiliPages.cover, credentials: credentials,
++                                       onClose: { CoreBridge.shared?.emit(["event": "coverWindowClosed"]) })
++        }
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/FaceAuthWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/FaceAuthWindow.swift
+deleted file mode 100644
+index fc26371a8..000000000
+--- a/plugins/livehime/core/Sources/LiveHimeCore/FaceAuthWindow.swift
++++ /dev/null
+@@ -1,132 +0,0 @@
+-import AppKit
+-import WebKit
+-
+-/// Hosts Bilibili's own pre-live verification page (the same entry point the
+-/// Windows client and v0.1.2 use). The page hands `v_voucher` to Bilibili's
+-/// risk SDK, which shows the face-verification QR code or other checks.
+-///
+-/// The page needs the logged-in session, so the current cookies are copied
+-/// into a non-persistent WebKit store that disappears with the window. The
+-/// app never completes or bypasses the verification itself.
+-@MainActor
+-final class FaceAuthWindowController: NSObject, NSWindowDelegate, WKNavigationDelegate {
+-    private static var current: FaceAuthWindowController?
+-
+-    private let window: NSWindow
+-    private let webView: WKWebView
+-    private let status: NSTextField
+-    private let onRetry: () -> Void
+-
+-    static func present(voucher: String?, credentials: SessionCredentials, onRetry: @escaping () -> Void) {
+-        if let current {
+-            current.window.makeKeyAndOrderFront(nil)
+-            return
+-        }
+-        let controller = FaceAuthWindowController(onRetry: onRetry)
+-        current = controller
+-        controller.load(voucher: voucher, credentials: credentials)
+-    }
+-
+-    static var pageURLBase: URLComponents {
+-        var components = URLComponents(string: "https://live.bilibili.com/p/html/bilili-page-face-auth/index.html")!
+-        components.queryItems = [
+-            URLQueryItem(name: "is_live_webview", value: "1"),
+-            URLQueryItem(name: "app_common", value: "open"),
+-            URLQueryItem(name: "pc_ui", value: "500,428,17181a,2")
+-        ]
+-        return components
+-    }
+-
+-    private init(onRetry: @escaping () -> Void) {
+-        self.onRetry = onRetry
+-        let configuration = WKWebViewConfiguration()
+-        configuration.websiteDataStore = .nonPersistent()
+-        webView = WKWebView(frame: .zero, configuration: configuration)
+-        status = NSTextField(labelWithString: "正在载入哔哩哔哩官方验证页面…")
+-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 640),
+-                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+-        super.init()
+-
+-        let retry = NSButton(title: "验证完成，重试开播", target: self, action: #selector(retryTapped))
+-        retry.keyEquivalent = "\r"
+-        let close = NSButton(title: "关闭", target: self, action: #selector(closeTapped))
+-        let buttons = NSStackView(views: [status, NSView(), close, retry])
+-        buttons.orientation = .horizontal
+-        let root = NSStackView(views: [webView, buttons])
+-        root.orientation = .vertical
+-        root.spacing = 10
+-        root.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 12, right: 12)
+-        webView.translatesAutoresizingMaskIntoConstraints = false
+-        webView.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+-        webView.heightAnchor.constraint(greaterThanOrEqualToConstant: 480).isActive = true
+-        webView.navigationDelegate = self
+-
+-        window.title = "哔哩哔哩开播身份验证"
+-        window.contentView = root
+-        window.isReleasedWhenClosed = false
+-        window.delegate = self
+-        window.center()
+-        window.makeKeyAndOrderFront(nil)
+-        NSApp.activate(ignoringOtherApps: true)
+-    }
+-
+-    private func load(voucher: String?, credentials: SessionCredentials) {
+-        var components = Self.pageURLBase
+-        if let voucher, !voucher.isEmpty {
+-            components.queryItems?.append(URLQueryItem(name: "v_voucher", value: voucher))
+-        }
+-        let url = components.url!
+-        let store = webView.configuration.websiteDataStore.httpCookieStore
+-        Task { @MainActor in
+-            for (name, value) in credentials.cookies {
+-                if let cookie = HTTPCookie(properties: [.domain: ".bilibili.com", .path: "/", .name: name,
+-                                                        .value: value, .secure: "TRUE"]) {
+-                    await store.setCookie(cookie)
+-                }
+-            }
+-            webView.load(URLRequest(url: url))
+-        }
+-    }
+-
+-    @objc private func retryTapped() {
+-        let retry = onRetry
+-        window.close()
+-        retry()
+-    }
+-
+-    @objc private func closeTapped() {
+-        window.close()
+-    }
+-
+-    func windowWillClose(_ notification: Notification) {
+-        webView.stopLoading()
+-        Self.current = nil
+-    }
+-
+-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+-        status.stringValue = "请按页面提示完成验证，然后点击「验证完成，重试开播」"
+-    }
+-
+-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+-        status.stringValue = "验证页面加载失败，请关闭后重新开播"
+-    }
+-
+-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+-        status.stringValue = "验证页面加载失败，请关闭后重新开播"
+-    }
+-}
+-
+-/// Opens the verification window for the ready account. When the user
+-/// confirms, emits {"event":"faceAuthRetry"} so the dock retries Go live.
+-@_cdecl("livehime_core_open_face_auth")
+-public func livehime_core_open_face_auth(_ voucher: UnsafePointer<CChar>?) {
+-    let voucherText = voucher.map { String(cString: $0) }
+-    DispatchQueue.main.async {
+-        MainActor.assumeIsolated {
+-            guard let bridge = CoreBridge.shared, let credentials = bridge.coordinator.credentials else { return }
+-            FaceAuthWindowController.present(voucher: voucherText, credentials: credentials) {
+-                CoreBridge.shared?.emit(["event": "faceAuthRetry"])
+-            }
+-        }
+-    }
+-}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index ee93f0ade..a0987cdf4 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -37,6 +37,10 @@ void livehime_core_stop_live(void);
+  * When the user confirms, {"event":"faceAuthRetry"} is emitted. */
+ void livehime_core_open_face_auth(const char *voucher);
+ 
++/* Opens Bilibili's live cover manager (upload, crop, history, review) for
++ * the ready account; emits {"event":"coverWindowClosed"} when it closes. */
++void livehime_core_open_cover_page(void);
++
+ /* Room activity. Once the account is ready the core keeps the room's danmaku
+  * connection open and emits:
+  *   {"event":"danmakuStatus","status":"connecting|connected|reconnecting|stopped"}
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index ce76c0b8a..0ffc06781 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -90,3 +90,5 @@ LiveHime.Feature.Interact.follow="%1 followed"
+ LiveHime.Feature.Interact.share="%1 shared the room"
+ LiveHime.Feature.LiveStarted="The room went live."
+ LiveHime.Feature.LiveEnded="The room went offline."
++LiveHime.Feature.Cover="Cover"
++LiveHime.Feature.ManageCover="Manage cover..."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 870871abf..7a7c1e485 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -90,3 +90,5 @@ LiveHime.Feature.Interact.follow="%1 关注了直播间"
+ LiveHime.Feature.Interact.share="%1 分享了直播间"
+ LiveHime.Feature.LiveStarted="直播间已开播。"
+ LiveHime.Feature.LiveEnded="直播间已下播。"
++LiveHime.Feature.Cover="封面"
++LiveHime.Feature.ManageCover="管理封面…"
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 1eae9f181..d94ca7c72 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -81,8 +81,13 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	titleRow->addWidget(saveTitle_);
+ 	roomStatus_ = new QLabel(roomPage);
+ 	roomStatus_->setWordWrap(true);
++	cover_ = new QPushButton(text("LiveHime.Feature.ManageCover"), roomPage);
++	auto *coverRow = new QHBoxLayout;
++	coverRow->addWidget(cover_);
++	coverRow->addStretch(1);
+ 	auto *roomForm = new QFormLayout;
+ 	roomForm->addRow(text("LiveHime.Feature.Title"), titleRow);
++	roomForm->addRow(text("LiveHime.Feature.Cover"), coverRow);
+ 	auto *roomLayout = new QVBoxLayout(roomPage);
+ 	roomLayout->setContentsMargins(0, 6, 0, 0);
+ 	roomLayout->addLayout(roomForm);
+@@ -102,6 +107,7 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	connect(send_, &QPushButton::clicked, this, &FeaturePanel::sendDanmaku);
+ 	connect(message_, &QLineEdit::returnPressed, this, &FeaturePanel::sendDanmaku);
+ 	connect(saveTitle_, &QPushButton::clicked, this, &FeaturePanel::saveTitle);
++	connect(cover_, &QPushButton::clicked, this, [] { livehime_core_open_cover_page(); });
+ 	connect(readAloud_, &QCheckBox::toggled, this, [this](bool on) {
+ 		livehime_core_set_tts(on ? 1 : 0);
+ 		saveSettings();
+diff --git a/plugins/livehime/src/feature-panel.hpp b/plugins/livehime/src/feature-panel.hpp
+index a5254cc49..7fcfc97c0 100644
+--- a/plugins/livehime/src/feature-panel.hpp
++++ b/plugins/livehime/src/feature-panel.hpp
+@@ -48,6 +48,7 @@ private:
+ 	QPushButton *send_;
+ 	QLineEdit *title_;
+ 	QPushButton *saveTitle_;
++	QPushButton *cover_;
+ 	QLabel *roomStatus_;
+ 	QLabel *signedOutHint_;
+ };

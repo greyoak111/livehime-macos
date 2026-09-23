@@ -1,0 +1,664 @@
+From 45033272fad79937abf2c86f0d8a74b1131221d7 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 00:48:57 +0800
+Subject: [PATCH 18/26] Add danmaku moderation, blocked words, Super Chat pin
+ and gift filter
+
+Right-clicking a chat line offers copy and mute (this stream, 1 hour,
+permanently) via AddSilentUser, with the parameters the live room page
+sends. The room tab manages Bilibili's room-wide blocked words
+(Get/Add/DelShieldKeyword); the list parser tolerates payload shape
+changes. The danmaku tab pins the latest Super Chat for its paid
+duration and can show gifts and Super Chats only; the choice is saved.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../core/Sources/LiveHimeCore/CBridge.swift   |  54 ++++++-
+ .../Sources/LiveHimeCore/DanmakuClient.swift  |   2 +-
+ .../LiveHimeCore/DanmakuProtocol.swift        |   4 +-
+ .../LiveHimeCore/LiveRoomActions.swift        |  47 ++++++
+ .../LiveHimeCore/SessionCoordinator.swift     |  34 +++++
+ .../DanmakuProtocolTests.swift                |   4 +-
+ .../SessionCoordinatorTests.swift             |  26 ++++
+ plugins/livehime/core/include/livehime-core.h |   7 +
+ plugins/livehime/data/locale/en-US.ini        |  14 ++
+ plugins/livehime/data/locale/zh-CN.ini        |  14 ++
+ plugins/livehime/src/feature-panel.cpp        | 143 +++++++++++++++++-
+ plugins/livehime/src/feature-panel.hpp        |  16 +-
+ 12 files changed, 349 insertions(+), 16 deletions(-)
+
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index f6b51775d..67f92d30e 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -66,8 +66,8 @@ final class CoreBridge {
+             if let medal { f["medal"] = medal }
+         case let .gift(user, name, count, paid, totalCoin):
+             f.merge(["kind": "gift", "user": user, "name": name, "count": count, "paid": paid, "totalCoin": totalCoin]) { $1 }
+-        case let .superChat(user, text, price):
+-            f.merge(["kind": "superChat", "user": user, "text": text, "price": price]) { $1 }
++        case let .superChat(user, text, price, seconds):
++            f.merge(["kind": "superChat", "user": user, "text": text, "price": price, "seconds": seconds]) { $1 }
+         case let .guardBought(user, level, name, count):
+             f.merge(["kind": "guard", "user": user, "level": level, "name": name, "count": count]) { $1 }
+         case let .interaction(user, kind):
+@@ -289,3 +289,53 @@ public func livehime_core_update_title(_ text: UnsafePointer<CChar>?) {
+ public func livehime_core_set_tts(_ enabled: Int32) {
+     onMain { CoreBridge.shared?.speaker.enabled = enabled != 0 }
+ }
++
++// MARK: Moderation
++
++@_cdecl("livehime_core_mute_user")
++public func livehime_core_mute_user(_ uid: Int64, _ hours: Int32) {
++    onMain {
++        guard let bridge = CoreBridge.shared else { return }
++        Task { @MainActor in
++            do {
++                try await bridge.coordinator.muteUser(uid: uid, hours: Int(hours))
++                bridge.emit(["event": "userMuted", "ok": true, "uid": uid])
++            } catch {
++                bridge.emit(["event": "userMuted", "ok": false, "uid": uid].merging(CoreBridge.errorFields(error)) { $1 })
++            }
++        }
++    }
++}
++
++@_cdecl("livehime_core_load_shield_keywords")
++public func livehime_core_load_shield_keywords() {
++    onMain {
++        guard let bridge = CoreBridge.shared else { return }
++        Task { @MainActor in
++            do {
++                let keywords = try await bridge.coordinator.shieldKeywords()
++                bridge.emit(["event": "shieldKeywords", "ok": true, "keywords": keywords])
++            } catch {
++                bridge.emit(["event": "shieldKeywords", "ok": false].merging(CoreBridge.errorFields(error)) { $1 })
++            }
++        }
++    }
++}
++
++/// Adds (add != 0) or removes a room-wide blocked word, then reloads the list.
++@_cdecl("livehime_core_set_shield_keyword")
++public func livehime_core_set_shield_keyword(_ keyword: UnsafePointer<CChar>?, _ add: Int32) {
++    let word = keyword.map { String(cString: $0) } ?? ""
++    onMain {
++        guard let bridge = CoreBridge.shared else { return }
++        Task { @MainActor in
++            do {
++                try await bridge.coordinator.setShieldKeyword(word, add: add != 0)
++                let keywords = try await bridge.coordinator.shieldKeywords()
++                bridge.emit(["event": "shieldKeywords", "ok": true, "keywords": keywords])
++            } catch {
++                bridge.emit(["event": "shieldKeywords", "ok": false].merging(CoreBridge.errorFields(error)) { $1 })
++            }
++        }
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+index db2ceee29..2165339f8 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+@@ -127,7 +127,7 @@ public final class DanmakuSpeaker: NSObject, AVSpeechSynthesizerDelegate {
+         switch event {
+         case .chat(_, let user, let text, _): return "\(user)说：\(text)"
+         case .gift(let user, let name, let count, _, _): return "感谢\(user)送的\(count)个\(name)"
+-        case .superChat(let user, let text, _): return "\(user)的醒目留言：\(text)"
++        case .superChat(let user, let text, _, _): return "\(user)的醒目留言：\(text)"
+         case .guardBought(let user, _, let name, _): return "感谢\(user)开通\(name)"
+         default: return nil
+         }
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+index ea04f4e6c..6215881ad 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+@@ -92,7 +92,7 @@ struct DanmakuPacket: Equatable {
+ public enum LiveRoomEvent: Equatable, Sendable {
+     case chat(uid: Int64, user: String, text: String, medal: String?)
+     case gift(user: String, name: String, count: Int, paid: Bool, totalCoin: Int)
+-    case superChat(user: String, text: String, price: Int)
++    case superChat(user: String, text: String, price: Int, seconds: Int)
+     case guardBought(user: String, level: Int, name: String, count: Int)
+     case interaction(user: String, kind: InteractionKind)
+     case watched(Int)
+@@ -137,7 +137,7 @@ enum DanmakuParser {
+         case "SUPER_CHAT_MESSAGE":
+             let user = data["user_info"] as? [String: Any]
+             return .superChat(user: user?["uname"] as? String ?? "", text: data["message"] as? String ?? "",
+-                              price: int(data["price"]))
++                              price: int(data["price"]), seconds: int(data["time"]))
+         case "GUARD_BUY":
+             return .guardBought(user: data["username"] as? String ?? "", level: int(data["guard_level"]),
+                                 name: data["gift_name"] as? String ?? "", count: int(data["num"]))
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+index 8ff0c7b82..19368d02d 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+@@ -85,6 +85,53 @@ extension BilibiliLiveClient {
+                                               ("csrf", csrf), ("csrf_token", csrf)]))
+     }
+ 
++    /// Room moderation (the requests the live room page makes).
++    /// `hours`: -1 permanent, 0 for the current live session, otherwise hours.
++    public func muteUser(roomID: Int64, uid: Int64, hours: Int, cookieHeader: String) async throws {
++        let csrf = try csrf(from: cookieHeader)
++        _ = try await requestJSON(url: URL(string: "https://api.live.bilibili.com/xlive/web-ucenter/v1/banned/AddSilentUser")!,
++                                  cookieHeader: cookieHeader,
++                                  body: form([("room_id", String(roomID)), ("tuid", String(uid)), ("mobile_app", "web"),
++                                              ("type", "1"), ("hour", String(hours)), ("csrf", csrf), ("csrf_token", csrf),
++                                              ("visit_id", "")]))
++    }
++
++    public func shieldKeywords(roomID: Int64, cookieHeader: String) async throws -> [String] {
++        let csrf = try csrf(from: cookieHeader)
++        let root = try await requestJSON(url: URL(string: "https://api.live.bilibili.com/xlive/web-ucenter/v1/banned/GetShieldKeywordList")!,
++                                         cookieHeader: cookieHeader,
++                                         body: form([("room_id", String(roomID)), ("csrf", csrf), ("csrf_token", csrf)]))
++        return Self.keywords(in: root["data"])
++    }
++
++    public func setShieldKeyword(roomID: Int64, keyword: String, add: Bool, cookieHeader: String) async throws {
++        let csrf = try csrf(from: cookieHeader)
++        let path = add ? "AddShieldKeyword" : "DelShieldKeyword"
++        _ = try await requestJSON(url: URL(string: "https://api.live.bilibili.com/xlive/web-ucenter/v1/banned/\(path)")!,
++                                  cookieHeader: cookieHeader,
++                                  body: form([("room_id", String(roomID)), ("keyword", keyword), ("csrf", csrf),
++                                              ("csrf_token", csrf)]))
++    }
++
++    /// The list's key names are not stable across versions; take every
++    /// "keyword" string (or plain string item) found in the payload.
++    static func keywords(in value: Any?) -> [String] {
++        var found: [String] = []
++        func walk(_ v: Any?) {
++            if let d = v as? [String: Any] {
++                if let k = d["keyword"] as? String, !k.isEmpty { found.append(k); return }
++                for key in d.keys.sorted() { walk(d[key]) }
++            } else if let a = v as? [Any] {
++                for item in a {
++                    if let s = item as? String, !s.isEmpty { found.append(s) } else { walk(item) }
++                }
++            }
++        }
++        walk(value)
++        var seen = Set<String>()
++        return found.filter { seen.insert($0).inserted }
++    }
++
+     private func cookieValue(_ name: String, in header: String) -> String? {
+         for part in header.split(separator: ";") {
+             let pair = part.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+index 4a0489893..65f46af71 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -47,6 +47,9 @@ public protocol BilibiliAccountAPI: Sendable {
+     func refreshSessionIfNeeded(_ current: SessionCredentials) async throws -> SessionCredentials?
+     func confirmRefresh(renewed: SessionCredentials, previousRefreshToken: String) async throws
+     func logout(_ current: SessionCredentials) async throws
++    func muteUser(roomID: Int64, uid: Int64, hours: Int, cookieHeader: String) async throws
++    func shieldKeywords(roomID: Int64, cookieHeader: String) async throws -> [String]
++    func setShieldKeyword(roomID: Int64, keyword: String, add: Bool, cookieHeader: String) async throws
+ }
+ 
+ /// Reads cookies a previous app version left in its WebKit store.
+@@ -237,6 +240,25 @@ public final class SessionCoordinator {
+         await refreshRoom()
+     }
+ 
++    public func muteUser(uid: Int64, hours: Int) async throws {
++        let (saved, account) = try readyAccount()
++        try await guarded { try await self.api.muteUser(roomID: account.room.roomID, uid: uid, hours: hours, cookieHeader: saved.cookieHeader) }
++    }
++
++    public func shieldKeywords() async throws -> [String] {
++        let (saved, account) = try readyAccount()
++        return try await guarded { try await self.api.shieldKeywords(roomID: account.room.roomID, cookieHeader: saved.cookieHeader) }
++    }
++
++    public func setShieldKeyword(_ keyword: String, add: Bool) async throws {
++        let (saved, account) = try readyAccount()
++        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !trimmed.isEmpty else { return }
++        try await guarded {
++            try await self.api.setShieldKeyword(roomID: account.room.roomID, keyword: trimmed, add: add, cookieHeader: saved.cookieHeader)
++        }
++    }
++
+     /// Re-reads the room so live status and area reflect Bilibili's state.
+     /// Failures leave the current account untouched.
+     public func refreshRoom() async {
+@@ -436,6 +458,18 @@ public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
+         try await SessionMaintenance().logout(current)
+     }
+ 
++    public func muteUser(roomID: Int64, uid: Int64, hours: Int, cookieHeader: String) async throws {
++        try await live(cookieHeader).muteUser(roomID: roomID, uid: uid, hours: hours, cookieHeader: cookieHeader)
++    }
++
++    public func shieldKeywords(roomID: Int64, cookieHeader: String) async throws -> [String] {
++        try await live(cookieHeader).shieldKeywords(roomID: roomID, cookieHeader: cookieHeader)
++    }
++
++    public func setShieldKeyword(roomID: Int64, keyword: String, add: Bool, cookieHeader: String) async throws {
++        try await live(cookieHeader).setShieldKeyword(roomID: roomID, keyword: keyword, add: add, cookieHeader: cookieHeader)
++    }
++
+     private func live(_ cookieHeader: String) -> BilibiliLiveClient {
+         BilibiliLiveClient(cookieHeader: cookieHeader, session: BilibiliWeb.session, diagnostics: diagnostics)
+     }
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+index ea70c85a6..effd7bb89 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+@@ -51,8 +51,8 @@ final class DanmakuProtocolTests: XCTestCase {
+ 
+     func testSuperChatAndGuard() {
+         XCTAssertEqual(DanmakuParser.event(from: ["cmd": "SUPER_CHAT_MESSAGE",
+-                                                  "data": ["message": "加油", "price": 30, "user_info": ["uname": "C"]]]),
+-                       .superChat(user: "C", text: "加油", price: 30))
++                                                  "data": ["message": "加油", "price": 30, "time": 60, "user_info": ["uname": "C"]]]),
++                       .superChat(user: "C", text: "加油", price: 30, seconds: 60))
+         XCTAssertEqual(DanmakuParser.event(from: ["cmd": "GUARD_BUY",
+                                                   "data": ["username": "D", "guard_level": 3, "gift_name": "舰长", "num": 1]]),
+                        .guardBought(user: "D", level: 3, name: "舰长", count: 1))
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+index a663415b8..30e058beb 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -57,6 +57,13 @@ private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
+     }
+     func confirmRefresh(renewed: SessionCredentials, previousRefreshToken: String) async throws { confirmed.append(previousRefreshToken) }
+     func logout(_ current: SessionCredentials) async throws { loggedOut.append(current) }
++    var muted: [(Int64, Int)] = []
++    var keywords: [String] = ["刷屏"]
++    func muteUser(roomID: Int64, uid: Int64, hours: Int, cookieHeader: String) async throws { muted.append((uid, hours)) }
++    func shieldKeywords(roomID: Int64, cookieHeader: String) async throws -> [String] { keywords }
++    func setShieldKeyword(roomID: Int64, keyword: String, add: Bool, cookieHeader: String) async throws {
++        if add { keywords.append(keyword) } else { keywords.removeAll { $0 == keyword } }
++    }
+     var sentDanmaku: [String] = []
+     var titles: [String] = []
+     func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws { sentDanmaku.append(text) }
+@@ -262,6 +269,25 @@ final class LiveRoomTests: XCTestCase {
+         XCTAssertEqual(account.room.title, "新标题")
+     }
+ 
++    func testModerationUsesReadyRoom() async throws {
++        let api = StubAPI()
++        let c = await readyCoordinator(api)
++        try await c.muteUser(uid: 7, hours: 0)
++        XCTAssertEqual(api.muted.first?.0, 7)
++        try await c.setShieldKeyword("  广告 ", add: true)
++        let afterAdd = try await c.shieldKeywords()
++        XCTAssertEqual(afterAdd, ["刷屏", "广告"])
++        try await c.setShieldKeyword("刷屏", add: false)
++        let afterRemove = try await c.shieldKeywords()
++        XCTAssertEqual(afterRemove, ["广告"])
++    }
++
++    func testKeywordListParsingIsShapeTolerant() {
++        XCTAssertEqual(BilibiliLiveClient.keywords(in: ["keyword_list": [["keyword": "a", "uid": 1], ["keyword": "b"]]]), ["a", "b"])
++        XCTAssertEqual(BilibiliLiveClient.keywords(in: ["list": ["x", "y", "x"]]), ["x", "y"])
++        XCTAssertEqual(BilibiliLiveClient.keywords(in: [:]), [])
++    }
++
+     func testStartLiveRequiresReadySession() async {
+         let c = SessionCoordinator(api: StubAPI(), store: MemoryCredentialStore())
+         do {
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index a0987cdf4..7db954aa1 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -51,6 +51,13 @@ void livehime_core_send_danmaku(const char *text);
+ void livehime_core_update_title(const char *title);
+ void livehime_core_set_tts(int enabled);
+ 
++/* Moderation. hours: -1 permanent, 0 current live session, otherwise hours.
++ * Replies: {"event":"userMuted","ok","uid"} and
++ * {"event":"shieldKeywords","ok","keywords":[...]}. */
++void livehime_core_mute_user(long long uid, int hours);
++void livehime_core_load_shield_keywords(void);
++void livehime_core_set_shield_keyword(const char *keyword, int add);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 4966aa1df..7266f5fb2 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -104,3 +104,17 @@ LiveHime.Overlay.Width="Width"
+ LiveHime.Overlay.ShowGifts="Show gifts"
+ LiveHime.Overlay.ShowSuperChats="Show Super Chats"
+ LiveHime.Overlay.ShowGuards="Show guard purchases"
++LiveHime.Feature.GiftsOnly="Gifts and Super Chats only"
++LiveHime.Feature.Copy="Copy"
++LiveHime.Feature.MuteUser="Mute %1"
++LiveHime.Feature.MuteSession="For this stream"
++LiveHime.Feature.MuteHour="For 1 hour"
++LiveHime.Feature.MuteForever="Permanently"
++LiveHime.Feature.Muted="User muted."
++LiveHime.Feature.MuteFailed="Could not mute the user"
++LiveHime.Feature.Keywords="Blocked words"
++LiveHime.Feature.KeywordPlaceholder="Add a word"
++LiveHime.Feature.AddKeyword="Add"
++LiveHime.Feature.RemoveKeyword="Remove selected"
++LiveHime.Feature.KeywordHint="Bilibili hides danmaku containing these words for everyone in your room."
++LiveHime.Feature.KeywordFailed="Blocked words could not be updated."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 5aa560824..8741f0f10 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -104,3 +104,17 @@ LiveHime.Overlay.Width="宽度"
+ LiveHime.Overlay.ShowGifts="显示礼物"
+ LiveHime.Overlay.ShowSuperChats="显示醒目留言"
+ LiveHime.Overlay.ShowGuards="显示上舰"
++LiveHime.Feature.GiftsOnly="只看礼物和留言"
++LiveHime.Feature.Copy="复制"
++LiveHime.Feature.MuteUser="禁言 %1"
++LiveHime.Feature.MuteSession="本场直播"
++LiveHime.Feature.MuteHour="1 小时"
++LiveHime.Feature.MuteForever="永久"
++LiveHime.Feature.Muted="已禁言该用户。"
++LiveHime.Feature.MuteFailed="禁言失败"
++LiveHime.Feature.Keywords="屏蔽词"
++LiveHime.Feature.KeywordPlaceholder="添加屏蔽词"
++LiveHime.Feature.AddKeyword="添加"
++LiveHime.Feature.RemoveKeyword="删除所选"
++LiveHime.Feature.KeywordHint="哔哩哔哩会为直播间里所有人隐藏包含这些词的弹幕。"
++LiveHime.Feature.KeywordFailed="屏蔽词未能更新。"
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index d94ca7c72..fdc70c9c2 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -6,9 +6,15 @@
+ #include <util/platform.h>
+ #include <util/util.hpp>
+ 
++#include <QApplication>
+ #include <QCheckBox>
++#include <QClipboard>
++#include <QGroupBox>
++#include <QMenu>
++#include <QTimer>
+ #include <QFormLayout>
+ #include <QHBoxLayout>
++#include <QJsonArray>
+ #include <QLabel>
+ #include <QLineEdit>
+ #include <QListWidget>
+@@ -52,10 +58,22 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	feed_->setWordWrap(true);
+ 	feed_->setUniformItemSizes(false);
+ 	feed_->setSelectionMode(QAbstractItemView::ExtendedSelection);
++	feed_->setContextMenuPolicy(Qt::CustomContextMenu);
++	connect(feed_, &QListWidget::customContextMenuRequested, this, &FeaturePanel::showFeedMenu);
++	pinned_ = new QLabel(danmakuPage);
++	pinned_->setWordWrap(true);
++	pinned_->setStyleSheet(QStringLiteral(
++		"QLabel { background: #3a2226; color: #ffd7da; border-left: 3px solid #fb4d5a; padding: 6px; }"));
++	pinned_->hide();
++	pinnedTimer_ = new QTimer(this);
++	pinnedTimer_->setSingleShot(true);
++	connect(pinnedTimer_, &QTimer::timeout, pinned_, &QLabel::hide);
+ 	showEntries_ = new QCheckBox(text("LiveHime.Feature.ShowEntries"), danmakuPage);
+ 	readAloud_ = new QCheckBox(text("LiveHime.Feature.ReadAloud"), danmakuPage);
++	giftsOnly_ = new QCheckBox(text("LiveHime.Feature.GiftsOnly"), danmakuPage);
+ 	auto *options = new QHBoxLayout;
+ 	options->addWidget(showEntries_);
++	options->addWidget(giftsOnly_);
+ 	options->addWidget(readAloud_);
+ 	options->addStretch(1);
+ 	message_ = new QLineEdit(danmakuPage);
+@@ -67,6 +85,7 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	sendRow->addWidget(send_);
+ 	auto *danmakuLayout = new QVBoxLayout(danmakuPage);
+ 	danmakuLayout->setContentsMargins(0, 6, 0, 0);
++	danmakuLayout->addWidget(pinned_);
+ 	danmakuLayout->addWidget(feed_, 1);
+ 	danmakuLayout->addLayout(options);
+ 	danmakuLayout->addLayout(sendRow);
+@@ -92,7 +111,39 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	roomLayout->setContentsMargins(0, 6, 0, 0);
+ 	roomLayout->addLayout(roomForm);
+ 	roomLayout->addWidget(roomStatus_);
+-	roomLayout->addStretch(1);
++
++	auto *shield = new QGroupBox(text("LiveHime.Feature.Keywords"), roomPage);
++	keywords_ = new QListWidget(shield);
++	keywords_->setSelectionMode(QAbstractItemView::ExtendedSelection);
++	newKeyword_ = new QLineEdit(shield);
++	newKeyword_->setPlaceholderText(text("LiveHime.Feature.KeywordPlaceholder"));
++	addKeyword_ = new QPushButton(text("LiveHime.Feature.AddKeyword"), shield);
++	removeKeyword_ = new QPushButton(text("LiveHime.Feature.RemoveKeyword"), shield);
++	keywordStatus_ = new QLabel(text("LiveHime.Feature.KeywordHint"), shield);
++	keywordStatus_->setWordWrap(true);
++	keywordStatus_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++	auto *keywordRow = new QHBoxLayout;
++	keywordRow->addWidget(newKeyword_, 1);
++	keywordRow->addWidget(addKeyword_);
++	keywordRow->addWidget(removeKeyword_);
++	auto *shieldLayout = new QVBoxLayout(shield);
++	shieldLayout->addWidget(keywords_, 1);
++	shieldLayout->addLayout(keywordRow);
++	shieldLayout->addWidget(keywordStatus_);
++	roomLayout->addWidget(shield, 1);
++	auto submitKeyword = [this] {
++		const QByteArray word = newKeyword_->text().trimmed().toUtf8();
++		if (word.isEmpty())
++			return;
++		addKeyword_->setEnabled(false);
++		livehime_core_set_shield_keyword(word.constData(), 1);
++	};
++	connect(addKeyword_, &QPushButton::clicked, this, submitKeyword);
++	connect(newKeyword_, &QLineEdit::returnPressed, this, submitKeyword);
++	connect(removeKeyword_, &QPushButton::clicked, this, [this] {
++		for (QListWidgetItem *item : keywords_->selectedItems())
++			livehime_core_set_shield_keyword(item->text().toUtf8().constData(), 0);
++	});
+ 
+ 	tabs_ = new QTabWidget(this);
+ 	tabs_->addTab(danmakuPage, text("LiveHime.Feature.DanmakuTab"));
+@@ -113,6 +164,7 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 		saveSettings();
+ 	});
+ 	connect(showEntries_, &QCheckBox::toggled, this, &FeaturePanel::saveSettings);
++	connect(giftsOnly_, &QCheckBox::toggled, this, &FeaturePanel::saveSettings);
+ 
+ 	loadSettings();
+ 	applyState(QJsonObject());
+@@ -128,9 +180,16 @@ void FeaturePanel::applyState(const QJsonObject &state)
+ 		if (!ready) {
+ 			watched_ = likes_ = onlineRank_ = -1;
+ 			feed_->clear();
++			keywords_->clear();
++			keywordsLoaded_ = false;
++			pinned_->hide();
+ 		}
+ 	}
+ 	tabs_->setEnabled(ready);
++	if (ready && !keywordsLoaded_) {
++		keywordsLoaded_ = true;
++		livehime_core_load_shield_keywords();
++	}
+ 	signedOutHint_->setVisible(!ready);
+ 	updateStats();
+ }
+@@ -152,6 +211,14 @@ void FeaturePanel::applyEvent(const QJsonObject &event)
+ 			appendFeed(text("LiveHime.Feature.SendFailed") + (detail.isEmpty() ? QString() : QStringLiteral("：") + detail),
+ 				   QStringLiteral("#e06c75"));
+ 		}
++	} else if (name == "shieldKeywords") {
++		showKeywords(event);
++	} else if (name == "userMuted") {
++		const bool ok = event.value("ok").toBool();
++		const QString detail = event.value("message").toString();
++		appendFeed(ok ? text("LiveHime.Feature.Muted")
++			      : text("LiveHime.Feature.MuteFailed") + (detail.isEmpty() ? QString() : QStringLiteral("：") + detail),
++			   ok ? QStringLiteral("#9aa0ab") : QStringLiteral("#e06c75"));
+ 	} else if (name == "titleUpdated") {
+ 		saveTitle_->setEnabled(true);
+ 		const bool ok = event.value("ok").toBool();
+@@ -167,25 +234,29 @@ void FeaturePanel::onRoomEvent(const QJsonObject &event)
+ {
+ 	const QString kind = event.value("kind").toString();
+ 	const QString user = event.value("user").toString();
++	const bool giftsOnly = giftsOnly_->isChecked();
+ 	if (kind == "chat") {
++		if (giftsOnly)
++			return;
+ 		const QString medal = event.value("medal").toString();
+ 		appendFeed((medal.isEmpty() ? QString() : QStringLiteral("[%1] ").arg(medal)) + user + QStringLiteral("：") +
+-			   event.value("text").toString());
++				   event.value("text").toString(),
++			   QString(), event.value("uid").toVariant().toLongLong(), user);
+ 	} else if (kind == "gift") {
+ 		appendFeed(text("LiveHime.Feature.Gift")
+ 				   .arg(user, event.value("name").toString())
+ 				   .arg(event.value("count").toInt()),
+ 			   QStringLiteral("#e0a040"));
+ 	} else if (kind == "superChat") {
+-		appendFeed(text("LiveHime.Feature.SuperChat")
+-				   .arg(event.value("price").toInt())
+-				   .arg(user, event.value("text").toString()),
+-			   QStringLiteral("#fb4d5a"));
++		const QString line =
++			text("LiveHime.Feature.SuperChat").arg(event.value("price").toInt()).arg(user, event.value("text").toString());
++		appendFeed(line, QStringLiteral("#fb4d5a"));
++		pinSuperChat(line, event.value("seconds").toInt());
+ 	} else if (kind == "guard") {
+ 		appendFeed(text("LiveHime.Feature.Guard").arg(user, event.value("name").toString()),
+ 			   QStringLiteral("#8994ee"));
+ 	} else if (kind == "enter" || kind == "follow" || kind == "share") {
+-		if (showEntries_->isChecked() || kind == "follow") {
++		if (!giftsOnly && (showEntries_->isChecked() || kind == "follow")) {
+ 			const QByteArray key = "LiveHime.Feature.Interact." + kind.toUtf8();
+ 			appendFeed(text(key.constData()).arg(user), QStringLiteral("#6c717b"));
+ 		}
+@@ -204,13 +275,65 @@ void FeaturePanel::onRoomEvent(const QJsonObject &event)
+ 	}
+ }
+ 
+-void FeaturePanel::appendFeed(const QString &line, const QString &color)
++void FeaturePanel::pinSuperChat(const QString &line, int seconds)
++{
++	/* Keep the latest Super Chat above the feed for its paid duration. */
++	pinned_->setText(line);
++	pinned_->show();
++	pinnedTimer_->start(std::max(seconds, 10) * 1000);
++}
++
++void FeaturePanel::showFeedMenu(const QPoint &pos)
++{
++	QListWidgetItem *item = feed_->itemAt(pos);
++	if (!item)
++		return;
++	QMenu menu(this);
++	const QString line = item->text();
++	menu.addAction(text("LiveHime.Feature.Copy"), this, [line] { QApplication::clipboard()->setText(line); });
++	const qint64 uid = item->data(Qt::UserRole).toLongLong();
++	const QString user = item->data(Qt::UserRole + 1).toString();
++	if (uid > 0) {
++		QMenu *mute = menu.addMenu(text("LiveHime.Feature.MuteUser").arg(user));
++		const std::pair<const char *, int> choices[] = {{"LiveHime.Feature.MuteSession", 0},
++								{"LiveHime.Feature.MuteHour", 1},
++								{"LiveHime.Feature.MuteForever", -1}};
++		for (const auto &[label, hours] : choices)
++			mute->addAction(text(label), this, [uid, hours = hours] { livehime_core_mute_user(uid, hours); });
++	}
++	menu.exec(feed_->viewport()->mapToGlobal(pos));
++}
++
++void FeaturePanel::showKeywords(const QJsonObject &event)
++{
++	addKeyword_->setEnabled(true);
++	if (!event.value("ok").toBool()) {
++		const QString detail = event.value("message").toString();
++		keywordStatus_->setText(text("LiveHime.Feature.KeywordFailed") +
++					(detail.isEmpty() ? QString() : QStringLiteral("\n") + detail));
++		keywordStatus_->setStyleSheet(QStringLiteral("color: #e06c75;"));
++		return;
++	}
++	keywords_->clear();
++	const QJsonArray list = event.value("keywords").toArray();
++	for (const QJsonValue value : list)
++		keywords_->addItem(value.toString());
++	newKeyword_->clear();
++	keywordStatus_->setText(text("LiveHime.Feature.KeywordHint"));
++	keywordStatus_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++}
++
++void FeaturePanel::appendFeed(const QString &line, const QString &color, qint64 uid, const QString &user)
+ {
+ 	QScrollBar *bar = feed_->verticalScrollBar();
+ 	const bool atBottom = bar->value() >= bar->maximum() - 4;
+ 	auto *item = new QListWidgetItem(line);
+ 	if (!color.isEmpty())
+ 		item->setForeground(QColor(color));
++	if (uid > 0) {
++		item->setData(Qt::UserRole, uid);
++		item->setData(Qt::UserRole + 1, user);
++	}
+ 	feed_->addItem(item);
+ 	while (feed_->count() > kMaxFeedItems)
+ 		delete feed_->takeItem(0);
+@@ -259,6 +382,9 @@ void FeaturePanel::loadSettings()
+ 	OBSDataAutoRelease data = path ? obs_data_create_from_json_file_safe(path, "bak") : nullptr;
+ 	const bool entries = data ? obs_data_get_bool(data, "show_entries") : false;
+ 	const bool tts = data ? obs_data_get_bool(data, "read_aloud") : false;
++	const bool giftsOnly = data ? obs_data_get_bool(data, "gifts_only") : false;
++	QSignalBlocker blockGifts(giftsOnly_);
++	giftsOnly_->setChecked(giftsOnly);
+ 	QSignalBlocker blockEntries(showEntries_);
+ 	QSignalBlocker blockTts(readAloud_);
+ 	showEntries_->setChecked(entries);
+@@ -276,5 +402,6 @@ void FeaturePanel::saveSettings()
+ 	OBSDataAutoRelease data = obs_data_create();
+ 	obs_data_set_bool(data, "show_entries", showEntries_->isChecked());
+ 	obs_data_set_bool(data, "read_aloud", readAloud_->isChecked());
++	obs_data_set_bool(data, "gifts_only", giftsOnly_->isChecked());
+ 	obs_data_save_json_safe(data, path, "tmp", "bak");
+ }
+diff --git a/plugins/livehime/src/feature-panel.hpp b/plugins/livehime/src/feature-panel.hpp
+index 7fcfc97c0..39634bd2b 100644
+--- a/plugins/livehime/src/feature-panel.hpp
++++ b/plugins/livehime/src/feature-panel.hpp
+@@ -9,6 +9,7 @@ class QLineEdit;
+ class QListWidget;
+ class QPushButton;
+ class QTabWidget;
++class QTimer;
+ 
+ /* Everyday live-room features below the account section: room stats, the
+  * live danmaku feed (chat, gifts, Super Chats, guards, entries) with sending
+@@ -25,7 +26,11 @@ public slots:
+ 	void applyEvent(const QJsonObject &event);
+ 
+ private:
+-	void appendFeed(const QString &line, const QString &color = QString());
++	void appendFeed(const QString &line, const QString &color = QString(), qint64 uid = 0,
++			const QString &user = QString());
++	void showFeedMenu(const QPoint &pos);
++	void pinSuperChat(const QString &line, int seconds);
++	void showKeywords(const QJsonObject &event);
+ 	void onRoomEvent(const QJsonObject &event);
+ 	void updateStats();
+ 	void sendDanmaku();
+@@ -44,6 +49,15 @@ private:
+ 	QListWidget *feed_;
+ 	QCheckBox *showEntries_;
+ 	QCheckBox *readAloud_;
++	QCheckBox *giftsOnly_;
++	QLabel *pinned_;
++	QTimer *pinnedTimer_;
++	QListWidget *keywords_;
++	QLineEdit *newKeyword_;
++	QPushButton *addKeyword_;
++	QPushButton *removeKeyword_;
++	QLabel *keywordStatus_;
++	bool keywordsLoaded_ = false;
+ 	QLineEdit *message_;
+ 	QPushButton *send_;
+ 	QLineEdit *title_;

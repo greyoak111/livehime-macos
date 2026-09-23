@@ -1,17 +1,19 @@
-# OBS component used by LiveHime macOS v0.1.2
+# OBS component used by LiveHime macOS v0.2.0
 
-The local development bundle uses an OBS Studio checkout as an internal,
-separately launched backend. The exact checkout used during v0.1.2 development
-was:
+Since v0.2.0 the app itself is a modified OBS Studio build (not a nested
+OBS.app as in v0.1.x).
 
 - Repository: https://github.com/obsproject/obs-studio
-- Commit: `6b3e550729f125b6c5b3767df88c08f5aef9d264`
-- Bundle metadata override used by the local build: `OBS_VERSION_OVERRIDE=32.2.2` (this is not a claim that the checkout is the official 32.2.2 release tag)
-- License: GNU GPL v2 or any later version
-- Integration: nested `OBS.app`, controlled over OBS WebSocket v5 on localhost
+- Base: tag `32.2.2`, commit `ba2f32bdf791005443988a4955e963663e16b1ed`
+- Modifications: the patch series in [`obs-fork/patches`](../../obs-fork/patches),
+  including the LiveHime plugin (`plugins/livehime`) and a mac-capture change
+- License: GNU GPL v2 or any later version (see `COPYING`)
+- Build: `BUNDLE_ID=local.livehime.macos build-aux/livehime/build-macos.sh`
+  (Xcode generator, RelWithDebInfo, arm64, `ENABLE_BROWSER=OFF`,
+  `OBS_VERSION_OVERRIDE=32.2.2`, `LIVEHIME_APP_VERSION=0.2.0`,
+  `OBS_USER_CONFIG_SUBDIR=LiveHime`)
+- Bundled files: [`DEPENDENCY-INVENTORY-v0.2.0.txt`](DEPENDENCY-INVENTORY-v0.2.0.txt)
 
-The public repository intentionally does not contain the generated OBS.app,
-prebuilt dependency archives, or the Windows Bilibili client. To reproduce the
-local backend, obtain the exact OBS source commit above and build it with the
-project's macOS packaging script. Any redistributed binary must be accompanied
-by the corresponding source and the applicable third-party notices.
+Rebuild steps are in [`obs-fork/README.md`](../../obs-fork/README.md). The
+repository does not contain generated app bundles, prebuilt dependency
+archives, the Windows Bilibili client, or signing keys.

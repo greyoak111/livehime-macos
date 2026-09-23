@@ -1,0 +1,168 @@
+From faea428dc5cdc45984d690d33fa4a0ce6d2bd482 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 23:05:03 +0800
+Subject: [PATCH 05/26] Show LiveHime name and version in window title; dock
+ panel on first run
+
+Add LIVEHIME_APP_VERSION, used as the bundle's marketing version and in
+the main window title ("LiveHime 0.2.0 (OBS 32.2.2)"). Without it the
+title and version stay upstream.
+
+OBS creates plugin docks hidden and floating; the LiveHime plugin now
+docks its panel on the right and shows it once, on first run, and leaves
+the user's saved layout alone afterwards.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/build-macos.sh    |  1 +
+ cmake/macos/defaults.cmake           |  1 +
+ cmake/macos/helpers.cmake            |  8 ++++++-
+ frontend/cmake/os-macos.cmake        |  7 ++++++
+ frontend/widgets/OBSBasic.cpp        |  8 +++++++
+ plugins/livehime/src/plugin-main.cpp | 33 ++++++++++++++++++++++++++++
+ 6 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
+index 156dca20f..ae38af243 100755
+--- a/build-aux/livehime/build-macos.sh
++++ b/build-aux/livehime/build-macos.sh
+@@ -15,6 +15,7 @@ cmake -S "$source_dir" --preset macos \
+   -DLIVEHIME_APP_BUNDLE_ID=local.livehime.macos \
+   -DLIVEHIME_APP_NAME=LiveHime \
+   -DLIVEHIME_APP_DISPLAY_NAME=LiveHime \
++  -DLIVEHIME_APP_VERSION=0.2.0 \
+   -DOBS_USER_CONFIG_SUBDIR=LiveHime
+ 
+ cmake --build "$source_dir/build_macos" --config "$config" --target obs-studio -- -quiet
+diff --git a/cmake/macos/defaults.cmake b/cmake/macos/defaults.cmake
+index b4466c6b1..82f16bdbb 100644
+--- a/cmake/macos/defaults.cmake
++++ b/cmake/macos/defaults.cmake
+@@ -19,6 +19,7 @@ include(xcode)
+ set(LIVEHIME_APP_BUNDLE_ID "com.obsproject.obs-studio" CACHE STRING "Application bundle identifier")
+ set(LIVEHIME_APP_NAME "OBS" CACHE STRING "Application bundle and executable name")
+ set(LIVEHIME_APP_DISPLAY_NAME "OBS Studio" CACHE STRING "Application display name")
++set(LIVEHIME_APP_VERSION "" CACHE STRING "Application marketing version; empty uses the OBS version")
+ set(OBS_USER_CONFIG_SUBDIR "" CACHE STRING "Subdirectory of ~/Library/Application Support used as the user config root")
+ 
+ include(buildspec)
+diff --git a/cmake/macos/helpers.cmake b/cmake/macos/helpers.cmake
+index 4fa4eb97a..c7c49e644 100644
+--- a/cmake/macos/helpers.cmake
++++ b/cmake/macos/helpers.cmake
+@@ -52,13 +52,19 @@ function(set_target_properties_obs target)
+           XCODE_EMBED_PLUGINS_CODE_SIGN_ON_COPY YES
+       )
+ 
++      if(LIVEHIME_APP_VERSION)
++        set(_marketing_version "${LIVEHIME_APP_VERSION}")
++      else()
++        set(_marketing_version "${OBS_VERSION_CANONICAL}")
++      endif()
++
+       set_target_xcode_properties(
+         ${target}
+         PROPERTIES PRODUCT_BUNDLE_IDENTIFIER "${LIVEHIME_APP_BUNDLE_ID}"
+                    PRODUCT_NAME "${LIVEHIME_APP_NAME}"
+                    ASSETCATALOG_COMPILER_APPICON_NAME AppIcon
+                    CURRENT_PROJECT_VERSION ${OBS_BUILD_NUMBER}
+-                   MARKETING_VERSION ${OBS_VERSION_CANONICAL}
++                   MARKETING_VERSION "${_marketing_version}"
+                    GENERATE_INFOPLIST_FILE YES
+                    COPY_PHASE_STRIP NO
+                    CLANG_ENABLE_OBJC_ARC YES
+diff --git a/frontend/cmake/os-macos.cmake b/frontend/cmake/os-macos.cmake
+index f6a46a59f..d91c1d8a9 100644
+--- a/frontend/cmake/os-macos.cmake
++++ b/frontend/cmake/os-macos.cmake
+@@ -32,3 +32,10 @@ target_link_libraries(
+     "$<LINK_LIBRARY:FRAMEWORK,ApplicationServices.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,AVFoundation.framework>"
+ )
++
++if(LIVEHIME_APP_VERSION)
++  target_compile_definitions(
++    obs-studio
++    PRIVATE LIVEHIME_APP_TITLE_NAME="${LIVEHIME_APP_DISPLAY_NAME}" LIVEHIME_APP_TITLE_VERSION="${LIVEHIME_APP_VERSION}"
++  )
++endif()
+diff --git a/frontend/widgets/OBSBasic.cpp b/frontend/widgets/OBSBasic.cpp
+index b6f544530..58b15e0f6 100644
+--- a/frontend/widgets/OBSBasic.cpp
++++ b/frontend/widgets/OBSBasic.cpp
+@@ -2127,12 +2127,20 @@ void OBSBasic::UpdateTitleBar()
+ 	const char *profile = config_get_string(App()->GetUserConfig(), "Basic", "Profile");
+ 	const char *sceneCollection = config_get_string(App()->GetUserConfig(), "Basic", "SceneCollection");
+ 
++#ifdef LIVEHIME_APP_TITLE_NAME
++	name << LIVEHIME_APP_TITLE_NAME << " " << LIVEHIME_APP_TITLE_VERSION << " (OBS " << App()->GetVersionString(false)
++	     << ")";
++	if (previewProgramMode) {
++		name << " - " << Str("Basic.TogglePreviewProgramMode");
++	}
++#else
+ 	name << "OBS ";
+ 	if (previewProgramMode) {
+ 		name << "Studio ";
+ 	}
+ 
+ 	name << App()->GetVersionString(false);
++#endif
+ 	if (safe_mode) {
+ 		name << " (" << Str("TitleBar.SafeMode") << ")";
+ 	}
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index 2dea26a5c..7b6760251 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -4,8 +4,11 @@
+ #include <obs-frontend-api.h>
+ #include <obs-module.h>
+ 
++#include <QDockWidget>
+ #include <QMainWindow>
+ #include <QPointer>
++#include <util/platform.h>
++#include <util/util.hpp>
+ 
+ OBS_DECLARE_MODULE()
+ OBS_MODULE_USE_DEFAULT_LOCALE("livehime", "en-US")
+@@ -18,8 +21,38 @@ MODULE_EXPORT const char *obs_module_description(void)
+ namespace {
+ QPointer<LiveHimeDock> dock;
+ 
++/* OBS creates plugin docks hidden and floating, then restores the user's
++ * saved layout. Dock and show the panel on the first run only; afterwards
++ * the user's own layout wins. */
++void placeDockOnFirstRun()
++{
++	BPtr<char> path = obs_module_config_path("state.json");
++	if (!path)
++		return;
++	OBSDataAutoRelease state = obs_data_create_from_json_file_safe(path, "bak");
++	if (state && obs_data_get_bool(state, "dock_placed"))
++		return;
++
++	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
++	auto *container = dock ? qobject_cast<QDockWidget *>(dock->parentWidget()) : nullptr;
++	if (!mainWindow || !container)
++		return;
++	container->setFloating(false);
++	mainWindow->addDockWidget(Qt::RightDockWidgetArea, container);
++	container->setVisible(true);
++	mainWindow->resizeDocks({container}, {320}, Qt::Horizontal);
++
++	BPtr<char> dir = obs_module_config_path("");
++	os_mkdirs(dir);
++	OBSDataAutoRelease saved = obs_data_create();
++	obs_data_set_bool(saved, "dock_placed", true);
++	obs_data_save_json_safe(saved, path, "tmp", "bak");
++}
++
+ void onFrontendEvent(enum obs_frontend_event event, void *)
+ {
++	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING)
++		placeDockOnFirstRun();
+ 	if (dock)
+ 		dock->controller()->handleFrontendEvent(event);
+ }

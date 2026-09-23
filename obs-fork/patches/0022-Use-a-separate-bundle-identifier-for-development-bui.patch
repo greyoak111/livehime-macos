@@ -1,0 +1,40 @@
+From 390b01c29541aa3d8286fccb244fd53449e245a7 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 03:09:37 +0800
+Subject: [PATCH 22/26] Use a separate bundle identifier for development builds
+
+Permission grants relaunch the app by bundle identifier, which picked the
+installed v0.1.2 that shares local.livehime.macos. Development builds now
+default to local.livehime.macos.dev; release packaging sets
+BUNDLE_ID=local.livehime.macos. The Keychain login item is unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/build-macos.sh | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
+index ae38af243..a37508c8d 100755
+--- a/build-aux/livehime/build-macos.sh
++++ b/build-aux/livehime/build-macos.sh
+@@ -5,6 +5,11 @@ set -euo pipefail
+ 
+ source_dir=${0:A:h:h:h}
+ config=${CONFIG:-RelWithDebInfo}
++# Development builds use their own bundle identifier so macOS permission
++# grants and "quit & reopen" never pick an installed release that shares
++# local.livehime.macos. Release packaging passes BUNDLE_ID=local.livehime.macos
++# to replace v0.1.x in place. The login Keychain item does not depend on it.
++bundle_id=${BUNDLE_ID:-local.livehime.macos.dev}
+ 
+ cmake -S "$source_dir" --preset macos \
+   -DENABLE_BROWSER=OFF \
+@@ -12,7 +17,7 @@ cmake -S "$source_dir" --preset macos \
+   -DOBS_CODESIGN_IDENTITY=- \
+   -DSPARKLE_APPCAST_URL= -DSPARKLE_PUBLIC_KEY= \
+   -DENABLE_SERVICE_UPDATES=OFF -DENABLE_WHATSNEW=OFF \
+-  -DLIVEHIME_APP_BUNDLE_ID=local.livehime.macos \
++  -DLIVEHIME_APP_BUNDLE_ID="$bundle_id" \
+   -DLIVEHIME_APP_NAME=LiveHime \
+   -DLIVEHIME_APP_DISPLAY_NAME=LiveHime \
+   -DLIVEHIME_APP_VERSION=0.2.0 \

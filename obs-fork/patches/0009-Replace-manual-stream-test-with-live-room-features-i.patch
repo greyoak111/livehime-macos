@@ -1,0 +1,1640 @@
+From e961773a6afbaa737b5de285e40b610a1d369216 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 23:45:27 +0800
+Subject: [PATCH 09/26] Replace manual stream test with live room features in
+ the dock
+
+The dock's lower half becomes a live-room area: stats (watched, likes,
+high-energy count, danmaku status), a danmaku tab with the live feed
+(chat, gifts, Super Chats, guards, entries/follows), sending and
+read-aloud, and a room tab for editing the title. The manual RTMP test
+remains available only through the automation vendor.
+
+The Swift core adds the danmaku protocol (packets, zlib/brotli,
+INTERACT_WORD_V2 protobuf, WBI signing), a reconnecting DanmakuClient
+that follows the ready account's room, send-danmaku and title update
+requests, and a short-queue speaker. The Go live status now warns when a
+stream started by Go live stops outside End live while the room stays
+open.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  18 ++
+ plugins/livehime/CMakeLists.txt               |   7 +
+ .../LiveHimeCore/BilibiliLiveClient.swift     |   8 +-
+ .../core/Sources/LiveHimeCore/CBridge.swift   |  95 ++++++
+ .../Sources/LiveHimeCore/DanmakuClient.swift  | 143 +++++++++
+ .../LiveHimeCore/DanmakuProtocol.swift        | 251 ++++++++++++++++
+ .../LiveHimeCore/LiveRoomActions.swift        |  95 ++++++
+ .../LiveHimeCore/SessionCoordinator.swift     |  25 ++
+ .../DanmakuLiveIntegrationTests.swift         |  24 ++
+ .../DanmakuProtocolTests.swift                |  68 +++++
+ .../SessionCoordinatorTests.swift             |  23 ++
+ plugins/livehime/core/include/livehime-core.h |  10 +
+ plugins/livehime/data/locale/en-US.ini        |  28 ++
+ plugins/livehime/data/locale/zh-CN.ini        |  28 ++
+ plugins/livehime/src/account-panel.cpp        |  18 +-
+ plugins/livehime/src/account-panel.hpp        |   5 +
+ plugins/livehime/src/feature-panel.cpp        | 274 ++++++++++++++++++
+ plugins/livehime/src/feature-panel.hpp        |  53 ++++
+ plugins/livehime/src/livehime-dock.cpp        |  54 +---
+ plugins/livehime/src/livehime-dock.hpp        |  21 +-
+ 20 files changed, 1180 insertions(+), 68 deletions(-)
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuLiveIntegrationTests.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+ create mode 100644 plugins/livehime/src/feature-panel.cpp
+ create mode 100644 plugins/livehime/src/feature-panel.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 77030c468..51c4ac331 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -23,3 +23,21 @@ item so the real login is never touched:
+ open --env LIVEHIME_KEYCHAIN_SERVICE=local.livehime.macos.e2e-test build_macos/frontend/RelWithDebInfo/LiveHime.app
+ node e2e-account.mjs <websocket password>
+ ```
++
++## Running safely
++
++- Do not run while a normal LiveHime is open: `open --env` reuses the running
++  instance instead of starting an isolated one.
++- The unreachable-server case leaves OBS's modal "failed to connect" dialog
++  open, which blocks a normal quit. Terminate the test instance afterwards
++  (only the one started with `LIVEHIME_KEYCHAIN_SERVICE`), and switch the
++  websocket server back off.
++
++## Danmaku integration test
++
++`swift test` in `plugins/livehime/core` skips the network test unless a
++public live room id is given:
++
++```sh
++LIVEHIME_LIVE_ROOM=<room id> swift test --filter DanmakuLiveIntegrationTests
++```
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 37a7b09ec..8b5a91bf4 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -13,8 +13,11 @@ target_sources(
+     core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+     core/Sources/LiveHimeCore/CBridge.swift
+     core/Sources/LiveHimeCore/CredentialStore.swift
++    core/Sources/LiveHimeCore/DanmakuClient.swift
++    core/Sources/LiveHimeCore/DanmakuProtocol.swift
+     core/Sources/LiveHimeCore/Diagnostics.swift
+     core/Sources/LiveHimeCore/FaceAuthWindow.swift
++    core/Sources/LiveHimeCore/LiveRoomActions.swift
+     core/Sources/LiveHimeCore/PlatformSupport.swift
+     core/Sources/LiveHimeCore/QRLogin.swift
+     core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -22,6 +25,8 @@ target_sources(
+     src/account-panel.hpp
+     src/automation.cpp
+     src/automation.hpp
++    src/feature-panel.cpp
++    src/feature-panel.hpp
+     src/livehime-dock.cpp
+     src/livehime-dock.hpp
+     src/plugin-main.cpp
+@@ -45,7 +50,9 @@ target_link_libraries(
+     OBS::frontend-api
+     OBS::libobs
+     Qt::Widgets
++    compression
+     "$<LINK_LIBRARY:FRAMEWORK,AppKit.framework>"
++    "$<LINK_LIBRARY:FRAMEWORK,AVFoundation.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,CoreImage.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,Security.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,WebKit.framework>"
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+index 8f383912c..b452453ed 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+@@ -343,9 +343,9 @@ public struct BilibiliLiveClient: Sendable {
+         return BilibiliRoomInfo(roomID: rid, uid: int64(d["uid"]), shortRoomID: int64(d["short_id"]), title: d["title"] as? String ?? d["roomname"] as? String ?? "", liveStatus: int(d["live_status"] ?? d["liveStatus"]), areaID: int(d["area_v2_id"] ?? d["area_id"]))
+     }
+ 
+-    private func withQuery(_ url: URL, _ query: [URLQueryItem]) -> URL { var c = URLComponents(url: url, resolvingAgainstBaseURL: false)!; c.queryItems = query; return c.url! }
++    func withQuery(_ url: URL, _ query: [URLQueryItem]) -> URL { var c = URLComponents(url: url, resolvingAgainstBaseURL: false)!; c.queryItems = query; return c.url! }
+ 
+-    private func requestJSON(url: URL, cookieHeader: String, body: Data?, httpMethod: String? = nil) async throws -> [String: Any] {
++    func requestJSON(url: URL, cookieHeader: String, body: Data?, httpMethod: String? = nil) async throws -> [String: Any] {
+         var request = URLRequest(url: url)
+         request.timeoutInterval = 12
+         request.httpMethod = httpMethod ?? (body == nil ? "GET" : "POST")
+@@ -450,7 +450,7 @@ public struct BilibiliLiveClient: Sendable {
+         return String(Int(Date().timeIntervalSince1970))
+     }
+ 
+-    private func csrf(from cookieHeader: String) throws -> String {
++    func csrf(from cookieHeader: String) throws -> String {
+         for part in cookieHeader.split(separator: ";") {
+             let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+             if pair.count == 2 && pair[0].trimmingCharacters(in: .whitespaces) == "bili_jct" && !pair[1].isEmpty { return pair[1] }
+@@ -458,7 +458,7 @@ public struct BilibiliLiveClient: Sendable {
+         throw BilibiliLiveError.missingCSRF
+     }
+ 
+-    private func form(_ values: [(String, String)]) -> Data {
++    func form(_ values: [(String, String)]) -> Data {
+         Data(formString(values).utf8)
+     }
+ 
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index cc8e9cd2f..6fc657c2b 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -13,20 +13,74 @@ final class CoreBridge {
+     static var shared: CoreBridge?
+ 
+     let coordinator: SessionCoordinator
++    let danmaku = DanmakuClient()
++    let speaker = DanmakuSpeaker()
+     var callback: LiveHimeStateCallback?
+     var context: UnsafeMutableRawPointer?
+ 
+     init(coordinator: SessionCoordinator) {
+         self.coordinator = coordinator
+         coordinator.onChange = { [weak self] state in self?.publish(state) }
++        danmaku.onStatus = { [weak self] status in self?.emit(["event": "danmakuStatus", "status": status.rawValue]) }
++        danmaku.onEvent = { [weak self] event in self?.handle(event) }
+     }
+ 
+     func publish(_ state: SessionState) {
++        syncDanmaku(with: state)
+         guard let callback else { return }
+         let json = Self.json(for: state)
+         json.withCString { callback($0, context) }
+     }
+ 
++    /// The danmaku connection follows the ready account's room.
++    private func syncDanmaku(with state: SessionState) {
++        switch state {
++        case .ready(let account):
++            if danmaku.roomID != account.room.roomID, let credentials = coordinator.credentials {
++                danmaku.start(roomID: account.room.roomID, uid: account.mid, cookieHeader: credentials.cookieHeader)
++            }
++        case .signedOut, .qrCode:
++            danmaku.stop()
++        case .verifying, .failed:
++            break
++        }
++    }
++
++    private func handle(_ event: LiveRoomEvent) {
++        speaker.speak(event)
++        switch event {
++        case .liveStarted, .liveEnded, .roomChanged:
++            Task { await coordinator.refreshRoom() }
++        default:
++            break
++        }
++        emit(Self.fields(for: event))
++    }
++
++    static func fields(for event: LiveRoomEvent) -> [String: Any] {
++        var f: [String: Any] = ["event": "room"]
++        switch event {
++        case let .chat(uid, user, text, medal):
++            f.merge(["kind": "chat", "uid": uid, "user": user, "text": text]) { $1 }
++            if let medal { f["medal"] = medal }
++        case let .gift(user, name, count, paid, totalCoin):
++            f.merge(["kind": "gift", "user": user, "name": name, "count": count, "paid": paid, "totalCoin": totalCoin]) { $1 }
++        case let .superChat(user, text, price):
++            f.merge(["kind": "superChat", "user": user, "text": text, "price": price]) { $1 }
++        case let .guardBought(user, level, name, count):
++            f.merge(["kind": "guard", "user": user, "level": level, "name": name, "count": count]) { $1 }
++        case let .interaction(user, kind):
++            f.merge(["kind": kind == .enter ? "enter" : kind == .share ? "share" : "follow", "user": user]) { $1 }
++        case .watched(let n): f.merge(["kind": "watched", "value": n]) { $1 }
++        case .likes(let n): f.merge(["kind": "likes", "value": n]) { $1 }
++        case .onlineRank(let n): f.merge(["kind": "onlineRank", "value": n]) { $1 }
++        case .liveStarted: f["kind"] = "liveStarted"
++        case .liveEnded: f["kind"] = "liveEnded"
++        case .roomChanged(let title): f.merge(["kind": "roomChanged", "title": title]) { $1 }
++        }
++        return f
++    }
++
+     static func json(for state: SessionState) -> String {
+         var object: [String: Any] = [:]
+         switch state {
+@@ -89,6 +143,8 @@ public func livehime_core_start(_ keychainService: UnsafePointer<CChar>?,
+ public func livehime_core_stop() {
+     onMain {
+         CoreBridge.shared?.callback = nil
++        CoreBridge.shared?.danmaku.stop()
++        CoreBridge.shared?.speaker.enabled = false
+         CoreBridge.shared?.coordinator.cancelQRLogin()
+         CoreBridge.shared = nil
+     }
+@@ -191,3 +247,42 @@ public func livehime_core_stop_live() {
+         }
+     }
+ }
++
++// MARK: Room actions
++
++@_cdecl("livehime_core_send_danmaku")
++public func livehime_core_send_danmaku(_ text: UnsafePointer<CChar>?) {
++    let message = text.map { String(cString: $0) } ?? ""
++    onMain {
++        guard let bridge = CoreBridge.shared else { return }
++        Task { @MainActor in
++            do {
++                try await bridge.coordinator.sendDanmaku(message)
++                bridge.emit(["event": "danmakuSent", "ok": true])
++            } catch {
++                bridge.emit(["event": "danmakuSent", "ok": false].merging(CoreBridge.errorFields(error)) { $1 })
++            }
++        }
++    }
++}
++
++@_cdecl("livehime_core_update_title")
++public func livehime_core_update_title(_ text: UnsafePointer<CChar>?) {
++    let title = text.map { String(cString: $0) } ?? ""
++    onMain {
++        guard let bridge = CoreBridge.shared else { return }
++        Task { @MainActor in
++            do {
++                try await bridge.coordinator.updateTitle(title)
++                bridge.emit(["event": "titleUpdated", "ok": true])
++            } catch {
++                bridge.emit(["event": "titleUpdated", "ok": false].merging(CoreBridge.errorFields(error)) { $1 })
++            }
++        }
++    }
++}
++
++@_cdecl("livehime_core_set_tts")
++public func livehime_core_set_tts(_ enabled: Int32) {
++    onMain { CoreBridge.shared?.speaker.enabled = enabled != 0 }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+new file mode 100644
+index 000000000..db2ceee29
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+@@ -0,0 +1,143 @@
++import AVFoundation
++import Foundation
++
++/// Keeps one live room's danmaku connection open: fetch a token, connect to
++/// one of the servers, authenticate, send a heartbeat every 30 seconds and
++/// reconnect with backoff (2 s doubling to 30 s) until stopped.
++@MainActor
++public final class DanmakuClient {
++    public enum Status: String, Sendable { case stopped, connecting, connected, reconnecting }
++
++    public var onEvent: ((LiveRoomEvent) -> Void)?
++    public var onStatus: ((Status) -> Void)?
++    public private(set) var roomID: Int64?
++    public private(set) var status: Status = .stopped {
++        didSet { if status != oldValue { onStatus?(status) } }
++    }
++
++    private var task: Task<Void, Never>?
++    private let socketSession = URLSession(configuration: .ephemeral)
++
++    public init() {}
++
++    public func start(roomID: Int64, uid: Int64, cookieHeader: String) {
++        stop()
++        self.roomID = roomID
++        task = Task { await self.run(roomID: roomID, uid: uid, cookieHeader: cookieHeader) }
++    }
++
++    public func stop() {
++        task?.cancel()
++        task = nil
++        roomID = nil
++        status = .stopped
++    }
++
++    private func run(roomID: Int64, uid: Int64, cookieHeader: String) async {
++        var backoff: Duration = .seconds(2)
++        var attempt = 0
++        while !Task.isCancelled {
++            status = attempt == 0 ? .connecting : .reconnecting
++            attempt += 1
++            let connectedFor = await session(roomID: roomID, uid: uid, cookieHeader: cookieHeader)
++            guard !Task.isCancelled else { break }
++            // A connection that stayed up for a while starts over quickly.
++            backoff = connectedFor > .seconds(60) ? .seconds(2) : min(backoff * 2, .seconds(30))
++            status = .reconnecting
++            try? await Task.sleep(for: backoff)
++        }
++    }
++
++    /// One connection; returns how long it stayed connected.
++    private func session(roomID: Int64, uid: Int64, cookieHeader: String) async -> Duration {
++        let clock = ContinuousClock()
++        var connectedAt: ContinuousClock.Instant?
++        do {
++            let client = BilibiliLiveClient(cookieHeader: cookieHeader, session: BilibiliWeb.session)
++            let info = try await client.danmakuConnectInfo(roomID: roomID, cookieHeader: cookieHeader)
++            let server = info.servers[Int.random(in: 0..<info.servers.count)]
++            var request = URLRequest(url: URL(string: "wss://\(server.host):\(server.port)/sub")!)
++            request.setValue(BilibiliWeb.userAgent, forHTTPHeaderField: "User-Agent")
++            request.setValue("https://live.bilibili.com", forHTTPHeaderField: "Origin")
++            let socket = socketSession.webSocketTask(with: request)
++            socket.resume()
++            defer { socket.cancel(with: .goingAway, reason: nil) }
++
++            let auth: [String: Any] = ["uid": uid, "roomid": roomID, "protover": 3, "buvid": info.buvid,
++                                       "platform": "web", "type": 2, "key": info.token]
++            try await socket.send(.data(DanmakuPacket.encode(.auth, body: try JSONSerialization.data(withJSONObject: auth))))
++
++            let heartbeat = Task {
++                while !Task.isCancelled {
++                    try? await socket.send(.data(DanmakuPacket.encode(.heartbeat, body: Data("[object Object]".utf8))))
++                    try? await Task.sleep(for: .seconds(30))
++                }
++            }
++            defer { heartbeat.cancel() }
++
++            while !Task.isCancelled {
++                let data: Data
++                switch try await socket.receive() {
++                case .data(let bytes): data = bytes
++                case .string(let text): data = Data(text.utf8)
++                @unknown default: continue
++                }
++                for packet in DanmakuPacket.decode(data) {
++                    if packet.operation == DanmakuOperation.authReply.rawValue {
++                        let reply = try? JSONSerialization.jsonObject(with: packet.body) as? [String: Any]
++                        guard DanmakuParser.int(reply?["code"]) == 0 else { return .zero }
++                        connectedAt = clock.now
++                        status = .connected
++                    }
++                    for event in DanmakuParser.events(from: packet) { onEvent?(event) }
++                }
++            }
++        } catch {
++            // Fall through to reconnect; the dock shows the status.
++        }
++        return connectedAt.map { clock.now - $0 } ?? .zero
++    }
++}
++
++/// Reads chat, gifts and Super Chats aloud with the system voice. Keeps a
++/// short queue so a busy room never builds up minutes of backlog.
++@MainActor
++public final class DanmakuSpeaker: NSObject, AVSpeechSynthesizerDelegate {
++    public var enabled = false {
++        didSet { if !enabled { synthesizer.stopSpeaking(at: .immediate); pending = 0 } }
++    }
++    private let synthesizer = AVSpeechSynthesizer()
++    private var pending = 0
++    private let maxPending = 4
++
++    public override init() {
++        super.init()
++        synthesizer.delegate = self
++    }
++
++    public func speak(_ event: LiveRoomEvent) {
++        guard enabled, pending < maxPending, let line = Self.line(for: event) else { return }
++        let utterance = AVSpeechUtterance(string: line)
++        utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
++        pending += 1
++        synthesizer.speak(utterance)
++    }
++
++    static func line(for event: LiveRoomEvent) -> String? {
++        switch event {
++        case .chat(_, let user, let text, _): return "\(user)说：\(text)"
++        case .gift(let user, let name, let count, _, _): return "感谢\(user)送的\(count)个\(name)"
++        case .superChat(let user, let text, _): return "\(user)的醒目留言：\(text)"
++        case .guardBought(let user, _, let name, _): return "感谢\(user)开通\(name)"
++        default: return nil
++        }
++    }
++
++    nonisolated public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
++        Task { @MainActor in self.pending = max(0, self.pending - 1) }
++    }
++
++    nonisolated public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
++        Task { @MainActor in self.pending = max(0, self.pending - 1) }
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+new file mode 100644
+index 000000000..ea04f4e6c
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+@@ -0,0 +1,251 @@
++import Compression
++import CryptoKit
++import Foundation
++
++// Bilibili live danmaku ("broadcast") protocol: 16-byte big-endian header
++// (packet length, header length, protocol version, operation, sequence)
++// followed by a body. Operation 5 bodies are JSON commands, possibly packed
++// as zlib (version 2) or brotli (version 3) compressed packet streams.
++
++enum DanmakuOperation: UInt32 {
++    case heartbeat = 2
++    case heartbeatReply = 3
++    case message = 5
++    case auth = 7
++    case authReply = 8
++}
++
++struct DanmakuPacket: Equatable {
++    var version: UInt16
++    var operation: UInt32
++    var body: Data
++
++    static let headerLength = 16
++
++    static func encode(_ operation: DanmakuOperation, body: Data, version: UInt16 = 1) -> Data {
++        var data = Data(capacity: headerLength + body.count)
++        func append<T: FixedWidthInteger>(_ value: T) { withUnsafeBytes(of: value.bigEndian) { data.append(contentsOf: $0) } }
++        append(UInt32(headerLength + body.count))
++        append(UInt16(headerLength))
++        append(version)
++        append(operation.rawValue)
++        append(UInt32(1))
++        data.append(body)
++        return data
++    }
++
++    /// Splits a frame into packets, expanding compressed containers.
++    static func decode(_ data: Data) -> [DanmakuPacket] {
++        var packets: [DanmakuPacket] = []
++        var offset = data.startIndex
++        while data.endIndex - offset >= headerLength {
++            let length = Int(read(UInt32.self, data, offset))
++            let header = Int(read(UInt16.self, data, offset + 4))
++            guard length >= header, header >= headerLength, offset + length <= data.endIndex else { break }
++            let packet = DanmakuPacket(version: read(UInt16.self, data, offset + 6),
++                                       operation: read(UInt32.self, data, offset + 8),
++                                       body: data.subdata(in: (offset + header)..<(offset + length)))
++            if packet.operation == DanmakuOperation.message.rawValue, packet.version == 2 || packet.version == 3,
++               let inflated = decompress(packet.body, brotli: packet.version == 3) {
++                packets += decode(inflated)
++            } else {
++                packets.append(packet)
++            }
++            offset += length
++        }
++        return packets
++    }
++
++    private static func read<T: FixedWidthInteger>(_ type: T.Type, _ data: Data, _ offset: Int) -> T {
++        var value: T = 0
++        _ = withUnsafeMutableBytes(of: &value) { data.copyBytes(to: $0, from: offset..<(offset + MemoryLayout<T>.size)) }
++        return T(bigEndian: value)
++    }
++
++    /// zlib bodies carry a 2-byte header and 4-byte checksum around raw
++    /// deflate, which is what Compression's ZLIB algorithm decodes.
++    static func decompress(_ data: Data, brotli: Bool) -> Data? {
++        var input = data
++        if !brotli {
++            guard input.count > 6 else { return nil }
++            input = input.subdata(in: (input.startIndex + 2)..<(input.endIndex - 4))
++        }
++        let algorithm = brotli ? COMPRESSION_BROTLI : COMPRESSION_ZLIB
++        var capacity = max(4096, input.count * 8)
++        while capacity <= 64 << 20 {
++            var output = Data(count: capacity)
++            let written = output.withUnsafeMutableBytes { out in
++                input.withUnsafeBytes { src in
++                    compression_decode_buffer(out.bindMemory(to: UInt8.self).baseAddress!, capacity,
++                                              src.bindMemory(to: UInt8.self).baseAddress!, input.count, nil, algorithm)
++                }
++            }
++            if written == 0 { return nil }
++            if written < capacity { return output.prefix(written) }
++            capacity *= 4 // output may have been truncated; retry larger
++        }
++        return nil
++    }
++}
++
++/// Room activity delivered to the dock.
++public enum LiveRoomEvent: Equatable, Sendable {
++    case chat(uid: Int64, user: String, text: String, medal: String?)
++    case gift(user: String, name: String, count: Int, paid: Bool, totalCoin: Int)
++    case superChat(user: String, text: String, price: Int)
++    case guardBought(user: String, level: Int, name: String, count: Int)
++    case interaction(user: String, kind: InteractionKind)
++    case watched(Int)
++    case likes(Int)
++    case onlineRank(Int)
++    case liveStarted
++    case liveEnded
++    case roomChanged(title: String)
++
++    public enum InteractionKind: Int, Sendable {
++        case enter = 1, follow = 2, share = 3, specialFollow = 4, mutualFollow = 5
++    }
++}
++
++enum DanmakuParser {
++    static func events(from packet: DanmakuPacket) -> [LiveRoomEvent] {
++        guard packet.operation == DanmakuOperation.message.rawValue,
++              let object = try? JSONSerialization.jsonObject(with: packet.body) as? [String: Any] else { return [] }
++        return event(from: object).map { [$0] } ?? []
++    }
++
++    static func event(from object: [String: Any]) -> LiveRoomEvent? {
++        guard let rawCommand = object["cmd"] as? String else { return nil }
++        // Commands may carry suffixes such as "DANMU_MSG:4:0:2:2:2:0".
++        let command = rawCommand.split(separator: ":").first.map(String.init) ?? rawCommand
++        let data = object["data"] as? [String: Any] ?? [:]
++        switch command {
++        case "DANMU_MSG":
++            guard let info = object["info"] as? [Any], info.count > 2,
++                  let text = info[1] as? String, let user = info[2] as? [Any], user.count > 1 else { return nil }
++            var medal: String?
++            if info.count > 3, let m = info[3] as? [Any], m.count > 1, let name = m[1] as? String, !name.isEmpty {
++                medal = "\(name) \(int(m[0]))"
++            }
++            return .chat(uid: int64(user[0]), user: user[1] as? String ?? "", text: text, medal: medal)
++        case "SEND_GIFT", "SEND_GIFT_V2":
++            return .gift(user: data["uname"] as? String ?? "",
++                         name: data["giftName"] as? String ?? data["gift_name"] as? String ?? "",
++                         count: int(data["num"]),
++                         paid: (data["coin_type"] as? String) == "gold",
++                         totalCoin: int(data["total_coin"]))
++        case "SUPER_CHAT_MESSAGE":
++            let user = data["user_info"] as? [String: Any]
++            return .superChat(user: user?["uname"] as? String ?? "", text: data["message"] as? String ?? "",
++                              price: int(data["price"]))
++        case "GUARD_BUY":
++            return .guardBought(user: data["username"] as? String ?? "", level: int(data["guard_level"]),
++                                name: data["gift_name"] as? String ?? "", count: int(data["num"]))
++        case "INTERACT_WORD":
++            guard let kind = LiveRoomEvent.InteractionKind(rawValue: int(data["msg_type"])) else { return nil }
++            return .interaction(user: data["uname"] as? String ?? "", kind: kind)
++        case "INTERACT_WORD_V2":
++            guard let pb = (data["pb"] as? String).flatMap({ Data(base64Encoded: $0) }) else { return nil }
++            let fields = Protobuf.fields(pb)
++            guard let kind = LiveRoomEvent.InteractionKind(rawValue: Int(fields.varint(5) ?? 0)) else { return nil }
++            return .interaction(user: fields.string(2) ?? "", kind: kind)
++        case "WATCHED_CHANGE":
++            return .watched(int(data["num"]))
++        case "LIKE_INFO_V3_UPDATE":
++            return .likes(int(data["click_count"]))
++        case "ONLINE_RANK_COUNT":
++            return .onlineRank(int(data["count"]))
++        case "LIVE":
++            return .liveStarted
++        case "PREPARING":
++            return .liveEnded
++        case "ROOM_CHANGE":
++            return .roomChanged(title: data["title"] as? String ?? "")
++        default:
++            return nil
++        }
++    }
++
++    static func int(_ value: Any?) -> Int {
++        (value as? NSNumber)?.intValue ?? (value as? String).flatMap(Int.init) ?? 0
++    }
++
++    static func int64(_ value: Any?) -> Int64 {
++        (value as? NSNumber)?.int64Value ?? (value as? String).flatMap(Int64.init) ?? 0
++    }
++}
++
++/// Minimal protobuf reader for the few fields the V2 commands need.
++enum Protobuf {
++    struct Fields {
++        var varints: [Int: UInt64] = [:]
++        var bytes: [Int: Data] = [:]
++        func varint(_ field: Int) -> UInt64? { varints[field] }
++        func string(_ field: Int) -> String? { bytes[field].map { String(decoding: $0, as: UTF8.self) } }
++    }
++
++    static func fields(_ data: Data) -> Fields {
++        var result = Fields()
++        var index = data.startIndex
++        func readVarint() -> UInt64? {
++            var value: UInt64 = 0
++            var shift: UInt64 = 0
++            while index < data.endIndex, shift < 64 {
++                let byte = data[index]
++                index += 1
++                value |= UInt64(byte & 0x7f) << shift
++                if byte & 0x80 == 0 { return value }
++                shift += 7
++            }
++            return nil
++        }
++        while index < data.endIndex, let key = readVarint() {
++            let field = Int(key >> 3)
++            switch key & 7 {
++            case 0:
++                guard let value = readVarint() else { return result }
++                result.varints[field] = value
++            case 2:
++                guard let length = readVarint(), index + Int(length) <= data.endIndex else { return result }
++                result.bytes[field] = data.subdata(in: index..<(index + Int(length)))
++                index += Int(length)
++            case 1:
++                index += 8
++            case 5:
++                index += 4
++            default:
++                return result
++            }
++        }
++        return result
++    }
++}
++
++/// WBI request signing used by Bilibili web APIs such as getDanmuInfo.
++struct WBISigner: Sendable {
++    static let mixinTable = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42,
++                             19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51,
++                             30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52]
++    let mixinKey: String
++
++    /// `imgURL`/`subURL` come from nav's `wbi_img`; the key is the file stem.
++    init?(imgURL: String, subURL: String) {
++        func stem(_ url: String) -> String { (url.split(separator: "/").last.map(String.init) ?? "").components(separatedBy: ".").first ?? "" }
++        let raw = Array(stem(imgURL) + stem(subURL))
++        guard raw.count >= 64 else { return nil }
++        mixinKey = String(Self.mixinTable.map { raw[$0] }.prefix(32))
++    }
++
++    func sign(_ params: [String: String], timestamp: Int = Int(Date().timeIntervalSince1970)) -> [URLQueryItem] {
++        var all = params
++        all["wts"] = String(timestamp)
++        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
++        let query = all.keys.sorted().map { key -> String in
++            let value = all[key]!.filter { !"!'()*".contains($0) }
++            return "\(key.addingPercentEncoding(withAllowedCharacters: unreserved)!)=\(value.addingPercentEncoding(withAllowedCharacters: unreserved)!)"
++        }.joined(separator: "&")
++        let digest = Insecure.MD5.hash(data: Data((query + mixinKey).utf8)).map { String(format: "%02x", $0) }.joined()
++        return all.keys.sorted().map { URLQueryItem(name: $0, value: all[$0]!.filter { !"!'()*".contains($0) }) }
++            + [URLQueryItem(name: "w_rid", value: digest)]
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+new file mode 100644
+index 000000000..8ff0c7b82
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+@@ -0,0 +1,95 @@
++import Foundation
++
++public struct DanmakuServer: Equatable, Sendable {
++    public let host: String
++    public let port: Int
++}
++
++public struct DanmakuConnectInfo: Equatable, Sendable {
++    public let token: String
++    public let servers: [DanmakuServer]
++    public let buvid: String
++}
++
++/// Room operations beyond start/stop: danmaku server discovery, sending
++/// danmaku and editing the title. Errors use BilibiliLiveError like the
++/// rest of the client.
++extension BilibiliLiveClient {
++    /// buvid3 identifies the browser to the danmaku server; QR logins do not
++    /// set it, so fall back to the public fingerprint endpoint.
++    func buvid3(cookieHeader: String) async throws -> String {
++        if let existing = cookieValue("buvid3", in: cookieHeader) { return existing }
++        let root = try await requestJSON(url: URL(string: "https://api.bilibili.com/x/frontend/finger/spi")!,
++                                         cookieHeader: "", body: nil)
++        guard let value = (root["data"] as? [String: Any])?["b_3"] as? String, !value.isEmpty else {
++            throw BilibiliLiveError.invalidResponse
++        }
++        return value
++    }
++
++    /// nav carries the WBI keys even when it answers -101 (not logged in),
++    /// so read them without the usual API-code check.
++    func wbiSigner(cookieHeader: String) async throws -> WBISigner {
++        var request = URLRequest(url: URL(string: "https://api.bilibili.com/x/web-interface/nav")!)
++        request.timeoutInterval = 12
++        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
++        request.setValue(BilibiliWeb.userAgent, forHTTPHeaderField: "User-Agent")
++        request.setValue("https://live.bilibili.com/", forHTTPHeaderField: "Referer")
++        let data: Data
++        do { (data, _) = try await session.data(for: request) }
++        catch let error as URLError { throw BilibiliLiveError.network(code: error.errorCode) }
++        let root = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
++        guard let wbi = (root["data"] as? [String: Any])?["wbi_img"] as? [String: Any],
++              let signer = WBISigner(imgURL: wbi["img_url"] as? String ?? "", subURL: wbi["sub_url"] as? String ?? "") else {
++            throw BilibiliLiveError.invalidResponse
++        }
++        return signer
++    }
++
++    public func danmakuConnectInfo(roomID: Int64, cookieHeader: String) async throws -> DanmakuConnectInfo {
++        let buvid = try await buvid3(cookieHeader: cookieHeader)
++        let cookies = cookieValue("buvid3", in: cookieHeader) == nil ? cookieHeader + "; buvid3=" + buvid : cookieHeader
++        let signer = try await wbiSigner(cookieHeader: cookies)
++        let query = signer.sign(["id": String(roomID), "type": "0", "web_location": "444.8"])
++        let root = try await requestJSON(
++            url: withQuery(URL(string: "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo")!, query),
++            cookieHeader: cookies, body: nil)
++        guard let data = root["data"] as? [String: Any], let token = data["token"] as? String,
++              let hosts = data["host_list"] as? [[String: Any]] else { throw BilibiliLiveError.invalidResponse }
++        let servers = hosts.compactMap { host -> DanmakuServer? in
++            guard let name = host["host"] as? String else { return nil }
++            return DanmakuServer(host: name, port: (host["wss_port"] as? NSNumber)?.intValue ?? 443)
++        }
++        guard !servers.isEmpty else { throw BilibiliLiveError.invalidResponse }
++        return DanmakuConnectInfo(token: token, servers: servers, buvid: buvid)
++    }
++
++    public func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws {
++        let csrf = try csrf(from: cookieHeader)
++        let body = form([
++            ("bubble", "0"), ("msg", text), ("color", "16777215"), ("mode", "1"), ("room_type", "0"),
++            ("jumpfrom", "0"), ("reply_mid", "0"), ("reply_attr", "0"), ("replay_dmid", ""),
++            ("statistics", #"{"appId":100,"platform":5}"#), ("fontsize", "25"),
++            ("rnd", String(Int(Date().timeIntervalSince1970))), ("roomid", String(roomID)),
++            ("csrf", csrf), ("csrf_token", csrf)
++        ])
++        _ = try await requestJSON(url: URL(string: "https://api.live.bilibili.com/msg/send")!,
++                                  cookieHeader: cookieHeader, body: body)
++    }
++
++    public func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws {
++        let csrf = try csrf(from: cookieHeader)
++        _ = try await requestJSON(url: URL(string: "https://api.live.bilibili.com/room/v1/Room/update")!,
++                                  cookieHeader: cookieHeader,
++                                  body: form([("room_id", String(roomID)), ("title", title),
++                                              ("csrf", csrf), ("csrf_token", csrf)]))
++    }
++
++    private func cookieValue(_ name: String, in header: String) -> String? {
++        for part in header.split(separator: ";") {
++            let pair = part.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
++            if pair.count == 2, pair[0] == name, !pair[1].isEmpty { return pair[1] }
++        }
++        return nil
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+index 2a43a50f9..7fcfb3790 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -41,6 +41,8 @@ public protocol BilibiliAccountAPI: Sendable {
+     func areas(cookieHeader: String) async throws -> [BilibiliLiveArea]
+     func startLive(roomID: Int64, area: BilibiliLiveArea, cookieHeader: String) async throws -> BilibiliStreamConfig
+     func stopLive(roomID: Int64, cookieHeader: String) async throws
++    func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws
++    func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws
+ }
+ 
+ /// Reads cookies a previous app version left in its WebKit store.
+@@ -147,6 +149,21 @@ public final class SessionCoordinator {
+         await refreshRoom()
+     }
+ 
++    public func sendDanmaku(_ text: String) async throws {
++        let (saved, account) = try readyAccount()
++        let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !message.isEmpty else { return }
++        try await guarded { try await self.api.sendDanmaku(roomID: account.room.roomID, text: message, cookieHeader: saved.cookieHeader) }
++    }
++
++    public func updateTitle(_ title: String) async throws {
++        let (saved, account) = try readyAccount()
++        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !trimmed.isEmpty else { return }
++        try await guarded { try await self.api.updateTitle(roomID: account.room.roomID, title: trimmed, cookieHeader: saved.cookieHeader) }
++        await refreshRoom()
++    }
++
+     /// Re-reads the room so live status and area reflect Bilibili's state.
+     /// Failures leave the current account untouched.
+     public func refreshRoom() async {
+@@ -321,6 +338,14 @@ public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
+         try await live(cookieHeader).stopLive(roomID: roomID, cookieHeader: cookieHeader)
+     }
+ 
++    public func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws {
++        try await live(cookieHeader).sendDanmaku(roomID: roomID, text: text, cookieHeader: cookieHeader)
++    }
++
++    public func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws {
++        try await live(cookieHeader).updateTitle(roomID: roomID, title: title, cookieHeader: cookieHeader)
++    }
++
+     private func live(_ cookieHeader: String) -> BilibiliLiveClient {
+         BilibiliLiveClient(cookieHeader: cookieHeader, session: BilibiliWeb.session, diagnostics: diagnostics)
+     }
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuLiveIntegrationTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuLiveIntegrationTests.swift
+new file mode 100644
+index 000000000..931016429
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuLiveIntegrationTests.swift
+@@ -0,0 +1,24 @@
++import XCTest
++@testable import LiveHimeCore
++
++/// Connects to a real public room anonymously. Skipped unless
++/// LIVEHIME_LIVE_ROOM is set (network access, read-only).
++@MainActor
++final class DanmakuLiveIntegrationTests: XCTestCase {
++    func testReceivesRoomEvents() async throws {
++        guard let room = ProcessInfo.processInfo.environment["LIVEHIME_LIVE_ROOM"].flatMap(Int64.init) else {
++            throw XCTSkip("set LIVEHIME_LIVE_ROOM to a live room id")
++        }
++        let client = DanmakuClient()
++        var statuses: [DanmakuClient.Status] = []
++        var events: [LiveRoomEvent] = []
++        client.onStatus = { statuses.append($0) }
++        client.onEvent = { events.append($0) }
++        client.start(roomID: room, uid: 0, cookieHeader: "")
++        for _ in 0..<60 where events.count < 10 { try await Task.sleep(for: .milliseconds(250)) }
++        client.stop()
++        print("statuses:", statuses.map(\.rawValue), "events:", events.count, "sample:", events.prefix(3))
++        XCTAssertTrue(statuses.contains(.connected))
++        XCTAssertFalse(events.isEmpty)
++    }
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+new file mode 100644
+index 000000000..1512972b6
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+@@ -0,0 +1,68 @@
++import XCTest
++@testable import LiveHimeCore
++
++/// Fixtures were produced independently with Node's zlib/brotli and a
++/// JavaScript WBI implementation.
++final class DanmakuProtocolTests: XCTestCase {
++    private let brotliFrame = "AAAA2QAQAAMAAAAFAAAAARvpAAAsCuzGYiNDhWv1zRqiHb+gwQN/riXJ40XRtzUNR5GUdzS6BvL8dEIUYlFINl2yKaZLwu3NotPVt0W+nMhW0JTZTocDxN1u9DfZ7iYVhWGsiaWBZTekQcqqqPeGBbskSbOEkrAuPcsX036RWFFWzEUgHOHxdEDtv6mqnAbvy08dqsDDv/n9PMRpVJ6L3+h746dmPhyBJL2S6WbF6B67m6hr0YWjr6K4FAHkfQ67dy++qCs4Hbt8g+k8nwJxEDB1GBZyCzXndg=="
++    private let zlibFrame = "AAAA3QAQAAIAAAAFAAAAAXicY2BgyGQQYAABVgYGBsZqpeTcFCUrJRdHP9/QeN9gdysTKwMrIzA0UNJRysxLy1eyio42iNVRerJ3wdOle5V0ok2MdJReLG96sme6o5KOQaxOtJGhjtLzTZ1Pdsx93tkDEoqtBRreiM2iYFc/l3h3T7cQJR2llMSSRCWraqXSvMTcVCUrqJlOSjpK6ZlpJX4Qwacb+p/ub366v1lJRymvNFfJylhHKTk/My++pLIAJF+cmVOWWqSko1SSX5KYEw+SUrIyqK0FAPO2Soc="
++
++    private let expected: [LiveRoomEvent] = [
++        .chat(uid: 42, user: "观众A", text: "你好", medal: "粉丝牌 21"),
++        .gift(user: "观众B", name: "小心心", count: 3, paid: false, totalCoin: 0)
++    ]
++
++    private func events(_ base64: String) -> [LiveRoomEvent] {
++        DanmakuPacket.decode(Data(base64Encoded: base64)!).flatMap(DanmakuParser.events)
++    }
++
++    func testBrotliContainerExpandsToCommands() {
++        XCTAssertEqual(events(brotliFrame), expected)
++    }
++
++    func testZlibContainerExpandsToCommands() {
++        XCTAssertEqual(events(zlibFrame), expected)
++    }
++
++    func testEncodeDecodeRoundTrip() {
++        let body = Data(#"{"roomid":1}"#.utf8)
++        let frame = DanmakuPacket.encode(.auth, body: body)
++        XCTAssertEqual(frame.count, 16 + body.count)
++        XCTAssertEqual(DanmakuPacket.decode(frame), [DanmakuPacket(version: 1, operation: 7, body: body)])
++    }
++
++    func testTruncatedFrameIsIgnored() {
++        let frame = DanmakuPacket.encode(.message, body: Data("{}".utf8))
++        XCTAssertEqual(DanmakuPacket.decode(frame.prefix(10)), [])
++    }
++
++    func testInteractWordV2ProtobufIsDecoded() {
++        // Captured from a public room: uname "T***", msg_type 1 (enter).
++        let object: [String: Any] = ["cmd": "INTERACT_WORD_V2", "data": ["pb": "EgRUKioqIgEBKAEwtqOsCjjZ48/VBkD89KL3jDRK"]]
++        XCTAssertEqual(DanmakuParser.event(from: object), .interaction(user: "T***", kind: .enter))
++    }
++
++    func testStatsCommands() {
++        XCTAssertEqual(DanmakuParser.event(from: ["cmd": "WATCHED_CHANGE", "data": ["num": 15408]]), .watched(15408))
++        XCTAssertEqual(DanmakuParser.event(from: ["cmd": "LIKE_INFO_V3_UPDATE", "data": ["click_count": "320903"]]), .likes(320903))
++        XCTAssertEqual(DanmakuParser.event(from: ["cmd": "ONLINE_RANK_COUNT", "data": ["count": "2547"]]), .onlineRank(2547))
++        XCTAssertEqual(DanmakuParser.event(from: ["cmd": "PREPARING"]), .liveEnded)
++    }
++
++    func testSuperChatAndGuard() {
++        XCTAssertEqual(DanmakuParser.event(from: ["cmd": "SUPER_CHAT_MESSAGE",
++                                                  "data": ["message": "加油", "price": 30, "user_info": ["uname": "C"]]]),
++                       .superChat(user: "C", text: "加油", price: 30))
++        XCTAssertEqual(DanmakuParser.event(from: ["cmd": "GUARD_BUY",
++                                                  "data": ["username": "D", "guard_level": 3, "gift_name": "舰长", "num": 1]]),
++                       .guardBought(user: "D", level: 3, name: "舰长", count: 1))
++    }
++
++    func testWBISignatureMatchesReference() throws {
++        let signer = try XCTUnwrap(WBISigner(imgURL: "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png",
++                                             subURL: "https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"))
++        XCTAssertEqual(signer.mixinKey, "ea1db124af3c7062474693fa704f4ff8")
++        let items = signer.sign(["id": "1001", "type": "0", "web_location": "444.8"], timestamp: 1_700_000_000)
++        XCTAssertEqual(items.last, URLQueryItem(name: "w_rid", value: "6a7b397a3b98a73cebbca7b826767240"))
++    }
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+index f4e65056d..a5b9aebce 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -42,6 +42,13 @@ private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
+         liveRoom = BilibiliRoomInfo(roomID: roomID, uid: 42, title: "room", liveStatus: 1, areaID: Int(area.areaID))
+         return endpoint
+     }
++    var sentDanmaku: [String] = []
++    var titles: [String] = []
++    func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws { sentDanmaku.append(text) }
++    func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws {
++        titles.append(title)
++        liveRoom = BilibiliRoomInfo(roomID: roomID, uid: 42, title: title, liveStatus: liveRoom.liveStatus, areaID: liveRoom.areaID)
++    }
+     func stopLive(roomID: Int64, cookieHeader: String) async throws {
+         stopCalls += 1
+         liveRoom = BilibiliRoomInfo(roomID: roomID, uid: 42, title: "room", liveStatus: 0, areaID: liveRoom.areaID)
+@@ -215,6 +222,22 @@ final class LiveRoomTests: XCTestCase {
+         XCTAssertEqual(c.state, .signedOut(.sessionExpired))
+     }
+ 
++    func testSendDanmakuTrimsAndSkipsEmpty() async throws {
++        let api = StubAPI()
++        let c = await readyCoordinator(api)
++        try await c.sendDanmaku("  你好  ")
++        try await c.sendDanmaku("   ")
++        XCTAssertEqual(api.sentDanmaku, ["你好"])
++    }
++
++    func testUpdateTitleRefreshesRoom() async throws {
++        let api = StubAPI()
++        let c = await readyCoordinator(api)
++        try await c.updateTitle("新标题")
++        guard case .ready(let account) = c.state else { return XCTFail("\(c.state)") }
++        XCTAssertEqual(account.room.title, "新标题")
++    }
++
+     func testStartLiveRequiresReadySession() async {
+         let c = SessionCoordinator(api: StubAPI(), store: MemoryCredentialStore())
+         do {
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 922ecb374..ee93f0ade 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -37,6 +37,16 @@ void livehime_core_stop_live(void);
+  * When the user confirms, {"event":"faceAuthRetry"} is emitted. */
+ void livehime_core_open_face_auth(const char *voucher);
+ 
++/* Room activity. Once the account is ready the core keeps the room's danmaku
++ * connection open and emits:
++ *   {"event":"danmakuStatus","status":"connecting|connected|reconnecting|stopped"}
++ *   {"event":"room","kind":"chat|gift|superChat|guard|enter|follow|share|
++ *            watched|likes|onlineRank|liveStarted|liveEnded|roomChanged",...}
++ * Actions reply with {"event":"danmakuSent"|"titleUpdated","ok":...}. */
++void livehime_core_send_danmaku(const char *text);
++void livehime_core_update_title(const char *title);
++void livehime_core_set_tts(int enabled);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index d090f02ca..ce76c0b8a 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -62,3 +62,31 @@ LiveHime.Live.Error.network="Could not reach Bilibili. Check the network and try
+ LiveHime.Live.Error.server="Bilibili returned an unexpected response."
+ LiveHime.Live.Error.notReady="The account is not ready yet."
+ LiveHime.Live.FaceAuthOpened="Bilibili requires face verification. Complete it in the window that opened, then choose Verified, retry."
++LiveHime.Feature.Group="Live room"
++LiveHime.Feature.SignInFirst="Log in above to see danmaku and manage your room."
++LiveHime.Feature.DanmakuTab="Danmaku"
++LiveHime.Feature.RoomTab="Room"
++LiveHime.Feature.ShowEntries="Show entries"
++LiveHime.Feature.ReadAloud="Read aloud"
++LiveHime.Feature.MessagePlaceholder="Send a danmaku"
++LiveHime.Feature.Send="Send"
++LiveHime.Feature.SendFailed="Danmaku not sent"
++LiveHime.Feature.Title="Title"
++LiveHime.Feature.SaveTitle="Save"
++LiveHime.Feature.TitleSaving="Saving title..."
++LiveHime.Feature.TitleSaved="Title saved."
++LiveHime.Feature.TitleFailed="The title was not saved."
++LiveHime.Feature.Stats="Watched %1 · Likes %2 · High energy %3 · %4"
++LiveHime.Feature.TenThousand="k"
++LiveHime.Feature.Danmaku.stopped="Danmaku off"
++LiveHime.Feature.Danmaku.connecting="Connecting danmaku"
++LiveHime.Feature.Danmaku.connected="Danmaku connected"
++LiveHime.Feature.Danmaku.reconnecting="Reconnecting danmaku"
++LiveHime.Feature.Gift="%1 sent %2 ×%3"
++LiveHime.Feature.SuperChat="¥%1 Super Chat · %2: %3"
++LiveHime.Feature.Guard="%1 became %2"
++LiveHime.Feature.Interact.enter="%1 entered"
++LiveHime.Feature.Interact.follow="%1 followed"
++LiveHime.Feature.Interact.share="%1 shared the room"
++LiveHime.Feature.LiveStarted="The room went live."
++LiveHime.Feature.LiveEnded="The room went offline."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index e73279467..870871abf 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -62,3 +62,31 @@ LiveHime.Live.Error.network="无法连接哔哩哔哩，请检查网络后重试
+ LiveHime.Live.Error.server="哔哩哔哩返回了异常结果。"
+ LiveHime.Live.Error.notReady="账号尚未就绪。"
+ LiveHime.Live.FaceAuthOpened="哔哩哔哩要求人脸验证。请在弹出的窗口中完成验证，然后点「验证完成，重试开播」。"
++LiveHime.Feature.Group="直播间"
++LiveHime.Feature.SignInFirst="登录后可查看弹幕、管理直播间。"
++LiveHime.Feature.DanmakuTab="弹幕"
++LiveHime.Feature.RoomTab="房间"
++LiveHime.Feature.ShowEntries="显示进场"
++LiveHime.Feature.ReadAloud="语音播报"
++LiveHime.Feature.MessagePlaceholder="发送弹幕"
++LiveHime.Feature.Send="发送"
++LiveHime.Feature.SendFailed="弹幕未发送"
++LiveHime.Feature.Title="标题"
++LiveHime.Feature.SaveTitle="保存"
++LiveHime.Feature.TitleSaving="正在保存标题…"
++LiveHime.Feature.TitleSaved="标题已保存。"
++LiveHime.Feature.TitleFailed="标题未保存。"
++LiveHime.Feature.Stats="看过 %1 · 点赞 %2 · 高能 %3 · %4"
++LiveHime.Feature.TenThousand="万"
++LiveHime.Feature.Danmaku.stopped="弹幕未连接"
++LiveHime.Feature.Danmaku.connecting="弹幕连接中"
++LiveHime.Feature.Danmaku.connected="弹幕已连接"
++LiveHime.Feature.Danmaku.reconnecting="弹幕重连中"
++LiveHime.Feature.Gift="%1 送出 %2 ×%3"
++LiveHime.Feature.SuperChat="¥%1 醒目留言 · %2：%3"
++LiveHime.Feature.Guard="%1 开通了%2"
++LiveHime.Feature.Interact.enter="%1 进入直播间"
++LiveHime.Feature.Interact.follow="%1 关注了直播间"
++LiveHime.Feature.Interact.share="%1 分享了直播间"
++LiveHime.Feature.LiveStarted="直播间已开播。"
++LiveHime.Feature.LiveEnded="直播间已下播。"
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index 77f138367..034087bee 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -145,6 +145,7 @@ void AccountPanel::applyState(const QJsonObject &state)
+ 		pages_->setCurrentIndex(Failed);
+ 	}
+ 	updateLiveControls();
++	emit stateChanged(state);
+ }
+ 
+ void AccountPanel::applyEvent(const QJsonObject &event)
+@@ -173,7 +174,8 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 		requesting_ = false;
+ 		const QString server = event.value("server").toString();
+ 		const QString key = event.value("key").toString();
+-		if (stream_->start(server, key))
++		ownStream_ = stream_->start(server, key);
++		if (ownStream_)
+ 			setLiveStatus(text("LiveHime.Live.Connecting"));
+ 		else
+ 			setLiveStatus(stream_->lastError() + QStringLiteral("\n") + text("LiveHime.Live.RoomStillOpen"), true);
+@@ -201,6 +203,7 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 			setLiveStatus(text("LiveHime.Live.StopFailed") + QStringLiteral("\n") + errorText(event), true);
+ 	}
+ 	updateLiveControls();
++	emit eventReceived(event);
+ }
+ 
+ void AccountPanel::onGoLive()
+@@ -229,10 +232,17 @@ void AccountPanel::onStreamStateChanged(StreamController::State state)
+ {
+ 	using State = StreamController::State;
+ 	const bool roomOpen = state_.value("liveStatus").toInt() == 1;
+-	if (state == State::Live && stream_->ownsSession())
++	if (state == State::Live && stream_->ownsSession()) {
+ 		setLiveStatus(text("LiveHime.Live.OnAir"));
+-	else if (state == State::Failed && roomOpen && !stopping_)
+-		setLiveStatus(stream_->lastError() + QStringLiteral("\n") + text("LiveHime.Live.RoomStillOpen"), true);
++	} else if ((state == State::Idle || state == State::Failed) && ownStream_) {
++		/* Stopped outside End live (OBS's own button, or an output error):
++		 * the Bilibili room is still open. */
++		if (!stopping_ && roomOpen) {
++			const QString reason = state == State::Failed ? stream_->lastError() + QStringLiteral("\n") : QString();
++			setLiveStatus(reason + text("LiveHime.Live.RoomStillOpen"), true);
++		}
++		ownStream_ = false;
++	}
+ 	updateLiveControls();
+ }
+ 
+diff --git a/plugins/livehime/src/account-panel.hpp b/plugins/livehime/src/account-panel.hpp
+index 69b07e785..1f2171098 100644
+--- a/plugins/livehime/src/account-panel.hpp
++++ b/plugins/livehime/src/account-panel.hpp
+@@ -30,6 +30,10 @@ public:
+ 	/* Last reported session state; "state" is "ready" once a room is loaded. */
+ 	const QJsonObject &state() const { return state_; }
+ 
++signals:
++	void stateChanged(const QJsonObject &state);
++	void eventReceived(const QJsonObject &event);
++
+ private:
+ 	static void onCoreMessage(const char *json, void *context);
+ 	void applyState(const QJsonObject &state);
+@@ -51,6 +55,7 @@ private:
+ 	bool areasLoaded_ = false;
+ 	bool requesting_ = false;
+ 	bool stopping_ = false;
++	bool ownStream_ = false; /* the running stream was started by Go live */
+ 
+ 	QStackedWidget *pages_;
+ 	QLabel *signedOutNotice_;
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+new file mode 100644
+index 000000000..1eae9f181
+--- /dev/null
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -0,0 +1,274 @@
++#include "feature-panel.hpp"
++
++#include <livehime-core.h>
++#include <obs-module.h>
++#include <obs.hpp>
++#include <util/platform.h>
++#include <util/util.hpp>
++
++#include <QCheckBox>
++#include <QFormLayout>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QLineEdit>
++#include <QListWidget>
++#include <QPushButton>
++#include <QScrollBar>
++#include <QTabWidget>
++#include <QVBoxLayout>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++
++QString countText(int value)
++{
++	if (value < 0)
++		return QStringLiteral("—");
++	/* Chinese groups by 万 (10,000); other locales use k (1,000). */
++	const QString unit = text("LiveHime.Feature.TenThousand");
++	const int divisor = unit == QStringLiteral("k") ? 1000 : 10000;
++	if (value >= divisor)
++		return QString::number(value / double(divisor), 'f', 1) + unit;
++	return QString::number(value);
++}
++
++constexpr int kMaxFeedItems = 300;
++} // namespace
++
++FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
++{
++	stats_ = new QLabel(this);
++	stats_->setStyleSheet(QStringLiteral("color: #9aa0ab; font-family: Menlo, monospace;"));
++	signedOutHint_ = new QLabel(text("LiveHime.Feature.SignInFirst"), this);
++	signedOutHint_->setWordWrap(true);
++	signedOutHint_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++
++	/* Danmaku tab */
++	auto *danmakuPage = new QWidget(this);
++	feed_ = new QListWidget(danmakuPage);
++	feed_->setWordWrap(true);
++	feed_->setUniformItemSizes(false);
++	feed_->setSelectionMode(QAbstractItemView::ExtendedSelection);
++	showEntries_ = new QCheckBox(text("LiveHime.Feature.ShowEntries"), danmakuPage);
++	readAloud_ = new QCheckBox(text("LiveHime.Feature.ReadAloud"), danmakuPage);
++	auto *options = new QHBoxLayout;
++	options->addWidget(showEntries_);
++	options->addWidget(readAloud_);
++	options->addStretch(1);
++	message_ = new QLineEdit(danmakuPage);
++	message_->setPlaceholderText(text("LiveHime.Feature.MessagePlaceholder"));
++	message_->setMaxLength(40);
++	send_ = new QPushButton(text("LiveHime.Feature.Send"), danmakuPage);
++	auto *sendRow = new QHBoxLayout;
++	sendRow->addWidget(message_, 1);
++	sendRow->addWidget(send_);
++	auto *danmakuLayout = new QVBoxLayout(danmakuPage);
++	danmakuLayout->setContentsMargins(0, 6, 0, 0);
++	danmakuLayout->addWidget(feed_, 1);
++	danmakuLayout->addLayout(options);
++	danmakuLayout->addLayout(sendRow);
++
++	/* Room tab */
++	auto *roomPage = new QWidget(this);
++	title_ = new QLineEdit(roomPage);
++	title_->setMaxLength(40);
++	saveTitle_ = new QPushButton(text("LiveHime.Feature.SaveTitle"), roomPage);
++	auto *titleRow = new QHBoxLayout;
++	titleRow->addWidget(title_, 1);
++	titleRow->addWidget(saveTitle_);
++	roomStatus_ = new QLabel(roomPage);
++	roomStatus_->setWordWrap(true);
++	auto *roomForm = new QFormLayout;
++	roomForm->addRow(text("LiveHime.Feature.Title"), titleRow);
++	auto *roomLayout = new QVBoxLayout(roomPage);
++	roomLayout->setContentsMargins(0, 6, 0, 0);
++	roomLayout->addLayout(roomForm);
++	roomLayout->addWidget(roomStatus_);
++	roomLayout->addStretch(1);
++
++	tabs_ = new QTabWidget(this);
++	tabs_->addTab(danmakuPage, text("LiveHime.Feature.DanmakuTab"));
++	tabs_->addTab(roomPage, text("LiveHime.Feature.RoomTab"));
++
++	auto *layout = new QVBoxLayout(this);
++	layout->setContentsMargins(0, 0, 0, 0);
++	layout->addWidget(stats_);
++	layout->addWidget(signedOutHint_);
++	layout->addWidget(tabs_, 1);
++
++	connect(send_, &QPushButton::clicked, this, &FeaturePanel::sendDanmaku);
++	connect(message_, &QLineEdit::returnPressed, this, &FeaturePanel::sendDanmaku);
++	connect(saveTitle_, &QPushButton::clicked, this, &FeaturePanel::saveTitle);
++	connect(readAloud_, &QCheckBox::toggled, this, [this](bool on) {
++		livehime_core_set_tts(on ? 1 : 0);
++		saveSettings();
++	});
++	connect(showEntries_, &QCheckBox::toggled, this, &FeaturePanel::saveSettings);
++
++	loadSettings();
++	applyState(QJsonObject());
++}
++
++void FeaturePanel::applyState(const QJsonObject &state)
++{
++	const bool ready = state.value("state").toString() == "ready";
++	if (ready && !title_->hasFocus())
++		title_->setText(state.value("title").toString());
++	if (ready != ready_) {
++		ready_ = ready;
++		if (!ready) {
++			watched_ = likes_ = onlineRank_ = -1;
++			feed_->clear();
++		}
++	}
++	tabs_->setEnabled(ready);
++	signedOutHint_->setVisible(!ready);
++	updateStats();
++}
++
++void FeaturePanel::applyEvent(const QJsonObject &event)
++{
++	const QString name = event.value("event").toString();
++	if (name == "room") {
++		onRoomEvent(event);
++	} else if (name == "danmakuStatus") {
++		danmakuStatus_ = event.value("status").toString();
++		updateStats();
++	} else if (name == "danmakuSent") {
++		send_->setEnabled(true);
++		if (event.value("ok").toBool()) {
++			message_->clear();
++		} else {
++			const QString detail = event.value("message").toString();
++			appendFeed(text("LiveHime.Feature.SendFailed") + (detail.isEmpty() ? QString() : QStringLiteral("：") + detail),
++				   QStringLiteral("#e06c75"));
++		}
++	} else if (name == "titleUpdated") {
++		saveTitle_->setEnabled(true);
++		const bool ok = event.value("ok").toBool();
++		const QString detail = event.value("message").toString();
++		roomStatus_->setText(ok ? text("LiveHime.Feature.TitleSaved")
++					: text("LiveHime.Feature.TitleFailed") +
++						  (detail.isEmpty() ? QString() : QStringLiteral("\n") + detail));
++		roomStatus_->setStyleSheet(ok ? QStringLiteral("color: #9aa0ab;") : QStringLiteral("color: #e06c75;"));
++	}
++}
++
++void FeaturePanel::onRoomEvent(const QJsonObject &event)
++{
++	const QString kind = event.value("kind").toString();
++	const QString user = event.value("user").toString();
++	if (kind == "chat") {
++		const QString medal = event.value("medal").toString();
++		appendFeed((medal.isEmpty() ? QString() : QStringLiteral("[%1] ").arg(medal)) + user + QStringLiteral("：") +
++			   event.value("text").toString());
++	} else if (kind == "gift") {
++		appendFeed(text("LiveHime.Feature.Gift")
++				   .arg(user, event.value("name").toString())
++				   .arg(event.value("count").toInt()),
++			   QStringLiteral("#e0a040"));
++	} else if (kind == "superChat") {
++		appendFeed(text("LiveHime.Feature.SuperChat")
++				   .arg(event.value("price").toInt())
++				   .arg(user, event.value("text").toString()),
++			   QStringLiteral("#fb4d5a"));
++	} else if (kind == "guard") {
++		appendFeed(text("LiveHime.Feature.Guard").arg(user, event.value("name").toString()),
++			   QStringLiteral("#8994ee"));
++	} else if (kind == "enter" || kind == "follow" || kind == "share") {
++		if (showEntries_->isChecked() || kind == "follow") {
++			const QByteArray key = "LiveHime.Feature.Interact." + kind.toUtf8();
++			appendFeed(text(key.constData()).arg(user), QStringLiteral("#6c717b"));
++		}
++	} else if (kind == "watched") {
++		watched_ = event.value("value").toInt();
++		updateStats();
++	} else if (kind == "likes") {
++		likes_ = event.value("value").toInt();
++		updateStats();
++	} else if (kind == "onlineRank") {
++		onlineRank_ = event.value("value").toInt();
++		updateStats();
++	} else if (kind == "liveStarted" || kind == "liveEnded") {
++		appendFeed(text(kind == "liveStarted" ? "LiveHime.Feature.LiveStarted" : "LiveHime.Feature.LiveEnded"),
++			   QStringLiteral("#9aa0ab"));
++	}
++}
++
++void FeaturePanel::appendFeed(const QString &line, const QString &color)
++{
++	QScrollBar *bar = feed_->verticalScrollBar();
++	const bool atBottom = bar->value() >= bar->maximum() - 4;
++	auto *item = new QListWidgetItem(line);
++	if (!color.isEmpty())
++		item->setForeground(QColor(color));
++	feed_->addItem(item);
++	while (feed_->count() > kMaxFeedItems)
++		delete feed_->takeItem(0);
++	/* Keep following new messages unless the user scrolled up to read. */
++	if (atBottom)
++		feed_->scrollToBottom();
++}
++
++void FeaturePanel::updateStats()
++{
++	if (!ready_) {
++		stats_->clear();
++		stats_->setVisible(false);
++		return;
++	}
++	const QByteArray statusKey = "LiveHime.Feature.Danmaku." + danmakuStatus_.toUtf8();
++	stats_->setText(text("LiveHime.Feature.Stats")
++				.arg(countText(watched_), countText(likes_), countText(onlineRank_),
++				     text(statusKey.constData())));
++	stats_->setVisible(true);
++}
++
++void FeaturePanel::sendDanmaku()
++{
++	const QByteArray message = message_->text().trimmed().toUtf8();
++	if (!ready_ || message.isEmpty())
++		return;
++	send_->setEnabled(false);
++	livehime_core_send_danmaku(message.constData());
++}
++
++void FeaturePanel::saveTitle()
++{
++	const QByteArray title = title_->text().trimmed().toUtf8();
++	if (!ready_ || title.isEmpty())
++		return;
++	saveTitle_->setEnabled(false);
++	roomStatus_->setText(text("LiveHime.Feature.TitleSaving"));
++	roomStatus_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++	livehime_core_update_title(title.constData());
++}
++
++void FeaturePanel::loadSettings()
++{
++	BPtr<char> path = obs_module_config_path("features.json");
++	OBSDataAutoRelease data = path ? obs_data_create_from_json_file_safe(path, "bak") : nullptr;
++	const bool entries = data ? obs_data_get_bool(data, "show_entries") : false;
++	const bool tts = data ? obs_data_get_bool(data, "read_aloud") : false;
++	QSignalBlocker blockEntries(showEntries_);
++	QSignalBlocker blockTts(readAloud_);
++	showEntries_->setChecked(entries);
++	readAloud_->setChecked(tts);
++	livehime_core_set_tts(tts ? 1 : 0);
++}
++
++void FeaturePanel::saveSettings()
++{
++	BPtr<char> dir = obs_module_config_path("");
++	BPtr<char> path = obs_module_config_path("features.json");
++	if (!dir || !path)
++		return;
++	os_mkdirs(dir);
++	OBSDataAutoRelease data = obs_data_create();
++	obs_data_set_bool(data, "show_entries", showEntries_->isChecked());
++	obs_data_set_bool(data, "read_aloud", readAloud_->isChecked());
++	obs_data_save_json_safe(data, path, "tmp", "bak");
++}
+diff --git a/plugins/livehime/src/feature-panel.hpp b/plugins/livehime/src/feature-panel.hpp
+new file mode 100644
+index 000000000..a5254cc49
+--- /dev/null
++++ b/plugins/livehime/src/feature-panel.hpp
+@@ -0,0 +1,53 @@
++#pragma once
++
++#include <QJsonObject>
++#include <QWidget>
++
++class QCheckBox;
++class QLabel;
++class QLineEdit;
++class QListWidget;
++class QPushButton;
++class QTabWidget;
++
++/* Everyday live-room features below the account section: room stats, the
++ * live danmaku feed (chat, gifts, Super Chats, guards, entries) with sending
++ * and read-aloud, and room title editing. It is driven by the core's state
++ * and events, forwarded by AccountPanel. */
++class FeaturePanel : public QWidget {
++	Q_OBJECT
++
++public:
++	explicit FeaturePanel(QWidget *parent = nullptr);
++
++public slots:
++	void applyState(const QJsonObject &state);
++	void applyEvent(const QJsonObject &event);
++
++private:
++	void appendFeed(const QString &line, const QString &color = QString());
++	void onRoomEvent(const QJsonObject &event);
++	void updateStats();
++	void sendDanmaku();
++	void saveTitle();
++	void loadSettings();
++	void saveSettings();
++
++	bool ready_ = false;
++	int watched_ = -1;
++	int likes_ = -1;
++	int onlineRank_ = -1;
++	QString danmakuStatus_ = QStringLiteral("stopped");
++
++	QLabel *stats_;
++	QTabWidget *tabs_;
++	QListWidget *feed_;
++	QCheckBox *showEntries_;
++	QCheckBox *readAloud_;
++	QLineEdit *message_;
++	QPushButton *send_;
++	QLineEdit *title_;
++	QPushButton *saveTitle_;
++	QLabel *roomStatus_;
++	QLabel *signedOutHint_;
++};
+diff --git a/plugins/livehime/src/livehime-dock.cpp b/plugins/livehime/src/livehime-dock.cpp
+index 69d802e0a..37cb5cf84 100644
+--- a/plugins/livehime/src/livehime-dock.cpp
++++ b/plugins/livehime/src/livehime-dock.cpp
+@@ -1,5 +1,6 @@
+ #include "livehime-dock.hpp"
+ #include "account-panel.hpp"
++#include "feature-panel.hpp"
+ 
+ #include <obs-module.h>
+ 
+@@ -59,43 +60,24 @@ LiveHimeDock::LiveHimeDock(QWidget *parent) : QWidget(parent), controller_(new S
+ 	statusRow->addWidget(statusChip_);
+ 	statusRow->addWidget(stats_, 1);
+ 
+-	server_ = new QLineEdit(this);
+-	server_->setPlaceholderText(QStringLiteral("rtmp://"));
+-	key_ = new QLineEdit(this);
+-	key_->setEchoMode(QLineEdit::Password);
+-	start_ = new QPushButton(text("LiveHime.Stream.Start"), this);
+-	stop_ = new QPushButton(text("LiveHime.Stream.Stop"), this);
+-
+-	auto *form = new QFormLayout;
+-	form->addRow(text("LiveHime.Stream.Server"), server_);
+-	form->addRow(text("LiveHime.Stream.Key"), key_);
+-	auto *buttons = new QHBoxLayout;
+-	buttons->addWidget(start_);
+-	buttons->addWidget(stop_);
+-
+-	auto *manual = new QGroupBox(text("LiveHime.Stream.ManualGroup"), this);
+-	auto *manualLayout = new QVBoxLayout(manual);
+-	manualLayout->addLayout(form);
+-	manualLayout->addLayout(buttons);
+-	auto *hint = new QLabel(text("LiveHime.Stream.ManualHint"), manual);
+-	hint->setWordWrap(true);
+-	hint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+-	manualLayout->addWidget(hint);
+-
+ 	auto *account = new QGroupBox(text("LiveHime.Account.Group"), this);
+ 	auto *accountLayout = new QVBoxLayout(account);
+ 	account_ = new AccountPanel(controller_, account);
+ 	accountLayout->addWidget(account_);
+ 
++	auto *featureBox = new QGroupBox(text("LiveHime.Feature.Group"), this);
++	auto *featureLayout = new QVBoxLayout(featureBox);
++	features_ = new FeaturePanel(featureBox);
++	featureLayout->addWidget(features_);
++	connect(account_, &AccountPanel::stateChanged, features_, &FeaturePanel::applyState);
++	connect(account_, &AccountPanel::eventReceived, features_, &FeaturePanel::applyEvent);
++
+ 	auto *layout = new QVBoxLayout(this);
+ 	layout->addWidget(account);
+ 	layout->addLayout(statusRow);
+ 	layout->addWidget(statusDetail_);
+-	layout->addWidget(manual);
+-	layout->addStretch(1);
++	layout->addWidget(featureBox, 1);
+ 
+-	connect(start_, &QPushButton::clicked, this, &LiveHimeDock::onStartClicked);
+-	connect(stop_, &QPushButton::clicked, this, &LiveHimeDock::onStopClicked);
+ 	connect(controller_, &StreamController::stateChanged, this, &LiveHimeDock::onStateChanged);
+ 	statsTimer_.setInterval(1000);
+ 	connect(&statsTimer_, &QTimer::timeout, this, &LiveHimeDock::updateStats);
+@@ -103,18 +85,9 @@ LiveHimeDock::LiveHimeDock(QWidget *parent) : QWidget(parent), controller_(new S
+ 	onStateChanged(controller_->state());
+ }
+ 
+-void LiveHimeDock::onStartClicked()
+-{
+-	QString error;
+-	if (!startManual(server_->text(), key_->text(), &error))
+-		statusDetail_->setText(error);
+-}
+-
+ bool LiveHimeDock::startManual(const QString &server, const QString &key, QString *error)
+ {
+ 	const QString trimmed = server.trimmed();
+-	server_->setText(trimmed);
+-	key_->setText(key);
+ 	if (!trimmed.startsWith(QStringLiteral("rtmp://"), Qt::CaseInsensitive) &&
+ 	    !trimmed.startsWith(QStringLiteral("rtmps://"), Qt::CaseInsensitive)) {
+ 		*error = text("LiveHime.Error.BadServer");
+@@ -127,11 +100,6 @@ bool LiveHimeDock::startManual(const QString &server, const QString &key, QStrin
+ 	return true;
+ }
+ 
+-void LiveHimeDock::onStopClicked()
+-{
+-	controller_->stop();
+-}
+-
+ void LiveHimeDock::onStateChanged(StreamController::State state)
+ {
+ 	using State = StreamController::State;
+@@ -143,10 +111,6 @@ void LiveHimeDock::onStateChanged(StreamController::State state)
+ 
+ 	const bool busy = state == State::Starting || state == State::Live || state == State::Reconnecting ||
+ 			  state == State::Stopping;
+-	start_->setEnabled(!busy);
+-	stop_->setEnabled(state == State::Live || state == State::Reconnecting || state == State::Starting);
+-	server_->setEnabled(!busy);
+-	key_->setEnabled(!busy);
+ 
+ 	statusDetail_->setText(state == State::Failed ? controller_->lastError() : QString());
+ 
+diff --git a/plugins/livehime/src/livehime-dock.hpp b/plugins/livehime/src/livehime-dock.hpp
+index e5c23a577..4757c9e00 100644
+--- a/plugins/livehime/src/livehime-dock.hpp
++++ b/plugins/livehime/src/livehime-dock.hpp
+@@ -7,15 +7,11 @@
+ #include <QWidget>
+ 
+ class AccountPanel;
++class FeaturePanel;
+ class QLabel;
+-class QLineEdit;
+-class QPushButton;
+-
+-/* The LiveHime control dock inside the OBS main window.
+- *
+- * This first version exposes the streaming pipeline with a manually entered
+- * RTMP endpoint; the Bilibili login and room flow will drive the same
+- * StreamController later. */
++
++/* The LiveHime control dock inside the OBS main window: Bilibili account and
++ * go-live controls, stream status, and the everyday room features. */
+ class LiveHimeDock : public QWidget {
+ 	Q_OBJECT
+ 
+@@ -28,24 +24,19 @@ public:
+ 	/* Same path as the dock's buttons; used by the automation interface.
+ 	 * Returns false with a localized reason when the request is rejected. */
+ 	bool startManual(const QString &server, const QString &key, QString *error);
+-	void stopStream() { onStopClicked(); }
++	void stopStream() { controller_->stop(); }
+ 
+ private slots:
+-	void onStartClicked();
+-	void onStopClicked();
+ 	void onStateChanged(StreamController::State state);
+ 	void updateStats();
+ 
+ private:
+ 	StreamController *controller_;
+ 	AccountPanel *account_;
++	FeaturePanel *features_;
+ 	QLabel *statusChip_;
+ 	QLabel *statusDetail_;
+ 	QLabel *stats_;
+-	QLineEdit *server_;
+-	QLineEdit *key_;
+-	QPushButton *start_;
+-	QPushButton *stop_;
+ 	QTimer statsTimer_;
+ 	QElapsedTimer liveClock_;
+ 	uint64_t lastBytes_ = 0;

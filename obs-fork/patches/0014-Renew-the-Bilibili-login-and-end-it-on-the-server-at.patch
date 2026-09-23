@@ -1,0 +1,453 @@
+From 1e53c4b20f4876273fecdea37e6eb7b2a885c6c6 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 00:29:12 +0800
+Subject: [PATCH 14/26] Renew the Bilibili login and end it on the server at
+ sign-out
+
+SessionMaintenance follows the web flow: cookie/info, RSA-OAEP(SHA-256)
+of refresh_<ms> under the public key shipped in the main site's
+wasm_rsa_encrypt_bg.wasm (modulus copied from it), correspond/1 for
+refresh_csrf, cookie/refresh, then confirm/refresh. The coordinator
+checks when the account becomes ready and every 12 hours, never while
+the room is live, one run at a time; the renewed login is saved before
+the old token is retired and any failure keeps the current login.
+Sign-out also calls login/exit/v2 (as the web header does). Outcomes are
+logged by step name only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/CMakeLists.txt               |   1 +
+ .../core/Sources/LiveHimeCore/CBridge.swift   |   1 +
+ .../LiveHimeCore/SessionCoordinator.swift     |  78 ++++++++-
+ .../LiveHimeCore/SessionMaintenance.swift     | 154 ++++++++++++++++++
+ .../SessionCoordinatorTests.swift             |  76 +++++++++
+ plugins/livehime/src/account-panel.cpp        |   4 +
+ 6 files changed, 313 insertions(+), 1 deletion(-)
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/SessionMaintenance.swift
+
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 8b5a91bf4..8a72c545f 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -20,6 +20,7 @@ target_sources(
+     core/Sources/LiveHimeCore/LiveRoomActions.swift
+     core/Sources/LiveHimeCore/PlatformSupport.swift
+     core/Sources/LiveHimeCore/QRLogin.swift
++    core/Sources/LiveHimeCore/SessionMaintenance.swift
+     core/Sources/LiveHimeCore/SessionCoordinator.swift
+     src/account-panel.cpp
+     src/account-panel.hpp
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index 6b071aabf..f6b51775d 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -21,6 +21,7 @@ final class CoreBridge {
+     init(coordinator: SessionCoordinator) {
+         self.coordinator = coordinator
+         coordinator.onChange = { [weak self] state in self?.publish(state) }
++        coordinator.onMaintenance = { [weak self] result in self?.emit(["event": "sessionMaintenance", "result": result]) }
+         danmaku.onStatus = { [weak self] status in self?.emit(["event": "danmakuStatus", "status": status.rawValue]) }
+         danmaku.onEvent = { [weak self] event in self?.handle(event) }
+     }
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+index aa04726f1..4a0489893 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -44,6 +44,9 @@ public protocol BilibiliAccountAPI: Sendable {
+     func upstream(roomID: Int64, cookieHeader: String) async throws -> BilibiliStreamConfig
+     func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws
+     func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws
++    func refreshSessionIfNeeded(_ current: SessionCredentials) async throws -> SessionCredentials?
++    func confirmRefresh(renewed: SessionCredentials, previousRefreshToken: String) async throws
++    func logout(_ current: SessionCredentials) async throws
+ }
+ 
+ /// Reads cookies a previous app version left in its WebKit store.
+@@ -57,6 +60,9 @@ public final class SessionCoordinator {
+         didSet { if state != oldValue { onChange?(state) } }
+     }
+     public var onChange: ((SessionState) -> Void)?
++    /// Outcome of each login maintenance check: "notNeeded", "refreshed",
++    /// "skippedWhileLive" or "failed:<step>". Never carries secrets.
++    public var onMaintenance: ((String) -> Void)?
+     /// Credentials of the ready account, for live start/stop requests.
+     public private(set) var credentials: SessionCredentials?
+ 
+@@ -66,9 +72,14 @@ public final class SessionCoordinator {
+     private let pollInterval: Duration
+     private let maxAutoRefresh: Int
+     private var task: Task<Void, Never>?
++    private var maintenanceTask: Task<Void, Never>?
++    private var maintaining = false
++    private let maintenanceInterval: Duration
+ 
+     public init(api: BilibiliAccountAPI, store: CredentialStore, importer: LegacySessionImporter? = nil,
+-                pollInterval: Duration = .milliseconds(1500), maxAutoRefresh: Int = 2) {
++                pollInterval: Duration = .milliseconds(1500), maxAutoRefresh: Int = 2,
++                maintenanceInterval: Duration = .seconds(12 * 3600)) {
++        self.maintenanceInterval = maintenanceInterval
+         self.api = api
+         self.store = store
+         self.importer = importer
+@@ -107,6 +118,10 @@ public final class SessionCoordinator {
+     public func signOut() {
+         task?.cancel()
+         task = nil
++        maintenanceTask?.cancel()
++        maintenanceTask = nil
++        var previous = credentials
++        if previous == nil, case .current(let saved)? = try? store.load() { previous = saved }
+         credentials = nil
+         do {
+             try store.remove()
+@@ -114,6 +129,54 @@ public final class SessionCoordinator {
+         } catch {
+             state = .failed(.keychain, detail: "\(error)")
+         }
++        // End the login on Bilibili's side too; best effort, the local login
++        // is already gone either way.
++        if let previous {
++            let api = self.api
++            Task { try? await api.logout(previous) }
++        }
++    }
++
++    /// Renews the login when Bilibili says it is due. Skipped while the room
++    /// is live so cookies never change mid-stream. The renewed login is saved
++    /// before the old token is retired; any failure keeps the current login.
++    public func maintainSession() async {
++        guard case .ready(let account) = state, let current = credentials else { return }
++        guard account.room.liveStatus != 1 else { onMaintenance?("skippedWhileLive"); return }
++        // One renewal at a time: a second run would present an already
++        // retired refresh token.
++        guard !maintaining else { return }
++        maintaining = true
++        defer { maintaining = false }
++        do {
++            guard let renewed = try await api.refreshSessionIfNeeded(current) else {
++                onMaintenance?("notNeeded")
++                return
++            }
++            try store.save(renewed)
++            credentials = renewed
++            do {
++                try await api.confirmRefresh(renewed: renewed, previousRefreshToken: current.refreshToken)
++                onMaintenance?("refreshed")
++            } catch {
++                onMaintenance?("refreshed:confirmFailed")
++            }
++        } catch SessionRefreshError.step(let step) {
++            onMaintenance?("failed:\(step)")
++        } catch {
++            onMaintenance?("failed:\(type(of: error))")
++        }
++    }
++
++    private func startMaintenance() {
++        maintenanceTask?.cancel()
++        maintenanceTask = Task { [weak self] in
++            while !Task.isCancelled {
++                await self?.maintainSession()
++                guard let interval = self?.maintenanceInterval else { return }
++                try? await Task.sleep(for: interval)
++            }
++        }
+     }
+ 
+     // MARK: Live room
+@@ -277,6 +340,7 @@ public final class SessionCoordinator {
+             guard !Task.isCancelled else { return }
+             credentials = saved
+             state = .ready(LiveAccount(mid: identity.mid, username: identity.username, room: room))
++            startMaintenance()
+         } catch {
+             guard !Task.isCancelled else { return }
+             if Self.isSessionRejected(error) {
+@@ -360,6 +424,18 @@ public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
+         try await live(cookieHeader).updateTitle(roomID: roomID, title: title, cookieHeader: cookieHeader)
+     }
+ 
++    public func refreshSessionIfNeeded(_ current: SessionCredentials) async throws -> SessionCredentials? {
++        try await SessionMaintenance().refreshIfNeeded(current)
++    }
++
++    public func confirmRefresh(renewed: SessionCredentials, previousRefreshToken: String) async throws {
++        try await SessionMaintenance().confirm(renewed: renewed, previousRefreshToken: previousRefreshToken)
++    }
++
++    public func logout(_ current: SessionCredentials) async throws {
++        try await SessionMaintenance().logout(current)
++    }
++
+     private func live(_ cookieHeader: String) -> BilibiliLiveClient {
+         BilibiliLiveClient(cookieHeader: cookieHeader, session: BilibiliWeb.session, diagnostics: diagnostics)
+     }
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionMaintenance.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionMaintenance.swift
+new file mode 100644
+index 000000000..2f47004e8
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionMaintenance.swift
+@@ -0,0 +1,154 @@
++import Foundation
++import Security
++
++/// Keeps a web login alive and ends it on the server.
++///
++/// Renewal follows Bilibili's web flow: `cookie/info` says whether a refresh
++/// is due; `refresh_<timestamp ms>` is encrypted with RSA-OAEP (SHA-256)
++/// under the public key the main site ships in `wasm_rsa_encrypt_bg.wasm`;
++/// the `correspond/1/<hex>` page reveals `refresh_csrf`; `cookie/refresh`
++/// issues new cookies and a new refresh token; `confirm/refresh` retires
++/// the old token. The caller saves the new login before confirming, and any
++/// failure leaves the current login untouched.
++public enum SessionRefreshError: Error, Equatable {
++    case missingCSRF
++    case step(String)      // which step failed; never carries secrets
++}
++
++struct SessionMaintenance: Sendable {
++    /// Modulus of the RSA public key embedded in the main site's
++    /// wasm_rsa_encrypt_bg.wasm (exponent 65537).
++    static let modulusHex = "cb81dd8e02470656da04dd38544446e2a3412051cfe9adc6a330a5ef90228509684960970b91c3360ca29c49e1690ff8fa068cb9dfc6179d1e9585cb9424e847db1ef59f33e37dd4dca8ccfb7631ee9b4a92640d00c8204300152a0ab7cd802889d3445aec69918fe6022b534912e7b095be3424dad1ba81145e969b533181f1"
++
++    let session: URLSession
++
++    init(session: URLSession = BilibiliWeb.session) {
++        self.session = session
++    }
++
++    // MARK: RSA
++
++    /// PKCS#1 RSAPublicKey DER: SEQUENCE { INTEGER n, INTEGER 65537 }.
++    static func publicKey() -> SecKey? {
++        var modulus = [UInt8]()
++        var index = modulusHex.startIndex
++        while index < modulusHex.endIndex {
++            let next = modulusHex.index(index, offsetBy: 2)
++            modulus.append(UInt8(modulusHex[index..<next], radix: 16)!)
++            index = next
++        }
++        let n: [UInt8] = [0x02, 0x81, UInt8(modulus.count + 1), 0x00] + modulus
++        let e: [UInt8] = [0x02, 0x03, 0x01, 0x00, 0x01]
++        let body = n + e
++        let der = Data([0x30, 0x81, UInt8(body.count)] + body)
++        let attributes: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
++                                         kSecAttrKeyClass as String: kSecAttrKeyClassPublic]
++        return SecKeyCreateWithData(der as CFData, attributes as CFDictionary, nil)
++    }
++
++    static func correspondPath(timestampMs: Int64) -> String? {
++        guard let key = publicKey(),
++              let encrypted = SecKeyCreateEncryptedData(key, .rsaEncryptionOAEPSHA256,
++                                                        Data("refresh_\(timestampMs)".utf8) as CFData, nil) as Data? else {
++            return nil
++        }
++        return encrypted.map { String(format: "%02x", $0) }.joined()
++    }
++
++    static func refreshCSRF(fromHTML html: String) -> String? {
++        guard let range = html.range(of: #"<div id="1-name">([^<]+)</div>"#, options: .regularExpression) else { return nil }
++        let match = String(html[range])
++        return match.replacingOccurrences(of: #"<div id="1-name">"#, with: "").replacingOccurrences(of: "</div>", with: "")
++            .trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++
++    // MARK: Flow
++
++    /// Returns renewed credentials, or nil when Bilibili says no refresh is due.
++    func refreshIfNeeded(_ current: SessionCredentials) async throws -> SessionCredentials? {
++        guard let csrf = current.csrf else { throw SessionRefreshError.missingCSRF }
++        var info = URLComponents(string: "https://passport.bilibili.com/x/passport-login/web/cookie/info")!
++        info.queryItems = [URLQueryItem(name: "csrf", value: csrf)]
++        let (infoRoot, _) = try await send(info.url!, cookies: current.cookieHeader, step: "cookieInfo")
++        let data = infoRoot["data"] as? [String: Any] ?? [:]
++        guard (data["refresh"] as? Bool) == true else { return nil }
++        let timestamp = (data["timestamp"] as? NSNumber)?.int64Value ?? Int64(Date().timeIntervalSince1970 * 1000)
++        guard !current.refreshToken.isEmpty else { throw SessionRefreshError.step("noRefreshToken") }
++
++        guard let path = Self.correspondPath(timestampMs: timestamp) else { throw SessionRefreshError.step("encrypt") }
++        let html = try await page(URL(string: "https://www.bilibili.com/correspond/1/\(path)")!, cookies: current.cookieHeader)
++        guard let refreshCSRF = Self.refreshCSRF(fromHTML: html) else { throw SessionRefreshError.step("refreshCSRF") }
++
++        let (refreshRoot, response) = try await send(
++            URL(string: "https://passport.bilibili.com/x/passport-login/web/cookie/refresh")!,
++            cookies: current.cookieHeader,
++            form: [("csrf", csrf), ("refresh_csrf", refreshCSRF), ("source", "main_web"),
++                   ("refresh_token", current.refreshToken)],
++            step: "cookieRefresh")
++        var cookies = current.cookies
++        if let url = response.url, let fields = response.allHeaderFields as? [String: String] {
++            for cookie in HTTPCookie.cookies(withResponseHeaderFields: fields, for: url) { cookies[cookie.name] = cookie.value }
++        }
++        let newToken = (refreshRoot["data"] as? [String: Any])?["refresh_token"] as? String ?? ""
++        let renewed = SessionCredentials(cookies: cookies, refreshToken: newToken)
++        guard renewed.isComplete, !newToken.isEmpty, renewed.cookies["SESSDATA"] != current.cookies["SESSDATA"] else {
++            throw SessionRefreshError.step("cookieRefreshResult")
++        }
++        return renewed
++    }
++
++    /// Retires the previous refresh token once the renewed login is saved.
++    func confirm(renewed: SessionCredentials, previousRefreshToken: String) async throws {
++        guard let csrf = renewed.csrf else { throw SessionRefreshError.missingCSRF }
++        _ = try await send(URL(string: "https://passport.bilibili.com/x/passport-login/web/confirm/refresh")!,
++                           cookies: renewed.cookieHeader,
++                           form: [("csrf", csrf), ("refresh_token", previousRefreshToken)], step: "confirmRefresh")
++    }
++
++    /// Ends the login on Bilibili's side (the same request the web header's
++    /// "log out" makes).
++    func logout(_ current: SessionCredentials) async throws {
++        guard let csrf = current.csrf else { throw SessionRefreshError.missingCSRF }
++        _ = try await send(URL(string: "https://passport.bilibili.com/login/exit/v2")!, cookies: current.cookieHeader,
++                           form: [("biliCSRF", csrf)], step: "logout")
++    }
++
++    // MARK: HTTP
++
++    private func request(_ url: URL, cookies: String) -> URLRequest {
++        var request = URLRequest(url: url)
++        request.timeoutInterval = 12
++        request.setValue(cookies, forHTTPHeaderField: "Cookie")
++        request.setValue(BilibiliWeb.userAgent, forHTTPHeaderField: "User-Agent")
++        request.setValue("https://www.bilibili.com/", forHTTPHeaderField: "Referer")
++        return request
++    }
++
++    private func send(_ url: URL, cookies: String, form: [(String, String)]? = nil,
++                      step: String) async throws -> ([String: Any], HTTPURLResponse) {
++        var request = request(url, cookies: cookies)
++        if let form {
++            let allowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "+&="))
++            request.httpMethod = "POST"
++            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
++            request.httpBody = Data(form.map {
++                "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")"
++            }.joined(separator: "&").utf8)
++        }
++        guard let (data, response) = try? await session.data(for: request), let http = response as? HTTPURLResponse,
++              (200..<300).contains(http.statusCode),
++              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++              (root["code"] as? NSNumber)?.intValue == 0 else {
++            throw SessionRefreshError.step(step)
++        }
++        return (root, http)
++    }
++
++    private func page(_ url: URL, cookies: String) async throws -> String {
++        guard let (data, response) = try? await session.data(for: request(url, cookies: cookies)),
++              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
++            throw SessionRefreshError.step("correspond")
++        }
++        return String(decoding: data, as: UTF8.self)
++    }
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+index cf26863cd..a663415b8 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -47,6 +47,16 @@ private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
+         liveRoom = BilibiliRoomInfo(roomID: roomID, uid: 42, title: "room", liveStatus: 1, areaID: Int(area.areaID))
+         return endpoint
+     }
++    var refreshResult: Result<SessionCredentials?, Error> = .success(nil)
++    var refreshCalls = 0
++    var confirmed: [String] = []
++    var loggedOut: [SessionCredentials] = []
++    func refreshSessionIfNeeded(_ current: SessionCredentials) async throws -> SessionCredentials? {
++        refreshCalls += 1
++        return try refreshResult.get()
++    }
++    func confirmRefresh(renewed: SessionCredentials, previousRefreshToken: String) async throws { confirmed.append(previousRefreshToken) }
++    func logout(_ current: SessionCredentials) async throws { loggedOut.append(current) }
+     var sentDanmaku: [String] = []
+     var titles: [String] = []
+     func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws { sentDanmaku.append(text) }
+@@ -263,6 +273,72 @@ final class LiveRoomTests: XCTestCase {
+     }
+ }
+ 
++@MainActor
++final class SessionMaintenanceTests: XCTestCase {
++    private func ready(_ api: StubAPI, _ store: MemoryCredentialStore) async -> (SessionCoordinator, () -> [String]) {
++        let c = SessionCoordinator(api: api, store: store, maintenanceInterval: .seconds(3600))
++        var results: [String] = []
++        c.onMaintenance = { results.append($0) }
++        c.restore(); await c.waitForIdle()
++        return (c, { results })
++    }
++
++    func testRenewedLoginIsSavedThenOldTokenRetired() async throws {
++        let api = StubAPI()
++        let renewed = SessionCredentials(cookies: ["SESSDATA": "new", "bili_jct": "c2", "DedeUserID": "42"], refreshToken: "rt2")
++        api.refreshResult = .success(renewed)
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "rt1")))
++        let (c, results) = await ready(api, store)
++        await c.maintainSession() // races the automatic check; only one may renew
++        for _ in 0..<100 where results().isEmpty { try await Task.sleep(for: .milliseconds(10)) }
++        XCTAssertEqual(try store.load(), .current(renewed))
++        XCTAssertEqual(c.credentials, renewed)
++        XCTAssertEqual(api.confirmed, ["rt1"])
++        XCTAssertEqual(results().last, "refreshed")
++    }
++
++    func testFailureKeepsCurrentLogin() async throws {
++        let api = StubAPI()
++        api.refreshResult = .failure(SessionRefreshError.step("refreshCSRF"))
++        let original = SessionCredentials(cookies: completeCookies, refreshToken: "rt1")
++        let store = MemoryCredentialStore(.current(original))
++        let (c, results) = await ready(api, store)
++        await c.maintainSession()
++        for _ in 0..<100 where results().isEmpty { try await Task.sleep(for: .milliseconds(10)) }
++        XCTAssertEqual(try store.load(), .current(original))
++        XCTAssertEqual(results().last, "failed:refreshCSRF")
++        guard case .ready = c.state else { return XCTFail("\(c.state)") }
++    }
++
++    func testSkippedWhileLive() async {
++        let api = StubAPI()
++        api.roomResult = .success(BilibiliRoomInfo(roomID: 1001, uid: 42, title: "t", liveStatus: 1, areaID: 7))
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "rt1")))
++        let (c, results) = await ready(api, store)
++        let before = api.refreshCalls
++        await c.maintainSession()
++        XCTAssertEqual(api.refreshCalls, before)
++        XCTAssertEqual(results().last, "skippedWhileLive")
++    }
++
++    func testSignOutEndsServerLogin() async throws {
++        let api = StubAPI()
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "rt1")))
++        let (c, _) = await ready(api, store)
++        c.signOut()
++        for _ in 0..<50 where api.loggedOut.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
++        XCTAssertEqual(api.loggedOut.first?.csrf, "csrf")
++    }
++
++    func testCorrespondPathAndCSRFParsing() {
++        let path = SessionMaintenance.correspondPath(timestampMs: 1_700_000_000_000)
++        XCTAssertEqual(path?.count, 256, "1024-bit RSA ciphertext as hex")
++        XCTAssertNotEqual(path, SessionMaintenance.correspondPath(timestampMs: 1_700_000_000_000), "OAEP is randomized")
++        XCTAssertEqual(SessionMaintenance.refreshCSRF(fromHTML: #"<html><div id="1-name">abc123</div></html>"#), "abc123")
++        XCTAssertNil(SessionMaintenance.refreshCSRF(fromHTML: "<html></html>"))
++    }
++}
++
+ final class CredentialParsingTests: XCTestCase {
+     func testPollSuccessReadsSetCookieHeaders() throws {
+         let url = URL(string: "https://passport.bilibili.com/x/passport-login/web/qrcode/poll")!
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index adfe7419e..c78251b3e 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -186,6 +186,10 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 	const QString name = event.value("event").toString();
+ 	blog(LOG_INFO, "[livehime] live event -> %s", name.toUtf8().constData());
+ 
++	if (name == "sessionMaintenance") {
++		blog(LOG_INFO, "[livehime] login maintenance: %s", event.value("result").toString().toUtf8().constData());
++		return;
++	}
+ 	if (name == "areas") {
+ 		area_->clear();
+ 		const int current = state_.value("areaId").toInt();

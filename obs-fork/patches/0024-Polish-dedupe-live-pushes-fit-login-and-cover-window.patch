@@ -1,0 +1,142 @@
+From b1b1ba9c40ba7e5be811a40c2b0d1f1cd8a9c769 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 03:34:14 +0800
+Subject: [PATCH 24/26] Polish: dedupe live pushes, fit login and cover
+ windows, room tab layout
+
+- Bilibili pushes LIVE twice for one start; repeated LIVE/PREPARING
+  pushes of the same state are dropped, so the feed says "went live" once.
+- The web login window opens at the mini-login dialog's 820 x 460 points
+  instead of showing the page backdrop above and below it.
+- The cover manager opens at 1080 x 680, the size its editor and previews
+  need, centered.
+- The room tab scrolls instead of squashing the blocked-words list, which
+  now has a minimum height; the live-room box no longer forces a minimum
+  height that compressed its contents.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Sources/LiveHimeCore/BilibiliPageWindow.swift    |  4 +++-
+ .../livehime/core/Sources/LiveHimeCore/CBridge.swift | 12 ++++++++++++
+ .../core/Sources/LiveHimeCore/WebLoginWindow.swift   |  4 +++-
+ plugins/livehime/src/feature-panel.cpp               | 11 ++++++++++-
+ plugins/livehime/src/livehime-dock.cpp               |  1 -
+ 5 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+index 3fc6a66b6..8983f35ee 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+@@ -193,7 +193,9 @@ enum BilibiliPages {
+     /// The Windows client's cover manager (upload, crop, history, review).
+     static let cover = BilibiliPageWindow.Options(
+         title: "直播间封面", url: URL(string: "https://live.bilibili.com/p/html/live-pc-blink/hime-live-cover/?pc_ui=680,566,0,1")!,
+-        size: NSSize(width: 720, height: 660), loadingText: "正在载入哔哩哔哩封面管理…",
++        // The cover editor (templates, preview, mobile/web previews) needs
++        // about 1080 x 620 points of page to show without clipping.
++        size: NSSize(width: 1080, height: 680), loadingText: "正在载入哔哩哔哩封面管理…",
+         readyText: "封面修改后可能需要哔哩哔哩审核", confirmTitle: nil)
+ }
+ 
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index bacc98df3..da7291898 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -17,6 +17,9 @@ final class CoreBridge {
+     let speaker = DanmakuSpeaker()
+     var callback: LiveHimeStateCallback?
+     var context: UnsafeMutableRawPointer?
++    /// Live state from the last LIVE/PREPARING push. Bilibili often pushes
++    /// LIVE twice for one start; repeats of the same state are dropped.
++    var roomLive: Bool?
+ 
+     init(coordinator: SessionCoordinator) {
+         self.coordinator = coordinator
+@@ -38,6 +41,7 @@ final class CoreBridge {
+         switch state {
+         case .ready(let account):
+             if danmaku.roomID != account.room.roomID, let credentials = coordinator.credentials {
++                roomLive = nil
+                 danmaku.start(roomID: account.room.roomID, uid: account.mid, cookieHeader: credentials.cookieHeader)
+             }
+         case .signedOut, .qrCode:
+@@ -48,6 +52,14 @@ final class CoreBridge {
+     }
+ 
+     private func handle(_ event: LiveRoomEvent) {
++        if case .liveStarted = event {
++            guard roomLive != true else { return }
++            roomLive = true
++        }
++        if case .liveEnded = event {
++            guard roomLive != false else { return }
++            roomLive = false
++        }
+         speaker.speak(event)
+         switch event {
+         case .liveStarted, .liveEnded, .roomChanged:
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/WebLoginWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/WebLoginWindow.swift
+index 7cc6af111..eb0750501 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/WebLoginWindow.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/WebLoginWindow.swift
+@@ -42,7 +42,9 @@ final class WebLoginWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WK
+         configuration.userContentController = content
+         configuration.websiteDataStore = .nonPersistent()
+         webView = WKWebView(frame: .zero, configuration: configuration)
+-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 520),
++        // The mini-login dialog is 820 x 460 points; a taller window only
++        // adds the page's grey backdrop above and below it.
++        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 460),
+                           styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+         super.init()
+ 
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index fdc70c9c2..761664b24 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -19,6 +19,7 @@
+ #include <QLineEdit>
+ #include <QListWidget>
+ #include <QPushButton>
++#include <QScrollArea>
+ #include <QScrollBar>
+ #include <QTabWidget>
+ #include <QVBoxLayout>
+@@ -115,6 +116,7 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	auto *shield = new QGroupBox(text("LiveHime.Feature.Keywords"), roomPage);
+ 	keywords_ = new QListWidget(shield);
+ 	keywords_->setSelectionMode(QAbstractItemView::ExtendedSelection);
++	keywords_->setMinimumHeight(110);
+ 	newKeyword_ = new QLineEdit(shield);
+ 	newKeyword_->setPlaceholderText(text("LiveHime.Feature.KeywordPlaceholder"));
+ 	addKeyword_ = new QPushButton(text("LiveHime.Feature.AddKeyword"), shield);
+@@ -145,9 +147,16 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 			livehime_core_set_shield_keyword(item->text().toUtf8().constData(), 0);
+ 	});
+ 
++	/* The room tab keeps its natural size and scrolls when the dock is
++	 * short, instead of squashing the blocked-words controls. */
++	auto *roomScroll = new QScrollArea(this);
++	roomScroll->setWidget(roomPage);
++	roomScroll->setWidgetResizable(true);
++	roomScroll->setFrameShape(QFrame::NoFrame);
++
+ 	tabs_ = new QTabWidget(this);
+ 	tabs_->addTab(danmakuPage, text("LiveHime.Feature.DanmakuTab"));
+-	tabs_->addTab(roomPage, text("LiveHime.Feature.RoomTab"));
++	tabs_->addTab(roomScroll, text("LiveHime.Feature.RoomTab"));
+ 
+ 	auto *layout = new QVBoxLayout(this);
+ 	layout->setContentsMargins(0, 0, 0, 0);
+diff --git a/plugins/livehime/src/livehime-dock.cpp b/plugins/livehime/src/livehime-dock.cpp
+index 2e8407504..e52d00c59 100644
+--- a/plugins/livehime/src/livehime-dock.cpp
++++ b/plugins/livehime/src/livehime-dock.cpp
+@@ -95,7 +95,6 @@ LiveHimeDock::LiveHimeDock(QWidget *parent) : QWidget(parent), controller_(new S
+ 	splitter_->addWidget(featureBox);
+ 	splitter_->setStretchFactor(0, 0);
+ 	splitter_->setStretchFactor(1, 1);
+-	featureBox->setMinimumHeight(160);
+ 	restoreSplitter();
+ 	connect(splitter_, &QSplitter::splitterMoved, this, &LiveHimeDock::saveSplitter);
+ 

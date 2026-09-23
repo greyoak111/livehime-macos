@@ -1,0 +1,279 @@
+From 7a5891e6561e720e735103deb35c17e4b2d9fbfe Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 00:38:05 +0800
+Subject: [PATCH 16/26] Replace OBS product naming in app prompts; hide
+ upstream-only menu items
+
+Load optional locale/overrides/<lang>.ini files after the regular locale
+so LiveHime can rename the running application in prompts (already
+running, crash/safe mode, exit confirmation, macOS permissions, restart
+notices, hide-from-capture) without touching upstream translation files.
+OBS credits, OBS plugins and imports from OBS keep their wording.
+
+The plugin hides upstream menu items that do not apply: updater, repair,
+what's new, release notes, Discord, website, and uploading logs to OBS's
+servers. A GetBrandingState automation request and e2e-branding.mjs
+check both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/e2e-branding.mjs | 16 +++++++++++++
+ frontend/OBSApp.cpp                       |  9 ++++++++
+ frontend/data/locale/overrides/en-US.ini  | 28 +++++++++++++++++++++++
+ frontend/data/locale/overrides/zh-CN.ini  | 28 +++++++++++++++++++++++
+ frontend/data/locale/overrides/zh-TW.ini  | 28 +++++++++++++++++++++++
+ plugins/livehime/src/automation.cpp       | 26 +++++++++++++++++++++
+ plugins/livehime/src/plugin-main.cpp      | 20 +++++++++++++++-
+ 7 files changed, 154 insertions(+), 1 deletion(-)
+ create mode 100644 build-aux/livehime/tests/e2e-branding.mjs
+ create mode 100644 frontend/data/locale/overrides/en-US.ini
+ create mode 100644 frontend/data/locale/overrides/zh-CN.ini
+ create mode 100644 frontend/data/locale/overrides/zh-TW.ini
+
+diff --git a/build-aux/livehime/tests/e2e-branding.mjs b/build-aux/livehime/tests/e2e-branding.mjs
+new file mode 100644
+index 000000000..228474f74
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-branding.mjs
+@@ -0,0 +1,16 @@
++import { createHash } from 'node:crypto';
++const sha=(s)=>createHash('sha256').update(s).digest('base64'); const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
++const ws=new WebSocket('ws://127.0.0.1:4466'); let id=1; const pend=new Map();
++const req=(t,d={})=>new Promise(r=>{const k=String(id++);pend.set(k,r);ws.send(JSON.stringify({op:6,d:{requestType:t,requestId:k,requestData:d}}));});
++ws.onmessage=async(ev)=>{const m=JSON.parse(ev.data);
++ if(m.op===0){const {challenge,salt}=m.d.authentication;ws.send(JSON.stringify({op:1,d:{rpcVersion:1,authentication:sha(sha(process.argv[2]+salt)+challenge),eventSubscriptions:0}}));}
++ else if(m.op===7) pend.get(m.d.requestId)?.(m.d);
++ else if(m.op===2){ for(let i=0;i<40&&!(await req('GetVersion')).requestStatus.result;i++) await sleep(500);
++  let fails=0; const check=(n,ok,i='')=>{if(!ok)fails++;console.log(`${ok?'PASS':'FAIL'}  ${n}${i?'  — '+i:''}`);};
++  for (const key of ['ConfirmExit.Text','MacPermissions.Description','About.Info']) {
++    const r=(await req('CallVendorRequest',{vendorName:'livehime',requestType:'GetBrandingState',requestData:{key}})).responseData.responseData;
++    if(key==='About.Info') check(`${key} keeps OBS credit`, r.text.includes('OBS'), r.text.slice(0,40));
++    else check(`${key} says LiveHime`, r.text.includes('LiveHime') && !r.text.includes('OBS'), r.text.slice(0,40));
++    if(key==='ConfirmExit.Text') for(const it of r.menuItems) check(`menu ${it.name} hidden`, it.found && !it.visible);
++  }
++  console.log(fails?`${fails} failed`:'all passed'); process.exit(fails?1:0);}};
+diff --git a/frontend/OBSApp.cpp b/frontend/OBSApp.cpp
+index 0d6d0e28e..dbff42548 100644
+--- a/frontend/OBSApp.cpp
++++ b/frontend/OBSApp.cpp
+@@ -1089,6 +1089,15 @@ void OBSApp::AppInit()
+ 	if (!InitLocale()) {
+ 		throw "Failed to load locale";
+ 	}
++	/* LiveHime: product-name overrides layered over the OBS strings. They
++	 * live in separate files so upstream translation updates never
++	 * conflict; later keys replace earlier ones. */
++	for (const std::string &lang : {std::string(DEFAULT_LANG), locale}) {
++		std::string path;
++		const std::string file = "locale/overrides/" + lang + ".ini";
++		if (!lang.empty() && GetDataFilePath(file.c_str(), path))
++			text_lookup_add(textLookup, path.c_str());
++	}
+ 	if (!InitTheme()) {
+ 		throw "Failed to load theme";
+ 	}
+diff --git a/frontend/data/locale/overrides/en-US.ini b/frontend/data/locale/overrides/en-US.ini
+new file mode 100644
+index 000000000..361804ca9
+--- /dev/null
++++ b/frontend/data/locale/overrides/en-US.ini
+@@ -0,0 +1,28 @@
++# LiveHime product-name overrides for en-US, loaded after en-US.ini.
++# Only strings that describe the running application; OBS credits,
++# OBS plugins and imports from OBS keep their original wording.
++AlreadyRunning.Title="LiveHime is already running"
++AlreadyRunning.Text="LiveHime is already running! Unless you meant to do this, please shut down any existing instances of LiveHime before trying to run a new instance. If you have LiveHime set to minimize to the system tray, please check to see if it's still running there."
++CrashHandling.Dialog.Title="LiveHime Crash Detected"
++CrashHandling.Labels.Text="LiveHime did not properly shut down.\n\nRun in Safe Mode (third-party plugins, scripting, and WebSockets disabled)?"
++SafeMode.Restart="Do you want to restart LiveHime in Safe Mode (third-party plugins, scripting, and WebSockets disabled)?"
++SafeMode.RestartNormal="Do you want to restart LiveHime in Normal Mode?"
++ConfirmBWTest.Text="You have LiveHime configured in bandwidth test mode. This mode allows for network testing without your channel going live. Once you are done testing, you will need to disable it in order for viewers to be able to see your stream.\n\nDo you want to continue?"
++ConfirmExit.Text="LiveHime is still currently active. All streams/recordings will be shut down."
++MissingFiles.HelpText="Some files are missing since you last used LiveHime."
++MissingFiles.AutoSearchText="LiveHime has found additional matches for missing files in that directory. Would you like to add them?"
++MacPermissions.Description="LiveHime requires your permission to be able to provide certain features. It is recommended to enable these permissions, but they are not required to use the app. You can always enable them later."
++MacPermissions.Description.OpenDialog="You can re-open this dialog via the LiveHime menu."
++MacPermissions.Item.ScreenRecording.Details="LiveHime requires this permission to be able to capture your screen."
++MacPermissions.Item.Microphone.Details="LiveHime requires this permission if you want to capture your microphone or an external audio device."
++MacPermissions.Item.InputMonitoring.Details="This permission is required for hotkeys to work while LiveHime is in the background."
++MacPermissions.Item.Accessibility.Details="On older installations, LiveHime may be listed in \"Accessibility\" instead of \"Input Monitoring\"."
++SourceLeak.Text="There was a problem while changing scene collections and some sources could not be unloaded. This issue is typically caused by plugins that are not releasing resources properly. Please ensure that any plugins you are using are up to date.\n\nLiveHime will now exit to prevent any potential data corruption."
++Basic.Main.RemigrateSceneCollection.CannotMigrate.FailedVideoReset="Reset not possible: Changing LiveHime resolution failed."
++Basic.Settings.General.HideOBSWindowsFromCapture="Hide LiveHime windows from screen capture"
++Basic.Settings.General.HideOBSWindowsFromCapture.Tooltip="This setting will hide all non-projector LiveHime windows from being captured by LiveHime and affects \nother applications, such as conferencing, screen sharing, remote support, screenshots, and other capture software."
++Basic.Settings.General.HideOBSWindowsFromCapture.Message="Enabling this option hides all non-projector LiveHime windows from being captured by LiveHime and affects other applications, such as conferencing, screen sharing, remote support, screenshots, and other capture software."
++AddUrl.Text="You have dragged a URL into LiveHime. This will automatically add the link as a source. Continue?"
++NeedsRestart="LiveHime needs to be restarted. Do you want to restart now?"
++LoadProfileNeedsRestart="Profile contains settings that require restarting LiveHime:\n%1\n\nDo you want to restart LiveHime for these settings to take effect?"
++PluginManager.Restart="LiveHime must be restarted to apply plugin changes"
+diff --git a/frontend/data/locale/overrides/zh-CN.ini b/frontend/data/locale/overrides/zh-CN.ini
+new file mode 100644
+index 000000000..c31b370c7
+--- /dev/null
++++ b/frontend/data/locale/overrides/zh-CN.ini
+@@ -0,0 +1,28 @@
++# LiveHime product-name overrides for zh-CN, loaded after zh-CN.ini.
++# Only strings that describe the running application; OBS credits,
++# OBS plugins and imports from OBS keep their original wording.
++AlreadyRunning.Title="LiveHime 已在运行"
++AlreadyRunning.Text="LiveHime 已经在运行中！若你真的想要这样做，请在启动新的 LiveHime 前关闭其他正在在运行中的 LiveHime。如果你把 LiveHime 设置成最小化到系统托盘，请检查它是否仍在运行。"
++CrashHandling.Dialog.Title="检测到 LiveHime 崩溃"
++CrashHandling.Labels.Text="LiveHime 未正确关闭。\n\n是否以安全模式运行（禁用第三方插件、脚本和 WebSocket）？"
++SafeMode.Restart="您要以安全模式重启 LiveHime（禁用第三方插件、脚本和 WebSocket）吗？"
++SafeMode.RestartNormal="您要以正常模式重启 LiveHime 吗？"
++ConfirmBWTest.Text="您已经在带宽测试模式下配置了 LiveHime。此模式允许在不开启频道的情况下进行网络测试。完成测试后，您需要禁用它，以便观众能够看到您的直播。\n\n是否继续？"
++ConfirmExit.Text="LiveHime 目前正在进行推流 / 录制任务，确认停止当前正在进行的所有任务并关闭程序吗？"
++MissingFiles.HelpText="跟上次您使用 LiveHime 相比，有部分文件丢失。"
++MissingFiles.AutoSearchText="LiveHime 在文件夹中找到了其他匹配的缺失文件。您想要添加它们吗？"
++MacPermissions.Description="LiveHime 需要您的授权，才能提供某些功能。建议您开启这些权限，但不开启不会影响正常使用。您可以随时再开启这些权限。"
++MacPermissions.Description.OpenDialog="您可以通过 LiveHime 菜单重新打开此对话框。"
++MacPermissions.Item.ScreenRecording.Details="LiveHime 需要此权限才能采集您的屏幕。"
++MacPermissions.Item.Microphone.Details="LiveHime 需要此权限才能使用您的麦克风或外部音频设备录制。"
++MacPermissions.Item.InputMonitoring.Details="当 LiveHime 在后台运行时，热键需要该权限才能正常工作。"
++MacPermissions.Item.Accessibility.Details="在旧版安装中，LiveHime 可能会列在“无障碍”而不是“输入监控”中。"
++SourceLeak.Text="在更改场景集合时出现问题，部分源无法卸载。这个问题通常是由于插件没有正确释放资源导致的。请确保您所使用的所有插件都已更新到最新版本。\n\nLiveHime将会退出以防任何潜在的数据损坏。"
++Basic.Main.RemigrateSceneCollection.CannotMigrate.FailedVideoReset="无法重置：更改 LiveHime 分辨率失败。"
++Basic.Settings.General.HideOBSWindowsFromCapture="在屏幕采集中隐藏 LiveHime 窗口"
++Basic.Settings.General.HideOBSWindowsFromCapture.Tooltip="此设置将隐藏所有非投影的 LiveHime 窗口，使其不被LiveHime 采集，避免影响\n其他应用程序，如会议、屏幕共享、远程支持、屏幕截图和其他截屏软件。"
++Basic.Settings.General.HideOBSWindowsFromCapture.Message="开启此设置会隐藏所有非投影的 LiveHime 窗口，使其不被LiveHime 采集，避免影响其他应用程序，如会议、屏幕共享、远程支持、屏幕截图和其他截屏软件。"
++AddUrl.Text="您已将 URL 拖拽到LiveHime。这会自动将链接添加为一个源。是否继续？"
++NeedsRestart="LiveHime需要重启。您想现在重新启动吗？"
++LoadProfileNeedsRestart="配置文件包含需要重启LiveHime的设置:\n%1\n\n您想要重启LiveHime使这些设置生效吗？"
++PluginManager.Restart="必须重启 LiveHime 才能应用插件更改"
+diff --git a/frontend/data/locale/overrides/zh-TW.ini b/frontend/data/locale/overrides/zh-TW.ini
+new file mode 100644
+index 000000000..7fa3cfc43
+--- /dev/null
++++ b/frontend/data/locale/overrides/zh-TW.ini
+@@ -0,0 +1,28 @@
++# LiveHime product-name overrides for zh-TW, loaded after zh-TW.ini.
++# Only strings that describe the running application; OBS credits,
++# OBS plugins and imports from OBS keep their original wording.
++AlreadyRunning.Title="LiveHime 已經執行"
++AlreadyRunning.Text="LiveHime 已經啟動！除非您就想這麼做，否則請在執行新實體前，先關閉現存的 LiveHime 實體。如果你已將 LiveHime 設定成最小化至系統工具列，那請檢查 LiveHime 是否還在工具列執行著。"
++CrashHandling.Dialog.Title="偵測到 LiveHime 當機"
++CrashHandling.Labels.Text="LiveHime 未正常關閉。\n\n要在安全模式下執行嗎？（已停用第三方外掛程式、指令碼和 WebSockets）"
++SafeMode.Restart="您是否想將 LiveHime 重新啟動至安全模式（也就是停用第三方外掛程式、指令稿和 WebSocket）？"
++SafeMode.RestartNormal="你要以一般模式重新啟動 LiveHime 嗎？"
++ConfirmBWTest.Text="你已在頻寬測試模式下設定了 LiveHime。此模式允許在沒有開始串流的情況下進行網路測試。完成測試後，你要停用它才可以進行串流。\n\n要繼續嗎？"
++ConfirmExit.Text="LiveHime 目前仍在運作中。所有的串流與錄影都將停止。"
++MissingFiles.HelpText="跟上次您使用 LiveHime 相比，有遺失部分檔案。"
++MissingFiles.AutoSearchText="LiveHime 在資料夾中發現到其他符合的遺失檔案。是否加入？"
++MacPermissions.Description="LiveHime 需要您的權限，才能提供某些功能。建議啟用這些權限，但論使用 App 是非必須的。您可以稍後再啟用。"
++MacPermissions.Description.OpenDialog="您可以透過 LiveHime 的選單，重新開啟這個對話方塊。"
++MacPermissions.Item.ScreenRecording.Details="LiveHime 需要本權限，方能擷取您的螢幕畫面。"
++MacPermissions.Item.Microphone.Details="如果您想用麥克風或其他錄音器，請允許 LiveHime 的錄音權利。"
++MacPermissions.Item.InputMonitoring.Details="當LiveHime在背景執行時需要取得權限來使用快速鍵。"
++MacPermissions.Item.Accessibility.Details="在舊版本的安裝上，LiveHime 可能列為“可訪問性”，而不是“輸入監視”。"
++SourceLeak.Text="更改場景集時發生錯誤，且無法卸載部分來源。這通常是因為外掛程式沒有正確釋放資源。請檢查您使用的所有外掛程式是否已經是最新版本。\n\nLiveHime 將立即結束，以免造成資料損毀。"
++Basic.Main.RemigrateSceneCollection.CannotMigrate.FailedVideoReset="無法重設：更改 LiveHime 解析度失敗。"
++Basic.Settings.General.HideOBSWindowsFromCapture="從螢幕擷取中隱藏 LiveHime 視窗"
++Basic.Settings.General.HideOBSWindowsFromCapture.Tooltip="本設定會隱藏所有非投影的 LiveHime 視窗，防止被 LiveHime 擷取而影響\n其他應用程式，如會議、螢幕共用、遠端支援、螢幕截圖及其他擷取軟體。"
++Basic.Settings.General.HideOBSWindowsFromCapture.Message="啟用本選項會隱藏所有非投影的 LiveHime 視窗，防止被 LiveHime 擷取而影響\n其他應用程式，如會議、螢幕共用、遠端支援、螢幕截圖及其他擷取軟體。"
++AddUrl.Text="您拖曳了網址到 LiveHime。這會自動將連結加為來源。繼續？"
++NeedsRestart="LiveHime 需要重新啟動。您是否要現在重新啟動？"
++LoadProfileNeedsRestart="設定檔內有需要重新啟動 LiveHime 的設定：\n%1\n\n是否要重新啟動 LiveHime，讓這些設定生效？"
++PluginManager.Restart="LiveHime 需要重新啟動才能套用外掛變更"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 7a3ea4bb0..667644ff6 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -4,10 +4,13 @@
+ 
+ #include <livehime-core.h>
+ 
++#include <obs-frontend-api.h>
+ #include <obs-module.h>
+ #include <obs-websocket-api.h>
+ 
++#include <QAction>
+ #include <QJsonDocument>
++#include <QMainWindow>
+ #include <QMetaEnum>
+ #include <QMetaObject>
+ #include <QPointer>
+@@ -81,6 +84,27 @@ void getAccountState(obs_data_t *, obs_data_t *response, void *)
+ 		obs_data_set_string(response, "error", "dock unavailable");
+ }
+ 
++/* Read-only branding check for tests: a frontend string and whether the
++ * upstream menu items are hidden. */
++void getBrandingState(obs_data_t *request, obs_data_t *response, void *)
++{
++	const char *key = obs_data_get_string(request, "key");
++	onUiThread([&] {
++		obs_data_set_string(response, "text", obs_frontend_get_locale_string(*key ? key : "ConfirmExit.Text"));
++		auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
++		OBSDataArrayAutoRelease hidden = obs_data_array_create();
++		for (const char *name : {"actionCheckForUpdates", "actionUploadCurrentLog", "actionWebsite"}) {
++			auto *action = mainWindow ? mainWindow->findChild<QAction *>(QString::fromLatin1(name)) : nullptr;
++			OBSDataAutoRelease item = obs_data_create();
++			obs_data_set_string(item, "name", name);
++			obs_data_set_bool(item, "found", action != nullptr);
++			obs_data_set_bool(item, "visible", action && action->isVisible());
++			obs_data_array_push_back(hidden, item);
++		}
++		obs_data_set_array(response, "menuItems", hidden);
++	});
++}
++
+ void startQRLogin(obs_data_t *, obs_data_t *, void *)
+ {
+ 	onUiThread([] { livehime_core_start_qr_login(); });
+@@ -104,6 +128,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "StartManualStream", startManualStream, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "StopStream", stopStream, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "GetAccountState", getAccountState, nullptr);
++	obs_websocket_vendor_register_request(vendor, "GetBrandingState", getBrandingState, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "StartQRLogin", startQRLogin, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "CancelQRLogin", cancelQRLogin, nullptr);
+ }
+@@ -115,6 +140,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "StartManualStream");
+ 		obs_websocket_vendor_unregister_request(vendor, "StopStream");
+ 		obs_websocket_vendor_unregister_request(vendor, "GetAccountState");
++		obs_websocket_vendor_unregister_request(vendor, "GetBrandingState");
+ 		obs_websocket_vendor_unregister_request(vendor, "StartQRLogin");
+ 		obs_websocket_vendor_unregister_request(vendor, "CancelQRLogin");
+ 		vendor = nullptr;
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index 2d84b446f..fa3d77397 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -5,6 +5,7 @@
+ #include <obs-frontend-api.h>
+ #include <obs-module.h>
+ 
++#include <QAction>
+ #include <QDockWidget>
+ #include <QMainWindow>
+ #include <QPointer>
+@@ -50,10 +51,27 @@ void placeDockOnFirstRun()
+ 	obs_data_save_json_safe(saved, path, "tmp", "bak");
+ }
+ 
++/* Upstream OBS menu items that do not apply to LiveHime: its updater, repair
++ * and news, OBS community links, and uploading logs to OBS's servers. */
++void hideUpstreamMenuItems()
++{
++	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
++	if (!mainWindow)
++		return;
++	for (const char *name : {"actionCheckForUpdates", "actionRepair", "actionShowWhatsNew", "actionReleaseNotes",
++				 "actionDiscord", "actionWebsite", "actionUploadCurrentLog", "actionUploadLastLog",
++				 "actionUploadLastCrashLog"}) {
++		if (auto *action = mainWindow->findChild<QAction *>(QString::fromLatin1(name)))
++			action->setVisible(false);
++	}
++}
++
+ void onFrontendEvent(enum obs_frontend_event event, void *)
+ {
+-	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING)
++	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+ 		placeDockOnFirstRun();
++		hideUpstreamMenuItems();
++	}
+ 	/* Still inside the frontend's shutdown with its API alive: close a room
+ 	 * this app opened so quitting never leaves it live. */
+ 	if (event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN && dock)

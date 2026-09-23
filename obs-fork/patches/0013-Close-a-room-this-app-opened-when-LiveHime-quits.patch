@@ -1,0 +1,127 @@
+From 41237e6e806d4cadf28f72b0fc5f39f49a43ffb0 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 00:20:35 +0800
+Subject: [PATCH 13/26] Close a room this app opened when LiveHime quits
+
+On OBS's scripting-shutdown event (the frontend API is still alive), the
+account panel closes the live room if Go live opened it and End live has
+not been confirmed, waiting up to six seconds for Bilibili. Rooms opened
+elsewhere (phone, another device) are left alone. OBS's own confirm-on-
+exit prompt still guards quitting while streaming.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/src/account-panel.cpp | 32 +++++++++++++++++++++++++-
+ plugins/livehime/src/account-panel.hpp |  7 +++++-
+ plugins/livehime/src/plugin-main.cpp   |  5 ++++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index 2ee7b7111..adfe7419e 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include <QByteArray>
+ #include <QComboBox>
++#include <QEventLoop>
++#include <QTimer>
+ #include <QHBoxLayout>
+ #include <QJsonArray>
+ #include <QJsonDocument>
+@@ -228,8 +230,10 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 		return;
+ 	} else if (name == "liveStopped") {
+ 		stopping_ = false;
+-		if (event.value("ok").toBool())
++		if (event.value("ok").toBool()) {
++			roomOpenedHere_ = false;
+ 			setLiveStatus(text("LiveHime.Live.Ended"));
++		}
+ 		else
+ 			setLiveStatus(text("LiveHime.Live.StopFailed") + QStringLiteral("\n") + errorText(event), true);
+ 	}
+@@ -237,12 +241,38 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 	emit eventReceived(event);
+ }
+ 
++void AccountPanel::closeRoomBeforeExit()
++{
++	const bool roomOpen = state_.value("state").toString() == "ready" && state_.value("liveStatus").toInt() == 1;
++	if (!roomOpenedHere_ || !roomOpen)
++		return;
++
++	blog(LOG_INFO, "[livehime] closing the live room before exit");
++	QEventLoop wait;
++	bool confirmed = false;
++	auto connection = connect(this, &AccountPanel::eventReceived, &wait, [&](const QJsonObject &event) {
++		if (event.value("event").toString() == "liveStopped") {
++			confirmed = event.value("ok").toBool();
++			wait.quit();
++		}
++	});
++	QTimer::singleShot(6000, &wait, &QEventLoop::quit);
++	if (!stopping_) {
++		stopping_ = true;
++		livehime_core_stop_live();
++	}
++	wait.exec();
++	disconnect(connection);
++	blog(LOG_INFO, "[livehime] live room close before exit: %s", confirmed ? "confirmed" : "not confirmed");
++}
++
+ void AccountPanel::onGoLive()
+ {
+ 	const QVariantList ids = area_->currentData().toList();
+ 	if (ids.size() != 2)
+ 		return;
+ 	requesting_ = true;
++	roomOpenedHere_ = true;
+ 	setLiveStatus(text("LiveHime.Live.Requesting"));
+ 	updateLiveControls();
+ 	livehime_core_start_live(ids[0].toLongLong(), ids[1].toLongLong());
+diff --git a/plugins/livehime/src/account-panel.hpp b/plugins/livehime/src/account-panel.hpp
+index 80450f63a..3f6ec4307 100644
+--- a/plugins/livehime/src/account-panel.hpp
++++ b/plugins/livehime/src/account-panel.hpp
+@@ -30,6 +30,10 @@ public:
+ 	/* Last reported session state; "state" is "ready" once a room is loaded. */
+ 	const QJsonObject &state() const { return state_; }
+ 
++	/* Called while OBS shuts down: if this app opened the live room and it
++	 * is still open, close it and wait briefly (bounded) for Bilibili. */
++	void closeRoomBeforeExit();
++
+ signals:
+ 	void stateChanged(const QJsonObject &state);
+ 	void eventReceived(const QJsonObject &event);
+@@ -56,7 +60,8 @@ private:
+ 	bool areasLoaded_ = false;
+ 	bool requesting_ = false;
+ 	bool stopping_ = false;
+-	bool ownStream_ = false; /* the running stream was started by Go live */
++	bool ownStream_ = false;      /* the running stream was started by Go live */
++	bool roomOpenedHere_ = false; /* Go live opened the room; End live not yet confirmed */
+ 
+ 	QStackedWidget *pages_;
+ 	QLabel *signedOutNotice_;
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index 7b6760251..2d84b446f 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -1,3 +1,4 @@
++#include "account-panel.hpp"
+ #include "automation.hpp"
+ #include "livehime-dock.hpp"
+ 
+@@ -53,6 +54,10 @@ void onFrontendEvent(enum obs_frontend_event event, void *)
+ {
+ 	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING)
+ 		placeDockOnFirstRun();
++	/* Still inside the frontend's shutdown with its API alive: close a room
++	 * this app opened so quitting never leaves it live. */
++	if (event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN && dock)
++		dock->account()->closeRoomBeforeExit();
+ 	if (dock)
+ 		dock->controller()->handleFrontendEvent(event);
+ }

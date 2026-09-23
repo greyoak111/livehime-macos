@@ -1,0 +1,147 @@
+From 83baab0d086cf1e3d9fdd8ce73262c99ce9f218d Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 00:07:25 +0800
+Subject: [PATCH 11/26] Make the LiveHime dock a resizable top/bottom split
+
+The account and go-live section sits above a draggable splitter and only
+takes the height of its visible page (the stacked widget no longer
+reserves the QR page's height); the live-room features below take the
+remaining space. The splitter position is saved in the plugin config.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/src/account-panel.cpp | 10 +++++
+ plugins/livehime/src/livehime-dock.cpp | 53 ++++++++++++++++++++++++--
+ plugins/livehime/src/livehime-dock.hpp |  5 +++
+ 3 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index 5e9fed138..b8b6b2156 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -75,6 +75,16 @@ AccountPanel::AccountPanel(StreamController *stream, QWidget *parent)
+ 	auto *layout = new QVBoxLayout(this);
+ 	layout->setContentsMargins(0, 0, 0, 0);
+ 	layout->addWidget(pages_);
++	/* A stacked widget reserves the height of its tallest page (the QR
++	 * code). Let only the visible page count so the section stays compact. */
++	connect(pages_, &QStackedWidget::currentChanged, this, [this](int index) {
++		for (int i = 0; i < pages_->count(); ++i)
++			pages_->widget(i)->setSizePolicy(QSizePolicy::Preferred,
++							 i == index ? QSizePolicy::Preferred : QSizePolicy::Ignored);
++		pages_->adjustSize();
++		updateGeometry();
++	});
++	pages_->setCurrentIndex(SignedOut);
+ 	pages_->setCurrentIndex(Verifying);
+ 
+ 	connect(stream_, &StreamController::stateChanged, this, &AccountPanel::onStreamStateChanged);
+diff --git a/plugins/livehime/src/livehime-dock.cpp b/plugins/livehime/src/livehime-dock.cpp
+index 37cb5cf84..2e8407504 100644
+--- a/plugins/livehime/src/livehime-dock.cpp
++++ b/plugins/livehime/src/livehime-dock.cpp
+@@ -10,8 +10,13 @@
+ #include <QLabel>
+ #include <QLineEdit>
+ #include <QPushButton>
++#include <QSplitter>
+ #include <QVBoxLayout>
+ 
++#include <obs.hpp>
++#include <util/platform.h>
++#include <util/util.hpp>
++
+ namespace {
+ QString text(const char *key)
+ {
+@@ -72,11 +77,30 @@ LiveHimeDock::LiveHimeDock(QWidget *parent) : QWidget(parent), controller_(new S
+ 	connect(account_, &AccountPanel::stateChanged, features_, &FeaturePanel::applyState);
+ 	connect(account_, &AccountPanel::eventReceived, features_, &FeaturePanel::applyEvent);
+ 
++	/* Top: account, go-live and stream status (only as tall as it needs).
++	 * Bottom: the live-room features, which get the remaining height. The
++	 * divider can be dragged; its position is remembered. */
++	auto *top = new QWidget(this);
++	auto *topLayout = new QVBoxLayout(top);
++	topLayout->setContentsMargins(0, 0, 0, 0);
++	topLayout->addWidget(account);
++	topLayout->addLayout(statusRow);
++	topLayout->addWidget(statusDetail_);
++	topLayout->addStretch(1);
++
++	splitter_ = new QSplitter(Qt::Vertical, this);
++	splitter_->setChildrenCollapsible(false);
++	splitter_->setHandleWidth(8);
++	splitter_->addWidget(top);
++	splitter_->addWidget(featureBox);
++	splitter_->setStretchFactor(0, 0);
++	splitter_->setStretchFactor(1, 1);
++	featureBox->setMinimumHeight(160);
++	restoreSplitter();
++	connect(splitter_, &QSplitter::splitterMoved, this, &LiveHimeDock::saveSplitter);
++
+ 	auto *layout = new QVBoxLayout(this);
+-	layout->addWidget(account);
+-	layout->addLayout(statusRow);
+-	layout->addWidget(statusDetail_);
+-	layout->addWidget(featureBox, 1);
++	layout->addWidget(splitter_);
+ 
+ 	connect(controller_, &StreamController::stateChanged, this, &LiveHimeDock::onStateChanged);
+ 	statsTimer_.setInterval(1000);
+@@ -141,3 +165,24 @@ void LiveHimeDock::updateStats()
+ 				.arg(s % 60, 2, 10, QLatin1Char('0'))
+ 				.arg(qRound(kbps)));
+ }
++
++void LiveHimeDock::restoreSplitter()
++{
++	BPtr<char> path = obs_module_config_path("layout.json");
++	OBSDataAutoRelease data = path ? obs_data_create_from_json_file_safe(path, "bak") : nullptr;
++	const char *state = data ? obs_data_get_string(data, "splitter") : "";
++	if (state && *state)
++		splitter_->restoreState(QByteArray::fromBase64(QByteArray(state)));
++}
++
++void LiveHimeDock::saveSplitter()
++{
++	BPtr<char> dir = obs_module_config_path("");
++	BPtr<char> path = obs_module_config_path("layout.json");
++	if (!dir || !path)
++		return;
++	os_mkdirs(dir);
++	OBSDataAutoRelease data = obs_data_create();
++	obs_data_set_string(data, "splitter", splitter_->saveState().toBase64().constData());
++	obs_data_save_json_safe(data, path, "tmp", "bak");
++}
+diff --git a/plugins/livehime/src/livehime-dock.hpp b/plugins/livehime/src/livehime-dock.hpp
+index 4757c9e00..0d4dfa1ed 100644
+--- a/plugins/livehime/src/livehime-dock.hpp
++++ b/plugins/livehime/src/livehime-dock.hpp
+@@ -9,6 +9,7 @@
+ class AccountPanel;
+ class FeaturePanel;
+ class QLabel;
++class QSplitter;
+ 
+ /* The LiveHime control dock inside the OBS main window: Bilibili account and
+  * go-live controls, stream status, and the everyday room features. */
+@@ -29,14 +30,18 @@ public:
+ private slots:
+ 	void onStateChanged(StreamController::State state);
+ 	void updateStats();
++	void saveSplitter();
+ 
+ private:
++	void restoreSplitter();
++
+ 	StreamController *controller_;
+ 	AccountPanel *account_;
+ 	FeaturePanel *features_;
+ 	QLabel *statusChip_;
+ 	QLabel *statusDetail_;
+ 	QLabel *stats_;
++	QSplitter *splitter_;
+ 	QTimer statsTimer_;
+ 	QElapsedTimer liveClock_;
+ 	uint64_t lastBytes_ = 0;

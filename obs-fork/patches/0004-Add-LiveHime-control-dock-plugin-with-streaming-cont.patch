@@ -1,0 +1,990 @@
+From b37badb75c7a855df1959e2dfcb3c6a0b8adb671 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 22:55:50 +0800
+Subject: [PATCH 04/26] Add LiveHime control dock plugin with streaming
+ controller
+
+plugins/livehime adds a "LiveHime" dock to the main window. Its
+StreamController installs a temporary rtmp_custom service per session,
+tracks OBS streaming state (including reconnects and stop codes), and
+restores the user's own service when the stream ends so a per-session
+stream key is never written to service.json. A watchdog covers start
+failures that OBS reports only through its own dialog.
+
+The plugin also registers a "livehime" obs-websocket vendor
+(GetStreamState, StartManualStream, StopStream) that drives the same code
+path as the dock; build-aux/livehime/tests/e2e-stream.mjs uses it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md         |  14 ++
+ build-aux/livehime/tests/e2e-stream.mjs    |  92 ++++++++
+ plugins/CMakeLists.txt                     |   1 +
+ plugins/livehime/CMakeLists.txt            |  27 +++
+ plugins/livehime/data/locale/en-US.ini     |  23 ++
+ plugins/livehime/data/locale/zh-CN.ini     |  23 ++
+ plugins/livehime/src/automation.cpp        |  90 ++++++++
+ plugins/livehime/src/automation.hpp        |   9 +
+ plugins/livehime/src/livehime-dock.cpp     | 172 +++++++++++++++
+ plugins/livehime/src/livehime-dock.hpp     |  50 +++++
+ plugins/livehime/src/plugin-main.cpp       |  51 +++++
+ plugins/livehime/src/stream-controller.cpp | 242 +++++++++++++++++++++
+ plugins/livehime/src/stream-controller.hpp |  67 ++++++
+ 13 files changed, 861 insertions(+)
+ create mode 100644 build-aux/livehime/tests/README.md
+ create mode 100644 build-aux/livehime/tests/e2e-stream.mjs
+ create mode 100644 plugins/livehime/CMakeLists.txt
+ create mode 100644 plugins/livehime/data/locale/en-US.ini
+ create mode 100644 plugins/livehime/data/locale/zh-CN.ini
+ create mode 100644 plugins/livehime/src/automation.cpp
+ create mode 100644 plugins/livehime/src/automation.hpp
+ create mode 100644 plugins/livehime/src/livehime-dock.cpp
+ create mode 100644 plugins/livehime/src/livehime-dock.hpp
+ create mode 100644 plugins/livehime/src/plugin-main.cpp
+ create mode 100644 plugins/livehime/src/stream-controller.cpp
+ create mode 100644 plugins/livehime/src/stream-controller.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+new file mode 100644
+index 000000000..976752e47
+--- /dev/null
++++ b/build-aux/livehime/tests/README.md
+@@ -0,0 +1,14 @@
++# LiveHime streaming end-to-end test
++
++Drives the LiveHime dock's streaming path through the `livehime`
++obs-websocket vendor and checks state, byte flow, error reporting and that
++the user's own stream service is restored.
++
++1. In LiveHime's own config (`~/Library/Application Support/LiveHime/obs-studio/
++   plugin_config/obs-websocket/config.json`) enable the server on port 4466
++   with a password, and set the profile's `service.json` to
++   `rtmp_custom` / `rtmp://user-own-server.invalid/app`.
++2. Start a local RTMP sink:
++   `ffmpeg -listen 1 -i rtmp://127.0.0.1:19350/live/test-key-123 -c copy -f flv -y /tmp/received.flv`
++3. Launch `LiveHime.app`, then run `node e2e-stream.mjs <websocket password>`
++   (Node 22+ for the built-in WebSocket).
+diff --git a/build-aux/livehime/tests/e2e-stream.mjs b/build-aux/livehime/tests/e2e-stream.mjs
+new file mode 100644
+index 000000000..2ef119c31
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-stream.mjs
+@@ -0,0 +1,92 @@
++// End-to-end check of the LiveHime dock's streaming path through the
++// "livehime" obs-websocket vendor. Usage: node e2e-stream.mjs <password>
++import { createHash } from 'node:crypto';
++
++const password = process.argv[2];
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++
++const ws = new WebSocket('ws://127.0.0.1:4466');
++let nextId = 1;
++const pending = new Map();
++const results = [];
++const check = (name, ok, info = '') => {
++  results.push({ name, ok });
++  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${info ? '  — ' + info : ''}`);
++};
++
++ws.onmessage = (ev) => {
++  const msg = JSON.parse(ev.data);
++  if (msg.op === 0) {
++    const { challenge, salt } = msg.d.authentication;
++    ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + salt) + challenge), eventSubscriptions: 0 } }));
++  } else if (msg.op === 2) {
++    run().catch((e) => { console.error(e); process.exit(2); });
++  } else if (msg.op === 7) {
++    pending.get(msg.d.requestId)?.(msg.d);
++  }
++};
++ws.onerror = (e) => { console.error('websocket error', e.message); process.exit(2); };
++
++function request(requestType, requestData = {}) {
++  const requestId = String(nextId++);
++  return new Promise((resolve) => {
++    pending.set(requestId, resolve);
++    ws.send(JSON.stringify({ op: 6, d: { requestType, requestId, requestData } }));
++  });
++}
++async function vendor(requestType, requestData = {}) {
++  const r = await request('CallVendorRequest', { vendorName: 'livehime', requestType, requestData });
++  if (!r.requestStatus.result) throw new Error(`${requestType}: ${r.requestStatus.comment}`);
++  return r.responseData.responseData;
++}
++async function waitState(want, timeoutMs) {
++  const end = Date.now() + timeoutMs;
++  let s;
++  while (Date.now() < end) {
++    s = await vendor('GetStreamState');
++    if (want.includes(s.state)) return s;
++    await sleep(250);
++  }
++  return s;
++}
++const service = async () => (await request('GetStreamServiceSettings')).responseData.streamServiceSettings;
++
++async function run() {
++  // obs-websocket answers 207 (NotReady) until OBS finishes loading.
++  for (let i = 0; i < 40 && !(await request('GetStreamServiceSettings')).requestStatus.result; i++) await sleep(500);
++  const userServer = 'rtmp://user-own-server.invalid/app';
++  check('user service loaded before test', (await service()).server === userServer);
++  check('initial state Idle', (await vendor('GetStreamState')).state === 'Idle');
++
++  const bad = await vendor('StartManualStream', { server: 'http://example.com/live', key: 'x' });
++  check('rejects non-RTMP server', bad.accepted === false && bad.state === 'Idle', bad.error);
++
++  const started = await vendor('StartManualStream', { server: 'rtmp://127.0.0.1:19350/live', key: 'test-key-123' });
++  check('start accepted', started.accepted === true && started.ownsSession === true, started.state);
++  const live = await waitState(['Live', 'Failed'], 20000);
++  check('reaches Live', live.state === 'Live', live.lastError);
++  const during = await service();
++  check('temporary service in use while live', during.server === 'rtmp://127.0.0.1:19350/live');
++  const again = await vendor('StartManualStream', { server: 'rtmp://127.0.0.1:19350/live', key: 'k' });
++  check('second start rejected while live', again.accepted === false, again.error);
++  await sleep(4000);
++  const bytes = (await vendor('GetStreamState')).totalBytes;
++  check('bytes flowing', bytes > 50000, `${bytes} bytes`);
++
++  await vendor('StopStream');
++  const stopped = await waitState(['Idle', 'Failed'], 15000);
++  check('stops cleanly to Idle', stopped.state === 'Idle', stopped.lastError);
++  check('user service restored after stop', (await service()).server === userServer);
++
++  const refused = await vendor('StartManualStream', { server: 'rtmp://127.0.0.1:19351/live', key: 'nobody-listening' });
++  check('start accepted (unreachable server)', refused.accepted === true);
++  const failed = await waitState(['Failed', 'Idle'], 30000);
++  check('unreachable server ends in Failed with reason', failed.state === 'Failed' && failed.lastError.length > 0, failed.lastError.replace(/\n/g, ' | '));
++  check('user service restored after failure', (await service()).server === userServer);
++
++  const passed = results.filter((r) => r.ok).length;
++  console.log(`\n${passed}/${results.length} checks passed`);
++  ws.close();
++  process.exit(passed === results.length ? 0 : 1);
++}
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 1bea2e4ff..47c44c83a 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -59,6 +59,7 @@ add_obs_plugin(
+     WITH_MESSAGE
+ )
+ add_obs_plugin(image-source)
++add_obs_plugin(livehime PLATFORMS MACOS)
+ add_obs_plugin(linux-alsa PLATFORMS LINUX FREEBSD OPENBSD)
+ add_obs_plugin(linux-capture PLATFORMS LINUX FREEBSD OPENBSD)
+ add_obs_plugin(linux-jack PLATFORMS LINUX FREEBSD OPENBSD)
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+new file mode 100644
+index 000000000..3b84db969
+--- /dev/null
++++ b/plugins/livehime/CMakeLists.txt
+@@ -0,0 +1,27 @@
++cmake_minimum_required(VERSION 3.28...3.30)
++
++find_package(Qt6 REQUIRED Widgets)
++
++add_library(livehime MODULE)
++add_library(OBS::livehime ALIAS livehime)
++
++target_sources(
++  livehime
++  PRIVATE
++    src/automation.cpp
++    src/automation.hpp
++    src/livehime-dock.cpp
++    src/livehime-dock.hpp
++    src/plugin-main.cpp
++    src/stream-controller.cpp
++    src/stream-controller.hpp
++)
++
++target_compile_options(livehime PRIVATE $<$<PLATFORM_ID:Darwin>:-Wno-quoted-include-in-framework-header>)
++
++# Header-only vendor API; resolved at runtime through obs-websocket's proc handler.
++target_include_directories(livehime PRIVATE "${CMAKE_SOURCE_DIR}/plugins/obs-websocket/lib")
++
++target_link_libraries(livehime PRIVATE OBS::frontend-api OBS::libobs Qt::Widgets)
++
++set_target_properties_obs(livehime PROPERTIES FOLDER plugins/livehime PREFIX "" AUTOMOC ON)
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+new file mode 100644
+index 000000000..40d75f2a0
+--- /dev/null
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -0,0 +1,23 @@
++LiveHime.DockTitle="LiveHime"
++LiveHime.State.Idle="Offline"
++LiveHime.State.Starting="Connecting"
++LiveHime.State.Live="Live"
++LiveHime.State.Reconnecting="Reconnecting"
++LiveHime.State.Stopping="Stopping"
++LiveHime.State.Failed="Failed"
++LiveHime.Stream.ManualGroup="Stream test (manual endpoint)"
++LiveHime.Stream.ManualHint="For checking the streaming pipeline. Your own stream settings are restored when this stream stops."
++LiveHime.Stream.Server="Server"
++LiveHime.Stream.Key="Stream key"
++LiveHime.Stream.Start="Start streaming"
++LiveHime.Stream.Stop="Stop streaming"
++LiveHime.Error.BadServer="The server address must start with rtmp:// or rtmps://."
++LiveHime.Error.AlreadyStreaming="A stream is already active. Stop it first."
++LiveHime.Error.StartFailed="Streaming could not start. Check the message shown by the stream output."
++LiveHime.Error.BadPath="Invalid server address."
++LiveHime.Error.ConnectFailed="Could not connect to the server."
++LiveHime.Error.InvalidStream="The server rejected the stream key."
++LiveHime.Error.Disconnected="Disconnected from the server."
++LiveHime.Error.Unsupported="The encoder settings are not supported by this server."
++LiveHime.Error.Encode="The encoder failed."
++LiveHime.Error.Generic="Streaming stopped because of an error."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+new file mode 100644
+index 000000000..5778c6568
+--- /dev/null
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -0,0 +1,23 @@
++LiveHime.DockTitle="直播姬"
++LiveHime.State.Idle="未开播"
++LiveHime.State.Starting="连接中"
++LiveHime.State.Live="直播中"
++LiveHime.State.Reconnecting="重连中"
++LiveHime.State.Stopping="正在停止"
++LiveHime.State.Failed="推流失败"
++LiveHime.Stream.ManualGroup="推流测试（手动地址）"
++LiveHime.Stream.ManualHint="用于检查推流链路。停止推流后会恢复你原来的推流设置。"
++LiveHime.Stream.Server="服务器"
++LiveHime.Stream.Key="推流码"
++LiveHime.Stream.Start="开始推流"
++LiveHime.Stream.Stop="停止推流"
++LiveHime.Error.BadServer="服务器地址必须以 rtmp:// 或 rtmps:// 开头。"
++LiveHime.Error.AlreadyStreaming="已有推流在进行，请先停止。"
++LiveHime.Error.StartFailed="推流未能开始，请查看推流输出给出的提示。"
++LiveHime.Error.BadPath="服务器地址无效。"
++LiveHime.Error.ConnectFailed="无法连接到服务器。"
++LiveHime.Error.InvalidStream="服务器拒绝了推流码。"
++LiveHime.Error.Disconnected="与服务器的连接已断开。"
++LiveHime.Error.Unsupported="该服务器不支持当前编码设置。"
++LiveHime.Error.Encode="编码器出错。"
++LiveHime.Error.Generic="推流因错误停止。"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+new file mode 100644
+index 000000000..94a7841f0
+--- /dev/null
++++ b/plugins/livehime/src/automation.cpp
+@@ -0,0 +1,90 @@
++#include "automation.hpp"
++#include "livehime-dock.hpp"
++
++#include <obs-module.h>
++#include <obs-websocket-api.h>
++
++#include <QMetaEnum>
++#include <QMetaObject>
++#include <QPointer>
++
++namespace {
++obs_websocket_vendor vendor = nullptr;
++QPointer<LiveHimeDock> target;
++
++/* Vendor requests arrive on the websocket thread; run them on the UI thread. */
++template<typename Fn> bool onUiThread(Fn &&fn)
++{
++	LiveHimeDock *dock = target.data();
++	if (!dock)
++		return false;
++	QMetaObject::invokeMethod(dock, std::forward<Fn>(fn), Qt::BlockingQueuedConnection);
++	return true;
++}
++
++void writeState(obs_data_t *response, LiveHimeDock *dock)
++{
++	StreamController *controller = dock->controller();
++	const char *name = QMetaEnum::fromType<StreamController::State>().valueToKey(
++		static_cast<int>(controller->state()));
++	obs_data_set_string(response, "state", name ? name : "Unknown");
++	obs_data_set_bool(response, "ownsSession", controller->ownsSession());
++	obs_data_set_string(response, "lastError", controller->lastError().toUtf8().constData());
++	obs_data_set_int(response, "totalBytes", static_cast<long long>(controller->totalBytes()));
++}
++
++void getStreamState(obs_data_t *, obs_data_t *response, void *)
++{
++	if (!onUiThread([response] { writeState(response, target.data()); }))
++		obs_data_set_string(response, "error", "dock unavailable");
++}
++
++void startManualStream(obs_data_t *request, obs_data_t *response, void *)
++{
++	const QString server = QString::fromUtf8(obs_data_get_string(request, "server"));
++	const QString key = QString::fromUtf8(obs_data_get_string(request, "key"));
++	const bool ran = onUiThread([&] {
++		QString error;
++		const bool ok = target->startManual(server, key, &error);
++		obs_data_set_bool(response, "accepted", ok);
++		if (!ok)
++			obs_data_set_string(response, "error", error.toUtf8().constData());
++		writeState(response, target.data());
++	});
++	if (!ran)
++		obs_data_set_string(response, "error", "dock unavailable");
++}
++
++void stopStream(obs_data_t *, obs_data_t *response, void *)
++{
++	if (!onUiThread([response] {
++		    target->stopStream();
++		    writeState(response, target.data());
++	    }))
++		obs_data_set_string(response, "error", "dock unavailable");
++}
++} // namespace
++
++void RegisterAutomation(LiveHimeDock *dock)
++{
++	target = dock;
++	vendor = obs_websocket_register_vendor("livehime");
++	if (!vendor) {
++		blog(LOG_INFO, "[livehime] obs-websocket not available; automation disabled");
++		return;
++	}
++	obs_websocket_vendor_register_request(vendor, "GetStreamState", getStreamState, nullptr);
++	obs_websocket_vendor_register_request(vendor, "StartManualStream", startManualStream, nullptr);
++	obs_websocket_vendor_register_request(vendor, "StopStream", stopStream, nullptr);
++}
++
++void UnregisterAutomation()
++{
++	if (vendor) {
++		obs_websocket_vendor_unregister_request(vendor, "GetStreamState");
++		obs_websocket_vendor_unregister_request(vendor, "StartManualStream");
++		obs_websocket_vendor_unregister_request(vendor, "StopStream");
++		vendor = nullptr;
++	}
++	target.clear();
++}
+diff --git a/plugins/livehime/src/automation.hpp b/plugins/livehime/src/automation.hpp
+new file mode 100644
+index 000000000..2d73e9e3a
+--- /dev/null
++++ b/plugins/livehime/src/automation.hpp
+@@ -0,0 +1,9 @@
++#pragma once
++
++class LiveHimeDock;
++
++/* Registers the "livehime" obs-websocket vendor so tests and future local
++ * tools can drive the same code paths as the dock. obs-websocket keeps its
++ * own authentication; nothing here opens a new listener. */
++void RegisterAutomation(LiveHimeDock *dock);
++void UnregisterAutomation();
+diff --git a/plugins/livehime/src/livehime-dock.cpp b/plugins/livehime/src/livehime-dock.cpp
+new file mode 100644
+index 000000000..87f34ea01
+--- /dev/null
++++ b/plugins/livehime/src/livehime-dock.cpp
+@@ -0,0 +1,172 @@
++#include "livehime-dock.hpp"
++
++#include <obs-module.h>
++
++#include <QFormLayout>
++#include <QGroupBox>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QLineEdit>
++#include <QPushButton>
++#include <QVBoxLayout>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++
++struct ChipStyle {
++	const char *label;
++	const char *color;
++};
++
++ChipStyle chipStyle(StreamController::State state)
++{
++	using State = StreamController::State;
++	switch (state) {
++	case State::Starting:
++		return {"LiveHime.State.Starting", "#7b80d8"};
++	case State::Live:
++		return {"LiveHime.State.Live", "#fb4d5a"};
++	case State::Reconnecting:
++		return {"LiveHime.State.Reconnecting", "#e0a040"};
++	case State::Stopping:
++		return {"LiveHime.State.Stopping", "#7b80d8"};
++	case State::Failed:
++		return {"LiveHime.State.Failed", "#b36269"};
++	case State::Idle:
++	default:
++		return {"LiveHime.State.Idle", "#5c616b"};
++	}
++}
++} // namespace
++
++LiveHimeDock::LiveHimeDock(QWidget *parent) : QWidget(parent), controller_(new StreamController(this))
++{
++	setObjectName(QStringLiteral("LiveHimeDock"));
++
++	statusChip_ = new QLabel(this);
++	statusChip_->setAlignment(Qt::AlignCenter);
++	statusDetail_ = new QLabel(this);
++	statusDetail_->setWordWrap(true);
++	statusDetail_->setTextInteractionFlags(Qt::TextSelectableByMouse);
++	stats_ = new QLabel(this);
++	stats_->setStyleSheet(QStringLiteral("font-family: Menlo, monospace; color: #9aa0ab;"));
++
++	auto *statusRow = new QHBoxLayout;
++	statusRow->addWidget(statusChip_);
++	statusRow->addWidget(stats_, 1);
++
++	server_ = new QLineEdit(this);
++	server_->setPlaceholderText(QStringLiteral("rtmp://"));
++	key_ = new QLineEdit(this);
++	key_->setEchoMode(QLineEdit::Password);
++	start_ = new QPushButton(text("LiveHime.Stream.Start"), this);
++	stop_ = new QPushButton(text("LiveHime.Stream.Stop"), this);
++
++	auto *form = new QFormLayout;
++	form->addRow(text("LiveHime.Stream.Server"), server_);
++	form->addRow(text("LiveHime.Stream.Key"), key_);
++	auto *buttons = new QHBoxLayout;
++	buttons->addWidget(start_);
++	buttons->addWidget(stop_);
++
++	auto *manual = new QGroupBox(text("LiveHime.Stream.ManualGroup"), this);
++	auto *manualLayout = new QVBoxLayout(manual);
++	manualLayout->addLayout(form);
++	manualLayout->addLayout(buttons);
++	auto *hint = new QLabel(text("LiveHime.Stream.ManualHint"), manual);
++	hint->setWordWrap(true);
++	hint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++	manualLayout->addWidget(hint);
++
++	auto *layout = new QVBoxLayout(this);
++	layout->addLayout(statusRow);
++	layout->addWidget(statusDetail_);
++	layout->addWidget(manual);
++	layout->addStretch(1);
++
++	connect(start_, &QPushButton::clicked, this, &LiveHimeDock::onStartClicked);
++	connect(stop_, &QPushButton::clicked, this, &LiveHimeDock::onStopClicked);
++	connect(controller_, &StreamController::stateChanged, this, &LiveHimeDock::onStateChanged);
++	statsTimer_.setInterval(1000);
++	connect(&statsTimer_, &QTimer::timeout, this, &LiveHimeDock::updateStats);
++
++	onStateChanged(controller_->state());
++}
++
++void LiveHimeDock::onStartClicked()
++{
++	QString error;
++	if (!startManual(server_->text(), key_->text(), &error))
++		statusDetail_->setText(error);
++}
++
++bool LiveHimeDock::startManual(const QString &server, const QString &key, QString *error)
++{
++	const QString trimmed = server.trimmed();
++	server_->setText(trimmed);
++	key_->setText(key);
++	if (!trimmed.startsWith(QStringLiteral("rtmp://"), Qt::CaseInsensitive) &&
++	    !trimmed.startsWith(QStringLiteral("rtmps://"), Qt::CaseInsensitive)) {
++		*error = text("LiveHime.Error.BadServer");
++		return false;
++	}
++	if (!controller_->start(trimmed, key)) {
++		*error = controller_->lastError();
++		return false;
++	}
++	return true;
++}
++
++void LiveHimeDock::onStopClicked()
++{
++	controller_->stop();
++}
++
++void LiveHimeDock::onStateChanged(StreamController::State state)
++{
++	using State = StreamController::State;
++	const ChipStyle style = chipStyle(state);
++	statusChip_->setText(text(style.label));
++	statusChip_->setStyleSheet(
++		QStringLiteral("QLabel { background: %1; color: white; border-radius: 9px; padding: 2px 10px; }")
++			.arg(QString::fromLatin1(style.color)));
++
++	const bool busy = state == State::Starting || state == State::Live || state == State::Reconnecting ||
++			  state == State::Stopping;
++	start_->setEnabled(!busy);
++	stop_->setEnabled(state == State::Live || state == State::Reconnecting || state == State::Starting);
++	server_->setEnabled(!busy);
++	key_->setEnabled(!busy);
++
++	statusDetail_->setText(state == State::Failed ? controller_->lastError() : QString());
++
++	if (state == State::Live && !statsTimer_.isActive()) {
++		liveClock_.start();
++		lastBytes_ = controller_->totalBytes();
++		lastStatsMs_ = 0;
++		statsTimer_.start();
++		updateStats();
++	} else if (!busy) {
++		statsTimer_.stop();
++		stats_->clear();
++	}
++}
++
++void LiveHimeDock::updateStats()
++{
++	const qint64 ms = liveClock_.elapsed();
++	const uint64_t bytes = controller_->totalBytes();
++	const qint64 dt = ms - lastStatsMs_;
++	const double kbps = dt > 0 && bytes >= lastBytes_ ? double(bytes - lastBytes_) * 8.0 / double(dt) : 0.0;
++	lastBytes_ = bytes;
++	lastStatsMs_ = ms;
++	const qint64 s = ms / 1000;
++	stats_->setText(QStringLiteral("%1:%2:%3  %4 kb/s")
++				.arg(s / 3600, 2, 10, QLatin1Char('0'))
++				.arg((s / 60) % 60, 2, 10, QLatin1Char('0'))
++				.arg(s % 60, 2, 10, QLatin1Char('0'))
++				.arg(qRound(kbps)));
++}
+diff --git a/plugins/livehime/src/livehime-dock.hpp b/plugins/livehime/src/livehime-dock.hpp
+new file mode 100644
+index 000000000..1815fda25
+--- /dev/null
++++ b/plugins/livehime/src/livehime-dock.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++
++#include "stream-controller.hpp"
++
++#include <QElapsedTimer>
++#include <QTimer>
++#include <QWidget>
++
++class QLabel;
++class QLineEdit;
++class QPushButton;
++
++/* The LiveHime control dock inside the OBS main window.
++ *
++ * This first version exposes the streaming pipeline with a manually entered
++ * RTMP endpoint; the Bilibili login and room flow will drive the same
++ * StreamController later. */
++class LiveHimeDock : public QWidget {
++	Q_OBJECT
++
++public:
++	explicit LiveHimeDock(QWidget *parent = nullptr);
++
++	StreamController *controller() { return controller_; }
++
++	/* Same path as the dock's buttons; used by the automation interface.
++	 * Returns false with a localized reason when the request is rejected. */
++	bool startManual(const QString &server, const QString &key, QString *error);
++	void stopStream() { onStopClicked(); }
++
++private slots:
++	void onStartClicked();
++	void onStopClicked();
++	void onStateChanged(StreamController::State state);
++	void updateStats();
++
++private:
++	StreamController *controller_;
++	QLabel *statusChip_;
++	QLabel *statusDetail_;
++	QLabel *stats_;
++	QLineEdit *server_;
++	QLineEdit *key_;
++	QPushButton *start_;
++	QPushButton *stop_;
++	QTimer statsTimer_;
++	QElapsedTimer liveClock_;
++	uint64_t lastBytes_ = 0;
++	qint64 lastStatsMs_ = 0;
++};
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+new file mode 100644
+index 000000000..2dea26a5c
+--- /dev/null
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -0,0 +1,51 @@
++#include "automation.hpp"
++#include "livehime-dock.hpp"
++
++#include <obs-frontend-api.h>
++#include <obs-module.h>
++
++#include <QMainWindow>
++#include <QPointer>
++
++OBS_DECLARE_MODULE()
++OBS_MODULE_USE_DEFAULT_LOCALE("livehime", "en-US")
++
++MODULE_EXPORT const char *obs_module_description(void)
++{
++	return "LiveHime: Bilibili live room control for OBS";
++}
++
++namespace {
++QPointer<LiveHimeDock> dock;
++
++void onFrontendEvent(enum obs_frontend_event event, void *)
++{
++	if (dock)
++		dock->controller()->handleFrontendEvent(event);
++}
++} // namespace
++
++bool obs_module_load(void)
++{
++	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
++	dock = new LiveHimeDock(mainWindow);
++	if (!obs_frontend_add_dock_by_id("livehime-control", obs_module_text("LiveHime.DockTitle"), dock)) {
++		blog(LOG_ERROR, "[livehime] failed to add control dock");
++		delete dock;
++		return false;
++	}
++	obs_frontend_add_event_callback(onFrontendEvent, nullptr);
++	blog(LOG_INFO, "[livehime] control dock loaded");
++	return true;
++}
++
++void obs_module_post_load(void)
++{
++	RegisterAutomation(dock);
++}
++
++void obs_module_unload(void)
++{
++	UnregisterAutomation();
++	obs_frontend_remove_event_callback(onFrontendEvent, nullptr);
++}
+diff --git a/plugins/livehime/src/stream-controller.cpp b/plugins/livehime/src/stream-controller.cpp
+new file mode 100644
+index 000000000..1690422b7
+--- /dev/null
++++ b/plugins/livehime/src/stream-controller.cpp
+@@ -0,0 +1,242 @@
++#include "stream-controller.hpp"
++
++#include <obs-frontend-api.h>
++#include <obs-module.h>
++
++#include <QMetaObject>
++
++namespace {
++const char *stopCodeText(int code)
++{
++	switch (code) {
++	case OBS_OUTPUT_BAD_PATH:
++		return "LiveHime.Error.BadPath";
++	case OBS_OUTPUT_CONNECT_FAILED:
++		return "LiveHime.Error.ConnectFailed";
++	case OBS_OUTPUT_INVALID_STREAM:
++		return "LiveHime.Error.InvalidStream";
++	case OBS_OUTPUT_DISCONNECTED:
++		return "LiveHime.Error.Disconnected";
++	case OBS_OUTPUT_UNSUPPORTED:
++		return "LiveHime.Error.Unsupported";
++	case OBS_OUTPUT_ENCODE_ERROR:
++		return "LiveHime.Error.Encode";
++	default:
++		return "LiveHime.Error.Generic";
++	}
++}
++
++constexpr qint64 kSetupTimeoutMs = 5000;    // STARTING must follow a local rtmp_custom setup quickly
++constexpr qint64 kConnectTimeoutMs = 45000; // longer than the RTMP connect timeout
++} // namespace
++
++StreamController::StreamController(QObject *parent) : QObject(parent)
++{
++	startWatchdog_.setInterval(500);
++	connect(&startWatchdog_, &QTimer::timeout, this, &StreamController::checkStartProgress);
++}
++
++StreamController::~StreamController()
++{
++	disconnectOutputSignals();
++	/* The frontend is shutting down; leave the user's service in place. */
++	if (previousService_) {
++		obs_frontend_set_streaming_service(previousService_);
++		obs_service_release(previousService_);
++		previousService_ = nullptr;
++	}
++}
++
++uint64_t StreamController::totalBytes() const
++{
++	return output_ ? obs_output_get_total_bytes(output_) : 0;
++}
++
++bool StreamController::start(const QString &server, const QString &key)
++{
++	if (obs_frontend_streaming_active() || state_ == State::Starting || state_ == State::Stopping) {
++		lastError_ = QString::fromUtf8(obs_module_text("LiveHime.Error.AlreadyStreaming"));
++		return false;
++	}
++
++	OBSDataAutoRelease settings = obs_data_create();
++	obs_data_set_string(settings, "server", server.trimmed().toUtf8().constData());
++	obs_data_set_string(settings, "key", key.trimmed().toUtf8().constData());
++	obs_data_set_bool(settings, "use_auth", false);
++	OBSServiceAutoRelease session = obs_service_create_private("rtmp_custom", "livehime_session", settings);
++	if (!session) {
++		lastError_ = QString::fromUtf8(obs_module_text("LiveHime.Error.Generic"));
++		setState(State::Failed);
++		return false;
++	}
++
++	if (!previousService_)
++		previousService_ = obs_service_get_ref(obs_frontend_get_streaming_service());
++	obs_frontend_set_streaming_service(session);
++
++	lastError_.clear();
++	sawStarting_ = false;
++	setState(State::Starting);
++	startClock_.start();
++	startWatchdog_.start();
++	obs_frontend_streaming_start();
++	return true;
++}
++
++void StreamController::stop()
++{
++	if (!obs_frontend_streaming_active())
++		return;
++	setState(State::Stopping);
++	obs_frontend_streaming_stop();
++}
++
++void StreamController::handleFrontendEvent(int event)
++{
++	switch (event) {
++	case OBS_FRONTEND_EVENT_STREAMING_STARTING:
++		sawStarting_ = true;
++		connectOutputSignals();
++		if (state_ != State::Starting) {
++			lastError_.clear();
++			setState(State::Starting);
++		}
++		break;
++	case OBS_FRONTEND_EVENT_STREAMING_STARTED:
++		connectOutputSignals();
++		setState(State::Live);
++		break;
++	case OBS_FRONTEND_EVENT_STREAMING_STOPPING:
++		setState(State::Stopping);
++		break;
++	case OBS_FRONTEND_EVENT_STREAMING_STOPPED:
++		/* The output's "stop" signal carries the code. Its queued handler
++		 * is posted before this event is delivered, so queue the fallback
++		 * behind it instead of briefly reporting Idle for a failed stream. */
++		QMetaObject::invokeMethod(
++			this,
++			[this] {
++				if (state_ != State::Idle && state_ != State::Failed)
++					onOutputStopped(OBS_OUTPUT_SUCCESS, QString());
++			},
++			Qt::QueuedConnection);
++		break;
++	case OBS_FRONTEND_EVENT_EXIT:
++		disconnectOutputSignals();
++		break;
++	default:
++		break;
++	}
++}
++
++void StreamController::checkStartProgress()
++{
++	if (state_ != State::Starting) {
++		startWatchdog_.stop();
++		return;
++	}
++	const qint64 elapsed = startClock_.elapsed();
++	if ((!sawStarting_ && elapsed > kSetupTimeoutMs) ||
++	    (elapsed > kConnectTimeoutMs && !obs_frontend_streaming_active()))
++		failStart();
++}
++
++void StreamController::failStart()
++{
++	startWatchdog_.stop();
++	disconnectOutputSignals();
++	restorePreviousService();
++	lastError_ = QString::fromUtf8(obs_module_text("LiveHime.Error.StartFailed"));
++	setState(State::Failed);
++}
++
++void StreamController::setState(State state)
++{
++	if (state != State::Starting)
++		startWatchdog_.stop();
++	if (state_ == state)
++		return;
++	state_ = state;
++	blog(LOG_INFO, "[livehime] stream state -> %d", static_cast<int>(state));
++	emit stateChanged(state);
++}
++
++void StreamController::connectOutputSignals()
++{
++	obs_output_t *output = obs_frontend_get_streaming_output();
++	if (output == output_) {
++		obs_output_release(output);
++		return;
++	}
++	disconnectOutputSignals();
++	output_ = output;
++	if (!output_)
++		return;
++	signal_handler_t *sh = obs_output_get_signal_handler(output_);
++	signal_handler_connect(sh, "reconnect", onReconnect, this);
++	signal_handler_connect(sh, "reconnect_success", onReconnectSuccess, this);
++	signal_handler_connect(sh, "stop", onStop, this);
++}
++
++void StreamController::disconnectOutputSignals()
++{
++	if (!output_)
++		return;
++	signal_handler_t *sh = obs_output_get_signal_handler(output_);
++	signal_handler_disconnect(sh, "reconnect", onReconnect, this);
++	signal_handler_disconnect(sh, "reconnect_success", onReconnectSuccess, this);
++	signal_handler_disconnect(sh, "stop", onStop, this);
++	obs_output_release(output_);
++	output_ = nullptr;
++}
++
++void StreamController::restorePreviousService()
++{
++	if (!previousService_)
++		return;
++	obs_frontend_set_streaming_service(previousService_);
++	obs_service_release(previousService_);
++	previousService_ = nullptr;
++}
++
++void StreamController::onOutputStopped(int code, const QString &detail)
++{
++	disconnectOutputSignals();
++	restorePreviousService();
++
++	if (code == OBS_OUTPUT_SUCCESS) {
++		lastError_.clear();
++		setState(State::Idle);
++		return;
++	}
++	lastError_ = QString::fromUtf8(obs_module_text(stopCodeText(code)));
++	if (!detail.isEmpty())
++		lastError_ += QStringLiteral("\n") + detail;
++	/* Failed is sticky until the next start so the reason stays visible. */
++	state_ = State::Idle;
++	setState(State::Failed);
++}
++
++/* Output signals arrive on libobs threads; hop to the UI thread. */
++void StreamController::onReconnect(void *data, calldata_t *)
++{
++	auto *self = static_cast<StreamController *>(data);
++	QMetaObject::invokeMethod(self, [self] { self->setState(State::Reconnecting); }, Qt::QueuedConnection);
++}
++
++void StreamController::onReconnectSuccess(void *data, calldata_t *)
++{
++	auto *self = static_cast<StreamController *>(data);
++	QMetaObject::invokeMethod(self, [self] { self->setState(State::Live); }, Qt::QueuedConnection);
++}
++
++void StreamController::onStop(void *data, calldata_t *cd)
++{
++	auto *self = static_cast<StreamController *>(data);
++	int code = static_cast<int>(calldata_int(cd, "code"));
++	obs_output_t *output = static_cast<obs_output_t *>(calldata_ptr(cd, "output"));
++	const char *error = output ? obs_output_get_last_error(output) : nullptr;
++	QString detail = error ? QString::fromUtf8(error) : QString();
++	QMetaObject::invokeMethod(self, [self, code, detail] { self->onOutputStopped(code, detail); },
++				  Qt::QueuedConnection);
++}
+diff --git a/plugins/livehime/src/stream-controller.hpp b/plugins/livehime/src/stream-controller.hpp
+new file mode 100644
+index 000000000..ea45049d4
+--- /dev/null
++++ b/plugins/livehime/src/stream-controller.hpp
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include <obs.hpp>
++
++#include <QElapsedTimer>
++#include <QObject>
++#include <QString>
++#include <QTimer>
++
++/* Owns the streaming side of a LiveHime session.
++ *
++ * The controller swaps in a temporary rtmp_custom service for a session and
++ * restores the user's own service once the output stops, so a per-session
++ * Bilibili stream key never ends up in the profile's service.json. It also
++ * mirrors OBS's streaming state, including streams started from OBS's own
++ * controls. All methods and signals run on the Qt UI thread. */
++class StreamController : public QObject {
++	Q_OBJECT
++
++public:
++	enum class State { Idle, Starting, Live, Reconnecting, Stopping, Failed };
++	Q_ENUM(State)
++
++	explicit StreamController(QObject *parent = nullptr);
++	~StreamController() override;
++
++	State state() const { return state_; }
++	/* True when the running stream uses a service this controller installed. */
++	bool ownsSession() const { return previousService_ != nullptr; }
++	/* Localized description of the last failure; empty unless state is Failed. */
++	QString lastError() const { return lastError_; }
++	uint64_t totalBytes() const;
++
++	/* Installs server/key as a temporary service and starts streaming.
++	 * Returns false (with lastError set) if a stream is already active. */
++	bool start(const QString &server, const QString &key);
++	void stop();
++
++	/* Called from the frontend event callback. */
++	void handleFrontendEvent(int event);
++
++signals:
++	void stateChanged(StreamController::State state);
++
++private:
++	void setState(State state);
++	void connectOutputSignals();
++	void disconnectOutputSignals();
++	void restorePreviousService();
++	void onOutputStopped(int code, const QString &detail);
++	void checkStartProgress();
++	void failStart();
++
++	static void onReconnect(void *data, calldata_t *cd);
++	static void onReconnectSuccess(void *data, calldata_t *cd);
++	static void onStop(void *data, calldata_t *cd);
++
++	State state_ = State::Idle;
++	QString lastError_;
++	obs_service_t *previousService_ = nullptr;
++	/* OBS reports some start failures only through its own error dialog,
++	 * without a STOPPED event; the watchdog keeps us from hanging in Starting. */
++	QTimer startWatchdog_;
++	QElapsedTimer startClock_;
++	bool sawStarting_ = false;
++	obs_output_t *output_ = nullptr; /* strong ref while signals are connected */
++};

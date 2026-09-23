@@ -1,0 +1,583 @@
+From 6abf4580ee6cb62cc83a12e1fa895266bd5f2276 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 00:44:04 +0800
+Subject: [PATCH 17/26] Add a "LiveHime danmaku" overlay source
+
+A native OBS source that shows the latest room messages (chat, gifts,
+Super Chats, guard purchases) on the canvas without a browser source.
+Each overlay wraps a private FreeType text source; a UI-thread hub feeds
+room events to all overlays and prunes expired lines twice a second.
+Settings: font (Hiragino Sans GB by default, which FreeType can load from
+/System/Library/Fonts), color, outline, shadow, lines, lifetime, width,
+and which message kinds to show. The box size is fixed so layouts do not
+jump. The font is copied field by field because settings merges drop
+default-only objects.
+
+An InjectOverlayEvent automation request (overlays only, nothing reaches
+Bilibili) backs e2e-overlay.mjs, which renders into a temporary scene.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/e2e-overlay.mjs |  71 ++++++
+ plugins/livehime/CMakeLists.txt          |   2 +
+ plugins/livehime/data/locale/en-US.ini   |  12 +
+ plugins/livehime/data/locale/zh-CN.ini   |  12 +
+ plugins/livehime/src/automation.cpp      |  18 ++
+ plugins/livehime/src/danmaku-overlay.cpp | 282 +++++++++++++++++++++++
+ plugins/livehime/src/danmaku-overlay.hpp |  41 ++++
+ plugins/livehime/src/plugin-main.cpp     |   7 +
+ 8 files changed, 445 insertions(+)
+ create mode 100644 build-aux/livehime/tests/e2e-overlay.mjs
+ create mode 100644 plugins/livehime/src/danmaku-overlay.cpp
+ create mode 100644 plugins/livehime/src/danmaku-overlay.hpp
+
+diff --git a/build-aux/livehime/tests/e2e-overlay.mjs b/build-aux/livehime/tests/e2e-overlay.mjs
+new file mode 100644
+index 000000000..eef54fe06
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-overlay.mjs
+@@ -0,0 +1,71 @@
++// Checks the "LiveHime danmaku" overlay source renders injected messages.
++// Works in a temporary scene that is removed afterwards.
++import { createHash } from 'node:crypto';
++import { writeFileSync } from 'node:fs';
++import zlib from 'node:zlib';
++
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const ws = new WebSocket('ws://127.0.0.1:4466');
++let id = 1;
++const pend = new Map();
++const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: t, requestData: d })).responseData?.responseData;
++let fails = 0;
++const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
++
++// Minimal PNG decode (8-bit RGBA, non-interlaced) to count visible pixels.
++function visiblePixels(png) {
++  let o = 8, w = 0, h = 0; const idat = [];
++  while (o < png.length) {
++    const len = png.readUInt32BE(o), type = png.toString('ascii', o + 4, o + 8), data = png.subarray(o + 8, o + 8 + len);
++    if (type === 'IHDR') { w = data.readUInt32BE(0); h = data.readUInt32BE(4); if (data[8] !== 8 || data[9] !== 6) return { w, h, count: -1 }; }
++    if (type === 'IDAT') idat.push(data);
++    o += 12 + len;
++  }
++  const raw = zlib.inflateSync(Buffer.concat(idat)), stride = w * 4; let prev = Buffer.alloc(stride), count = 0;
++  for (let y = 0; y < h; y++) {
++    const f = raw[y * (stride + 1)], line = Buffer.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
++    for (let x = 0; x < stride; x++) {
++      const a = x >= 4 ? line[x - 4] : 0, b = prev[x], c = x >= 4 ? prev[x - 4] : 0;
++      const p = f === 1 ? a : f === 2 ? b : f === 3 ? (a + b) >> 1 : f === 4 ? (() => { const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c); return pa <= pb && pa <= pc ? a : pb <= pc ? b : c; })() : 0;
++      line[x] = (line[x] + p) & 255;
++    }
++    for (let x = 3; x < stride; x += 4) if (line[x] > 128) count++;
++    prev = line;
++  }
++  return { w, h, count };
++}
++
++async function shot(name) {
++  const r = await req('GetSourceScreenshot', { sourceName: name, imageFormat: 'png' });
++  const png = Buffer.from(r.responseData.imageData.split(',')[1], 'base64');
++  return { png, ...visiblePixels(png) };
++}
++
++ws.onmessage = async (ev) => {
++  const m = JSON.parse(ev.data);
++  if (m.op === 0) { const { challenge, salt } = m.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(process.argv[2] + salt) + challenge), eventSubscriptions: 0 } })); }
++  else if (m.op === 7) pend.get(m.d.requestId)?.(m.d);
++  else if (m.op === 2) {
++    for (let i = 0; i < 40 && !(await req('GetVersion')).requestStatus.result; i++) await sleep(500);
++    const scene = 'livehime-e2e', input = 'livehime-e2e-danmaku';
++    await req('CreateScene', { sceneName: scene });
++    const created = await req('CreateInput', { sceneName: scene, inputName: input, inputKind: 'livehime_danmaku_overlay', inputSettings: { lifetime: 0 } });
++    check('overlay source can be created', created.requestStatus.result, created.requestStatus.comment);
++    await sleep(800);
++    const empty = await shot(input);
++    check('empty overlay renders nothing', empty.count === 0, `${empty.w}x${empty.h}, ${empty.count} px`);
++    for (const [user, text] of [['观众A', '主播好！'], ['观众B', '这个画面好清楚'], ['观众C', 'hello LiveHime']])
++      await vendor('InjectOverlayEvent', { kind: 'chat', user, text });
++    await vendor('InjectOverlayEvent', { kind: 'gift', user: '观众D', name: '小心心', count: 3 });
++    await sleep(1200);
++    const full = await shot(input);
++    writeFileSync(process.argv[3] || '/tmp/overlay.png', full.png);
++    check('injected messages are drawn', full.count > 500, `${full.w}x${full.h}, ${full.count} px`);
++    await req('RemoveScene', { sceneName: scene });
++    const gone = await req('GetSceneList');
++    check('temporary scene removed', !gone.responseData.scenes.some((s) => s.sceneName === scene));
++    console.log(fails ? `${fails} failed` : 'all passed'); process.exit(fails ? 1 : 0);
++  }
++};
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 18cf70be1..1799c99d5 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -26,6 +26,8 @@ target_sources(
+     src/account-panel.hpp
+     src/automation.cpp
+     src/automation.hpp
++    src/danmaku-overlay.cpp
++    src/danmaku-overlay.hpp
+     src/feature-panel.cpp
+     src/feature-panel.hpp
+     src/livehime-dock.cpp
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 0ffc06781..4966aa1df 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -92,3 +92,15 @@ LiveHime.Feature.LiveStarted="The room went live."
+ LiveHime.Feature.LiveEnded="The room went offline."
+ LiveHime.Feature.Cover="Cover"
+ LiveHime.Feature.ManageCover="Manage cover..."
++LiveHime.Overlay.Name="LiveHime danmaku"
++LiveHime.Overlay.Font="Font"
++LiveHime.Overlay.Color="Color"
++LiveHime.Overlay.Outline="Outline"
++LiveHime.Overlay.Shadow="Drop shadow"
++LiveHime.Overlay.Lines="Lines"
++LiveHime.Overlay.Lifetime="Keep messages for"
++LiveHime.Overlay.LifetimeHint="0 keeps messages until newer ones replace them."
++LiveHime.Overlay.Width="Width"
++LiveHime.Overlay.ShowGifts="Show gifts"
++LiveHime.Overlay.ShowSuperChats="Show Super Chats"
++LiveHime.Overlay.ShowGuards="Show guard purchases"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 7a7c1e485..5aa560824 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -92,3 +92,15 @@ LiveHime.Feature.LiveStarted="直播间已开播。"
+ LiveHime.Feature.LiveEnded="直播间已下播。"
+ LiveHime.Feature.Cover="封面"
+ LiveHime.Feature.ManageCover="管理封面…"
++LiveHime.Overlay.Name="直播姬弹幕"
++LiveHime.Overlay.Font="字体"
++LiveHime.Overlay.Color="颜色"
++LiveHime.Overlay.Outline="描边"
++LiveHime.Overlay.Shadow="阴影"
++LiveHime.Overlay.Lines="行数"
++LiveHime.Overlay.Lifetime="停留时间"
++LiveHime.Overlay.LifetimeHint="设为 0 时，弹幕一直保留，直到被新弹幕顶掉。"
++LiveHime.Overlay.Width="宽度"
++LiveHime.Overlay.ShowGifts="显示礼物"
++LiveHime.Overlay.ShowSuperChats="显示醒目留言"
++LiveHime.Overlay.ShowGuards="显示上舰"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 667644ff6..7a3ddb390 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -1,5 +1,6 @@
+ #include "automation.hpp"
+ #include "account-panel.hpp"
++#include "danmaku-overlay.hpp"
+ #include "livehime-dock.hpp"
+ 
+ #include <livehime-core.h>
+@@ -105,6 +106,21 @@ void getBrandingState(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
++/* Test hook: feeds a room event ({"kind","user","text",...}) to the danmaku
++ * overlays only. Nothing is sent to Bilibili. */
++void injectOverlayEvent(obs_data_t *request, obs_data_t *response, void *)
++{
++	const char *json = obs_data_get_json(request);
++	const QJsonObject event = QJsonDocument::fromJson(QByteArray(json)).object();
++	const bool ran = onUiThread([&] {
++		QJsonObject room = event;
++		room.insert("event", "room");
++		if (DanmakuOverlayHub *hub = DanmakuOverlayHub::instance())
++			hub->push(room);
++	});
++	obs_data_set_bool(response, "accepted", ran);
++}
++
+ void startQRLogin(obs_data_t *, obs_data_t *, void *)
+ {
+ 	onUiThread([] { livehime_core_start_qr_login(); });
+@@ -129,6 +145,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "StopStream", stopStream, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "GetAccountState", getAccountState, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "GetBrandingState", getBrandingState, nullptr);
++	obs_websocket_vendor_register_request(vendor, "InjectOverlayEvent", injectOverlayEvent, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "StartQRLogin", startQRLogin, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "CancelQRLogin", cancelQRLogin, nullptr);
+ }
+@@ -141,6 +158,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "StopStream");
+ 		obs_websocket_vendor_unregister_request(vendor, "GetAccountState");
+ 		obs_websocket_vendor_unregister_request(vendor, "GetBrandingState");
++		obs_websocket_vendor_unregister_request(vendor, "InjectOverlayEvent");
+ 		obs_websocket_vendor_unregister_request(vendor, "StartQRLogin");
+ 		obs_websocket_vendor_unregister_request(vendor, "CancelQRLogin");
+ 		vendor = nullptr;
+diff --git a/plugins/livehime/src/danmaku-overlay.cpp b/plugins/livehime/src/danmaku-overlay.cpp
+new file mode 100644
+index 000000000..9730d6058
+--- /dev/null
++++ b/plugins/livehime/src/danmaku-overlay.cpp
+@@ -0,0 +1,282 @@
++#include "danmaku-overlay.hpp"
++
++#include <obs-module.h>
++#include <obs.hpp>
++
++#include <QDateTime>
++#include <QStringList>
++
++#include <atomic>
++#include <deque>
++
++namespace {
++constexpr int kDefaultLines = 8;
++constexpr int kDefaultLifetime = 30;
++constexpr int kDefaultWidth = 700;
++constexpr int kDefaultFontSize = 36;
++/* FreeType finds fonts on disk; PingFang lives in a system asset store it
++ * cannot see, while Hiragino Sans GB ships in /System/Library/Fonts. */
++constexpr const char *kDefaultFace = "Hiragino Sans GB";
++
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++} // namespace
++
++struct DanmakuOverlay {
++	obs_source_t *self = nullptr;
++	obs_source_t *label = nullptr; /* private text_ft2_source_v2 */
++
++	std::atomic<int> width{kDefaultWidth};
++	std::atomic<int> height{kDefaultLines * kDefaultFontSize * 4 / 3};
++
++	/* Touched on the UI thread only (hub push/refresh). */
++	int maxLines = kDefaultLines;
++	int lifetimeSeconds = kDefaultLifetime;
++	bool showGifts = true;
++	bool showSuperChats = true;
++	bool showGuards = true;
++	struct Line {
++		QString text;
++		qint64 postedMs;
++	};
++	std::deque<Line> lines;
++	QString shown;
++};
++
++DanmakuOverlayHub *DanmakuOverlayHub::instance_ = nullptr;
++
++DanmakuOverlayHub::DanmakuOverlayHub()
++{
++	timer_.setInterval(500);
++	connect(&timer_, &QTimer::timeout, this, &DanmakuOverlayHub::refresh);
++	timer_.start();
++}
++
++void DanmakuOverlayHub::create()
++{
++	if (!instance_)
++		instance_ = new DanmakuOverlayHub();
++}
++
++void DanmakuOverlayHub::destroy()
++{
++	delete instance_;
++	instance_ = nullptr;
++}
++
++void DanmakuOverlayHub::add(DanmakuOverlay *overlay)
++{
++	std::lock_guard lock(mutex_);
++	overlays_.insert(overlay);
++}
++
++void DanmakuOverlayHub::remove(DanmakuOverlay *overlay)
++{
++	std::lock_guard lock(mutex_);
++	overlays_.erase(overlay);
++}
++
++void DanmakuOverlayHub::push(const QJsonObject &event)
++{
++	if (event.value("event").toString() != "room")
++		return;
++	const QString kind = event.value("kind").toString();
++	const QString user = event.value("user").toString();
++	QString line;
++	if (kind == "chat")
++		line = user + QStringLiteral("：") + event.value("text").toString();
++	else if (kind == "gift")
++		line = text("LiveHime.Feature.Gift").arg(user, event.value("name").toString()).arg(event.value("count").toInt());
++	else if (kind == "superChat")
++		line = text("LiveHime.Feature.SuperChat")
++			       .arg(event.value("price").toInt())
++			       .arg(user, event.value("text").toString());
++	else if (kind == "guard")
++		line = text("LiveHime.Feature.Guard").arg(user, event.value("name").toString());
++	else
++		return;
++
++	const qint64 now = QDateTime::currentMSecsSinceEpoch();
++	std::lock_guard lock(mutex_);
++	for (DanmakuOverlay *overlay : overlays_) {
++		if ((kind == "gift" && !overlay->showGifts) || (kind == "superChat" && !overlay->showSuperChats) ||
++		    (kind == "guard" && !overlay->showGuards))
++			continue;
++		overlay->lines.push_back({line, now});
++		while (static_cast<int>(overlay->lines.size()) > overlay->maxLines)
++			overlay->lines.pop_front();
++	}
++}
++
++void DanmakuOverlayHub::refresh()
++{
++	const qint64 now = QDateTime::currentMSecsSinceEpoch();
++	std::lock_guard lock(mutex_);
++	for (DanmakuOverlay *overlay : overlays_) {
++		if (overlay->lifetimeSeconds > 0) {
++			while (!overlay->lines.empty() && now - overlay->lines.front().postedMs > overlay->lifetimeSeconds * 1000LL)
++				overlay->lines.pop_front();
++		}
++		QStringList rows;
++		for (const auto &line : overlay->lines)
++			rows << line.text;
++		const QString joined = rows.join(QStringLiteral("\n"));
++		if (joined == overlay->shown)
++			continue;
++		overlay->shown = joined;
++		OBSDataAutoRelease update = obs_data_create();
++		/* An empty string would fall back to the text source's placeholder. */
++		obs_data_set_string(update, "text", joined.isEmpty() ? " " : joined.toUtf8().constData());
++		obs_source_update(overlay->label, update);
++	}
++}
++
++/* ---- obs_source_info ---- */
++
++namespace {
++const char *overlayName(void *)
++{
++	return obs_module_text("LiveHime.Overlay.Name");
++}
++
++void overlayUpdate(void *data, obs_data_t *settings)
++{
++	auto *overlay = static_cast<DanmakuOverlay *>(data);
++	OBSDataAutoRelease font = obs_data_get_obj(settings, "font");
++	const int fontSize = font ? static_cast<int>(obs_data_get_int(font, "size")) : kDefaultFontSize;
++	const int lines = static_cast<int>(obs_data_get_int(settings, "lines"));
++	const int width = static_cast<int>(obs_data_get_int(settings, "width"));
++	overlay->width = width;
++	overlay->height = lines * (fontSize > 0 ? fontSize : kDefaultFontSize) * 4 / 3;
++
++	if (DanmakuOverlayHub *hub = DanmakuOverlayHub::instance()) {
++		hub->remove(overlay);
++		overlay->maxLines = lines;
++		overlay->lifetimeSeconds = static_cast<int>(obs_data_get_int(settings, "lifetime"));
++		overlay->showGifts = obs_data_get_bool(settings, "show_gifts");
++		overlay->showSuperChats = obs_data_get_bool(settings, "show_super_chats");
++		overlay->showGuards = obs_data_get_bool(settings, "show_guards");
++		while (static_cast<int>(overlay->lines.size()) > overlay->maxLines)
++			overlay->lines.pop_front();
++		hub->add(overlay);
++	}
++
++	OBSDataAutoRelease label = obs_data_create();
++	/* Copy the font explicitly: settings merges keep only set values, so
++	 * passing an object that holds defaults would reach the text source
++	 * as an empty font. */
++	OBSDataAutoRelease labelFont = obs_data_create();
++	obs_data_set_string(labelFont, "face", font ? obs_data_get_string(font, "face") : kDefaultFace);
++	obs_data_set_string(labelFont, "style", font ? obs_data_get_string(font, "style") : "");
++	obs_data_set_int(labelFont, "size", fontSize > 0 ? fontSize : kDefaultFontSize);
++	obs_data_set_int(labelFont, "flags", font ? obs_data_get_int(font, "flags") : 0);
++	obs_data_set_obj(label, "font", labelFont);
++	const long long color = obs_data_get_int(settings, "color");
++	obs_data_set_int(label, "color1", color);
++	obs_data_set_int(label, "color2", color);
++	obs_data_set_bool(label, "outline", obs_data_get_bool(settings, "outline"));
++	obs_data_set_bool(label, "drop_shadow", obs_data_get_bool(settings, "drop_shadow"));
++	obs_data_set_bool(label, "word_wrap", true);
++	obs_data_set_int(label, "custom_width", width);
++	obs_source_update(overlay->label, label);
++}
++
++void *overlayCreate(obs_data_t *settings, obs_source_t *source)
++{
++	auto *overlay = new DanmakuOverlay();
++	overlay->self = source;
++	OBSDataAutoRelease label = obs_data_create();
++	obs_data_set_string(label, "text", " ");
++	overlay->label = obs_source_create_private("text_ft2_source_v2", "livehime-danmaku-text", label);
++	if (!overlay->label) {
++		delete overlay;
++		return nullptr;
++	}
++	overlayUpdate(overlay, settings);
++	return overlay;
++}
++
++void overlayDestroy(void *data)
++{
++	auto *overlay = static_cast<DanmakuOverlay *>(data);
++	if (DanmakuOverlayHub *hub = DanmakuOverlayHub::instance())
++		hub->remove(overlay);
++	obs_source_release(overlay->label);
++	delete overlay;
++}
++
++uint32_t overlayWidth(void *data)
++{
++	return static_cast<uint32_t>(static_cast<DanmakuOverlay *>(data)->width.load());
++}
++
++uint32_t overlayHeight(void *data)
++{
++	return static_cast<uint32_t>(static_cast<DanmakuOverlay *>(data)->height.load());
++}
++
++void overlayRender(void *data, gs_effect_t *)
++{
++	obs_source_video_render(static_cast<DanmakuOverlay *>(data)->label);
++}
++
++void overlayDefaults(obs_data_t *settings)
++{
++	OBSDataAutoRelease font = obs_data_create();
++	obs_data_set_default_string(font, "face", kDefaultFace);
++	obs_data_set_default_int(font, "size", kDefaultFontSize);
++	obs_data_set_default_int(font, "flags", 0);
++	obs_data_set_default_string(font, "style", "W3");
++	obs_data_set_default_obj(settings, "font", font);
++	obs_data_set_default_int(settings, "lines", kDefaultLines);
++	obs_data_set_default_int(settings, "lifetime", kDefaultLifetime);
++	obs_data_set_default_int(settings, "width", kDefaultWidth);
++	obs_data_set_default_int(settings, "color", 0xFFFFFFFF);
++	obs_data_set_default_bool(settings, "outline", true);
++	obs_data_set_default_bool(settings, "drop_shadow", false);
++	obs_data_set_default_bool(settings, "show_gifts", true);
++	obs_data_set_default_bool(settings, "show_super_chats", true);
++	obs_data_set_default_bool(settings, "show_guards", true);
++}
++
++obs_properties_t *overlayProperties(void *)
++{
++	obs_properties_t *props = obs_properties_create();
++	obs_properties_add_font(props, "font", obs_module_text("LiveHime.Overlay.Font"));
++	obs_properties_add_color_alpha(props, "color", obs_module_text("LiveHime.Overlay.Color"));
++	obs_properties_add_bool(props, "outline", obs_module_text("LiveHime.Overlay.Outline"));
++	obs_properties_add_bool(props, "drop_shadow", obs_module_text("LiveHime.Overlay.Shadow"));
++	obs_properties_add_int_slider(props, "lines", obs_module_text("LiveHime.Overlay.Lines"), 1, 30, 1);
++	obs_property_t *lifetime =
++		obs_properties_add_int(props, "lifetime", obs_module_text("LiveHime.Overlay.Lifetime"), 0, 3600, 5);
++	obs_property_int_set_suffix(lifetime, " s");
++	obs_property_set_long_description(lifetime, obs_module_text("LiveHime.Overlay.LifetimeHint"));
++	obs_property_t *width = obs_properties_add_int(props, "width", obs_module_text("LiveHime.Overlay.Width"), 100, 3840, 10);
++	obs_property_int_set_suffix(width, " px");
++	obs_properties_add_bool(props, "show_gifts", obs_module_text("LiveHime.Overlay.ShowGifts"));
++	obs_properties_add_bool(props, "show_super_chats", obs_module_text("LiveHime.Overlay.ShowSuperChats"));
++	obs_properties_add_bool(props, "show_guards", obs_module_text("LiveHime.Overlay.ShowGuards"));
++	return props;
++}
++} // namespace
++
++void RegisterDanmakuOverlaySource()
++{
++	obs_source_info info = {};
++	info.id = "livehime_danmaku_overlay";
++	info.type = OBS_SOURCE_TYPE_INPUT;
++	info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW;
++	info.icon_type = OBS_ICON_TYPE_TEXT;
++	info.get_name = overlayName;
++	info.create = overlayCreate;
++	info.destroy = overlayDestroy;
++	info.update = overlayUpdate;
++	info.get_width = overlayWidth;
++	info.get_height = overlayHeight;
++	info.video_render = overlayRender;
++	info.get_defaults = overlayDefaults;
++	info.get_properties = overlayProperties;
++	obs_register_source(&info);
++}
+diff --git a/plugins/livehime/src/danmaku-overlay.hpp b/plugins/livehime/src/danmaku-overlay.hpp
+new file mode 100644
+index 000000000..152f4898c
+--- /dev/null
++++ b/plugins/livehime/src/danmaku-overlay.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include <QJsonObject>
++#include <QObject>
++#include <QTimer>
++
++#include <mutex>
++#include <set>
++
++struct DanmakuOverlay;
++
++/* "LiveHime danmaku" OBS source: shows the latest room messages (chat,
++ * gifts, Super Chats, guards) on the canvas. Each source wraps a private
++ * FreeType text source that does the drawing; this hub receives room events
++ * on the UI thread and refreshes every overlay twice a second, dropping
++ * messages older than the source's lifetime. */
++class DanmakuOverlayHub : public QObject {
++	Q_OBJECT
++
++public:
++	static void create();
++	static void destroy();
++	static DanmakuOverlayHub *instance() { return instance_; }
++
++	void add(DanmakuOverlay *overlay);
++	void remove(DanmakuOverlay *overlay);
++
++public slots:
++	void push(const QJsonObject &event);
++
++private:
++	DanmakuOverlayHub();
++	void refresh();
++
++	static DanmakuOverlayHub *instance_;
++	std::mutex mutex_;
++	std::set<DanmakuOverlay *> overlays_;
++	QTimer timer_;
++};
++
++void RegisterDanmakuOverlaySource();
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index fa3d77397..81f01ebb6 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -1,5 +1,6 @@
+ #include "account-panel.hpp"
+ #include "automation.hpp"
++#include "danmaku-overlay.hpp"
+ #include "livehime-dock.hpp"
+ 
+ #include <obs-frontend-api.h>
+@@ -83,6 +84,9 @@ void onFrontendEvent(enum obs_frontend_event event, void *)
+ 
+ bool obs_module_load(void)
+ {
++	DanmakuOverlayHub::create();
++	RegisterDanmakuOverlaySource();
++
+ 	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+ 	dock = new LiveHimeDock(mainWindow);
+ 	if (!obs_frontend_add_dock_by_id("livehime-control", obs_module_text("LiveHime.DockTitle"), dock)) {
+@@ -90,6 +94,8 @@ bool obs_module_load(void)
+ 		delete dock;
+ 		return false;
+ 	}
++	QObject::connect(dock->account(), &AccountPanel::eventReceived, DanmakuOverlayHub::instance(),
++			 &DanmakuOverlayHub::push);
+ 	obs_frontend_add_event_callback(onFrontendEvent, nullptr);
+ 	blog(LOG_INFO, "[livehime] control dock loaded");
+ 	return true;
+@@ -104,4 +110,5 @@ void obs_module_unload(void)
+ {
+ 	UnregisterAutomation();
+ 	obs_frontend_remove_event_callback(onFrontendEvent, nullptr);
++	DanmakuOverlayHub::destroy();
+ }

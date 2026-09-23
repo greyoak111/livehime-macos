@@ -1,5 +1,28 @@
 # 升级 LiveHime macOS
 
+## 从 v0.1.x 升级到 v0.2.0
+
+v0.2.0 把应用整个换成了带直播姬面板的 OBS，但保留了同一个应用身份：
+`CFBundleIdentifier` 仍是 `local.livehime.macos`，应用名仍是 `LiveHimeMacApp.app`，登录信息
+仍存在钥匙串项 `local.livehime.macos.session` 里。
+
+1. 先结束直播，退出 LiveHime 和 v0.1.x 内置的 OBS。
+2. 打开 `LiveHimeMacApp-v0.2.0-arm64.dmg`，把 LiveHime 拖到“应用程序”，选择“替换”。
+3. 打开应用。如果被系统拦下，到 系统设置 → 隐私与安全性，点“仍要打开”。
+
+升级后需要注意：
+
+- **登录：** 通常会自动沿用。如果 v0.1.x 只保存了部分凭据，面板会提示“旧版本的登录信息无法沿用”，
+  重新扫码登录即可。
+- **权限：** 应用的可执行文件变了，macOS 会重新询问屏幕录制、麦克风和摄像头权限。
+- **场景：** v0.2.0 的 OBS 配置放在 `~/Library/Application Support/LiveHime/obs-studio`。
+  v0.1.x 内置 OBS 用的是普通 OBS 的配置目录（`~/Library/Application Support/obs-studio`），
+  所以原来的场景不会自动出现。需要的话，在 v0.2.0 里用 场景集合 → 导入，选择
+  `~/Library/Application Support/obs-studio/basic/scenes/` 里的 `.json` 文件。
+- **回滚：** 替换前把旧的 `LiveHimeMacApp.app` 拷一份到别处，就可以换回去；两个版本不要同时运行。
+
+## v0.1.x 之间的升级（历史）
+
 从 `v0.1.0` 或 `v0.1.1` 升级到 `v0.1.2` 不需要重新登录，也不需要导出账号数据。这些正式版本保持同一个
 `CFBundleIdentifier`（`local.livehime.macos`）和同一个 Keychain service（
 `local.livehime.macos.session`）。因此替换 `/Applications/LiveHimeMacApp.app` 时，macOS

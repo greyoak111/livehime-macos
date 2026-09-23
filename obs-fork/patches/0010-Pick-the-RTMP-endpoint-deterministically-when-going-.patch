@@ -1,0 +1,238 @@
+From 5c2cb84c81bb2a5a99c4c8973244597dce374daf Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 23:55:40 +0800
+Subject: [PATCH 10/26] Pick the RTMP endpoint deterministically when going
+ live
+
+startLive can list several protocols. The endpoint parser inherited from
+v0.1.2 took whichever nested dictionary value it met first; Swift
+dictionary order is random per run, so when that was the SRT entry the
+room opened but going live failed with a generic server error. Prefer
+data.rtmp and protocols[rtmp], then collect candidates in sorted key order
+and take the first rtmp/rtmps one. If the room opened without a usable
+endpoint, fall back to GetUpStreamRtmp. Server-kind errors now show their
+technical reason in the dock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../LiveHimeCore/BilibiliLiveClient.swift     | 43 ++++++++++++++-----
+ .../core/Sources/LiveHimeCore/CBridge.swift   |  2 +
+ .../LiveHimeCore/SessionCoordinator.swift     | 18 +++++++-
+ .../DanmakuProtocolTests.swift                | 37 ++++++++++++++++
+ .../SessionCoordinatorTests.swift             | 14 ++++++
+ plugins/livehime/src/account-panel.cpp        | 11 ++---
+ 6 files changed, 107 insertions(+), 18 deletions(-)
+
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+index b452453ed..fbb871f55 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliLiveClient.swift
+@@ -309,20 +309,41 @@ public struct BilibiliLiveClient: Sendable {
+         return try parseStreamConfig(root)
+     }
+ 
++    /// Picks the RTMP endpoint from a startLive/GetUpStreamRtmp payload.
++    /// The payload can list several protocols (for example rtmp and srt), so
++    /// look at the known RTMP locations first, then collect every candidate
++    /// in a stable order and take the first rtmp/rtmps one. Dictionary
++    /// iteration order is random, so "first match wins" must never decide.
+     private static func parseStreamConfig(_ root: [String: Any]) throws -> BilibiliStreamConfig {
+-        func scan(_ value: Any?) -> (String, String)? {
++        func pair(_ d: [String: Any]) -> (String, String)? {
++            let a = d["addr"] as? String ?? d["server"] as? String ?? d["rtmp_addr"] as? String
++            let k = d["code"] as? String ?? d["key"] as? String ?? d["stream_code"] as? String
++            guard let a, let k, !a.isEmpty, !k.isEmpty else { return nil }
++            return (a, k)
++        }
++        func collect(_ value: Any?, into out: inout [(String, String)]) {
+             if let d = value as? [String: Any] {
+-                let a = d["addr"] as? String ?? d["server"] as? String ?? d["rtmp_addr"] as? String
+-                let k = d["code"] as? String ?? d["key"] as? String ?? d["stream_code"] as? String
+-                if let a, let k, !a.isEmpty, !k.isEmpty { return (a, k) }
+-                for v in d.values { if let x = scan(v) { return x } }
+-            } else if let a = value as? [Any] { for v in a { if let x = scan(v) { return x } } }
+-            return nil
++                if let p = pair(d) { out.append(p) }
++                for key in d.keys.sorted() { collect(d[key], into: &out) }
++            } else if let a = value as? [Any] {
++                for v in a { collect(v, into: &out) }
++            }
++        }
++        func usable(_ p: (String, String)) -> BilibiliStreamConfig? {
++            guard let url = URL(string: p.0), ["rtmp", "rtmps"].contains(url.scheme?.lowercased() ?? ""),
++                  let host = url.host, !host.isEmpty else { return nil }
++            return BilibiliStreamConfig(server: url, key: p.1)
++        }
++        let data = root["data"] as? [String: Any] ?? [:]
++        var candidates: [(String, String)] = []
++        if let rtmp = data["rtmp"] as? [String: Any], let p = pair(rtmp) { candidates.append(p) }
++        for entry in data["protocols"] as? [[String: Any]] ?? []
++        where (entry["protocol"] as? String)?.lowercased() == "rtmp" {
++            if let p = pair(entry) { candidates.append(p) }
+         }
+-        guard let pair = scan(root["data"]), let server = URL(string: pair.0),
+-              ["rtmp", "rtmps"].contains(server.scheme?.lowercased() ?? ""),
+-              let host = server.host, !host.isEmpty else { throw BilibiliLiveError.missingStreamConfig }
+-        return BilibiliStreamConfig(server: server, key: pair.1)
++        collect(root["data"], into: &candidates)
++        for candidate in candidates { if let config = usable(candidate) { return config } }
++        throw BilibiliLiveError.missingStreamConfig
+     }
+ 
+     private func parseStreamConfig(_ root: [String: Any], stage: BilibiliDiagnosticStage) throws -> BilibiliStreamConfig {
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index 6fc657c2b..6b071aabf 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -188,6 +188,8 @@ extension CoreBridge {
+             return ["kind": "http", "code": status]
+         case SessionCoordinator.LiveError.notReady:
+             return ["kind": "notReady"]
++        case BilibiliLiveError.missingStreamConfig:
++            return ["kind": "server", "message": "missingStreamConfig"]
+         default:
+             return ["kind": SessionCoordinator.notice(for: error) == .network ? "network" : "server",
+                     "message": "\(error)"]
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+index 7fcfb3790..aa04726f1 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -41,6 +41,7 @@ public protocol BilibiliAccountAPI: Sendable {
+     func areas(cookieHeader: String) async throws -> [BilibiliLiveArea]
+     func startLive(roomID: Int64, area: BilibiliLiveArea, cookieHeader: String) async throws -> BilibiliStreamConfig
+     func stopLive(roomID: Int64, cookieHeader: String) async throws
++    func upstream(roomID: Int64, cookieHeader: String) async throws -> BilibiliStreamConfig
+     func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws
+     func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws
+ }
+@@ -131,8 +132,17 @@ public final class SessionCoordinator {
+     /// record is refreshed afterwards so the dock shows Bilibili's view.
+     public func startLive(area: BilibiliLiveArea) async throws -> BilibiliStreamConfig {
+         let (saved, account) = try readyAccount()
+-        let endpoint = try await guarded {
+-            try await self.api.startLive(roomID: account.room.roomID, area: area, cookieHeader: saved.cookieHeader)
++        let endpoint: BilibiliStreamConfig
++        do {
++            endpoint = try await guarded {
++                try await self.api.startLive(roomID: account.room.roomID, area: area, cookieHeader: saved.cookieHeader)
++            }
++        } catch BilibiliLiveError.missingStreamConfig {
++            // startLive succeeded (the room is open) but its payload had no
++            // usable RTMP endpoint; ask for the upstream address directly.
++            endpoint = try await guarded {
++                try await self.api.upstream(roomID: account.room.roomID, cookieHeader: saved.cookieHeader)
++            }
+         }
+         await refreshRoom()
+         return endpoint
+@@ -338,6 +348,10 @@ public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
+         try await live(cookieHeader).stopLive(roomID: roomID, cookieHeader: cookieHeader)
+     }
+ 
++    public func upstream(roomID: Int64, cookieHeader: String) async throws -> BilibiliStreamConfig {
++        try await live(cookieHeader).fetchUpstream(roomID: roomID)
++    }
++
+     public func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws {
+         try await live(cookieHeader).sendDanmaku(roomID: roomID, text: text, cookieHeader: cookieHeader)
+     }
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+index 1512972b6..ea70c85a6 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+@@ -66,3 +66,40 @@ final class DanmakuProtocolTests: XCTestCase {
+         XCTAssertEqual(items.last, URLQueryItem(name: "w_rid", value: "6a7b397a3b98a73cebbca7b826767240"))
+     }
+ }
++
++/// Regression: startLive payloads can list several protocols. The parser once
++/// took whichever dictionary value it met first (random order) and failed
++/// whenever that happened to be the SRT entry.
++final class StreamConfigParsingTests: XCTestCase {
++    private func payload(_ data: [String: Any]) -> Data {
++        try! JSONSerialization.data(withJSONObject: ["code": 0, "data": data])
++    }
++
++    func testPrefersRTMPWhenSRTIsAlsoListed() throws {
++        let data: [String: Any] = [
++            "change": 1,
++            "a_srt": ["addr": "srt://live-push.example:1937", "code": "srtkey"],
++            "protocols": [["protocol": "srt", "addr": "srt://live-push.example:1937", "code": "srtkey"],
++                          ["protocol": "rtmp", "addr": "rtmp://live-push.example/live-bvc/", "code": "?streamname=k"]],
++            "z_other": ["addr": "https://example.com", "code": "x"]
++        ]
++        for _ in 0..<50 {
++            let config = try BilibiliLiveClient.parseStreamConfig(from: payload(data))
++            XCTAssertEqual(config.address, "rtmp://live-push.example/live-bvc/")
++            XCTAssertEqual(config.key, "?streamname=k")
++        }
++    }
++
++    func testRTMPObjectWins() throws {
++        let data: [String: Any] = ["rtmp": ["addr": "rtmp://a.example/live/", "code": "k1"],
++                                   "srt": ["addr": "srt://b.example", "code": "k2"]]
++        XCTAssertEqual(try BilibiliLiveClient.parseStreamConfig(from: payload(data)).key, "k1")
++    }
++
++    func testOnlyNonRTMPIsMissing() {
++        let data: [String: Any] = ["srt": ["addr": "srt://b.example", "code": "k2"]]
++        XCTAssertThrowsError(try BilibiliLiveClient.parseStreamConfig(from: payload(data))) {
++            XCTAssertEqual($0 as? BilibiliLiveError, .missingStreamConfig)
++        }
++    }
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+index a5b9aebce..cf26863cd 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -31,6 +31,11 @@ private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
+     var liveRoom = fixtureRoom
+     var startResult: Result<BilibiliStreamConfig, Error> = .success(BilibiliStreamConfig(address: "rtmp://live-push.example/live-bvc/", code: "?streamname=k"))
+     var stopCalls = 0
++    var upstreamCalls = 0
++    func upstream(roomID: Int64, cookieHeader: String) async throws -> BilibiliStreamConfig {
++        upstreamCalls += 1
++        return BilibiliStreamConfig(address: "rtmp://upstream.example/live-bvc/", code: "?streamname=u")
++    }
+     var startedAreas: [Int64] = []
+     func roomInfo(roomID: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo { liveRoom }
+     func areas(cookieHeader: String) async throws -> [BilibiliLiveArea] {
+@@ -200,6 +205,15 @@ final class LiveRoomTests: XCTestCase {
+         XCTAssertEqual(api.stopCalls, 1)
+     }
+ 
++    func testMissingEndpointFallsBackToUpstream() async throws {
++        let api = StubAPI()
++        api.startResult = .failure(BilibiliLiveError.missingStreamConfig)
++        let c = await readyCoordinator(api)
++        let endpoint = try await c.startLive(area: BilibiliLiveArea(areaID: 7, name: ""))
++        XCTAssertEqual(endpoint.address, "rtmp://upstream.example/live-bvc/")
++        XCTAssertEqual(api.upstreamCalls, 1)
++    }
++
+     func testFaceAuthErrorKeepsSessionReady() async {
+         let api = StubAPI()
+         api.startResult = .failure(BilibiliLiveError.faceAuthRequired(voucher: "v"))
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index 034087bee..5e9fed138 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -42,12 +42,13 @@ QString errorText(const QJsonObject &error)
+ {
+ 	const QString kind = error.value("kind").toString();
+ 	QString message = keyedText("LiveHime.Live.Error.", kind);
+-	if (kind == "api" || kind == "http") {
++	if (kind == "api" || kind == "http")
+ 		message = message.arg(error.value("code").toInt());
+-		const QString detail = error.value("message").toString();
+-		if (!detail.isEmpty())
+-			message += QStringLiteral("\n") + detail;
+-	}
++	/* Bilibili's own message, or a technical reason such as
++	 * missingStreamConfig, so failures can be diagnosed from a screenshot. */
++	const QString detail = error.value("message").toString();
++	if (!detail.isEmpty() && (kind == "api" || kind == "http" || kind == "server"))
++		message += QStringLiteral("\n") + detail;
+ 	return message.isEmpty() ? text("LiveHime.Live.Error.server") : message;
+ }
+ 

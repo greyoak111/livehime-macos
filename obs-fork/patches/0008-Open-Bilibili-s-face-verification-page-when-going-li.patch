@@ -1,0 +1,241 @@
+From 27a0a6de83b3a418f44662488b8706af649cd678 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 23:26:09 +0800
+Subject: [PATCH 08/26] Open Bilibili's face verification page when going live
+ requires it
+
+When startLive answers with a face-verification requirement, the dock
+opens Bilibili's own pre-live verification page (the entry point v0.1.2
+and the Windows client use) in a window whose WebKit store is
+non-persistent and seeded with the current session cookies. "Verified,
+retry" retries Go live. Only whether a voucher was present is logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugins/livehime/CMakeLists.txt               |   2 +
+ .../Sources/LiveHimeCore/FaceAuthWindow.swift | 132 ++++++++++++++++++
+ plugins/livehime/core/include/livehime-core.h |   5 +
+ plugins/livehime/data/locale/en-US.ini        |   1 +
+ plugins/livehime/data/locale/zh-CN.ini        |   1 +
+ plugins/livehime/src/account-panel.cpp        |  15 +-
+ 6 files changed, 155 insertions(+), 1 deletion(-)
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/FaceAuthWindow.swift
+
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 9ab68af91..37a7b09ec 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -14,6 +14,7 @@ target_sources(
+     core/Sources/LiveHimeCore/CBridge.swift
+     core/Sources/LiveHimeCore/CredentialStore.swift
+     core/Sources/LiveHimeCore/Diagnostics.swift
++    core/Sources/LiveHimeCore/FaceAuthWindow.swift
+     core/Sources/LiveHimeCore/PlatformSupport.swift
+     core/Sources/LiveHimeCore/QRLogin.swift
+     core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -44,6 +45,7 @@ target_link_libraries(
+     OBS::frontend-api
+     OBS::libobs
+     Qt::Widgets
++    "$<LINK_LIBRARY:FRAMEWORK,AppKit.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,CoreImage.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,Security.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,WebKit.framework>"
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/FaceAuthWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/FaceAuthWindow.swift
+new file mode 100644
+index 000000000..fc26371a8
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/FaceAuthWindow.swift
+@@ -0,0 +1,132 @@
++import AppKit
++import WebKit
++
++/// Hosts Bilibili's own pre-live verification page (the same entry point the
++/// Windows client and v0.1.2 use). The page hands `v_voucher` to Bilibili's
++/// risk SDK, which shows the face-verification QR code or other checks.
++///
++/// The page needs the logged-in session, so the current cookies are copied
++/// into a non-persistent WebKit store that disappears with the window. The
++/// app never completes or bypasses the verification itself.
++@MainActor
++final class FaceAuthWindowController: NSObject, NSWindowDelegate, WKNavigationDelegate {
++    private static var current: FaceAuthWindowController?
++
++    private let window: NSWindow
++    private let webView: WKWebView
++    private let status: NSTextField
++    private let onRetry: () -> Void
++
++    static func present(voucher: String?, credentials: SessionCredentials, onRetry: @escaping () -> Void) {
++        if let current {
++            current.window.makeKeyAndOrderFront(nil)
++            return
++        }
++        let controller = FaceAuthWindowController(onRetry: onRetry)
++        current = controller
++        controller.load(voucher: voucher, credentials: credentials)
++    }
++
++    static var pageURLBase: URLComponents {
++        var components = URLComponents(string: "https://live.bilibili.com/p/html/bilili-page-face-auth/index.html")!
++        components.queryItems = [
++            URLQueryItem(name: "is_live_webview", value: "1"),
++            URLQueryItem(name: "app_common", value: "open"),
++            URLQueryItem(name: "pc_ui", value: "500,428,17181a,2")
++        ]
++        return components
++    }
++
++    private init(onRetry: @escaping () -> Void) {
++        self.onRetry = onRetry
++        let configuration = WKWebViewConfiguration()
++        configuration.websiteDataStore = .nonPersistent()
++        webView = WKWebView(frame: .zero, configuration: configuration)
++        status = NSTextField(labelWithString: "正在载入哔哩哔哩官方验证页面…")
++        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 640),
++                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
++        super.init()
++
++        let retry = NSButton(title: "验证完成，重试开播", target: self, action: #selector(retryTapped))
++        retry.keyEquivalent = "\r"
++        let close = NSButton(title: "关闭", target: self, action: #selector(closeTapped))
++        let buttons = NSStackView(views: [status, NSView(), close, retry])
++        buttons.orientation = .horizontal
++        let root = NSStackView(views: [webView, buttons])
++        root.orientation = .vertical
++        root.spacing = 10
++        root.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 12, right: 12)
++        webView.translatesAutoresizingMaskIntoConstraints = false
++        webView.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
++        webView.heightAnchor.constraint(greaterThanOrEqualToConstant: 480).isActive = true
++        webView.navigationDelegate = self
++
++        window.title = "哔哩哔哩开播身份验证"
++        window.contentView = root
++        window.isReleasedWhenClosed = false
++        window.delegate = self
++        window.center()
++        window.makeKeyAndOrderFront(nil)
++        NSApp.activate(ignoringOtherApps: true)
++    }
++
++    private func load(voucher: String?, credentials: SessionCredentials) {
++        var components = Self.pageURLBase
++        if let voucher, !voucher.isEmpty {
++            components.queryItems?.append(URLQueryItem(name: "v_voucher", value: voucher))
++        }
++        let url = components.url!
++        let store = webView.configuration.websiteDataStore.httpCookieStore
++        Task { @MainActor in
++            for (name, value) in credentials.cookies {
++                if let cookie = HTTPCookie(properties: [.domain: ".bilibili.com", .path: "/", .name: name,
++                                                        .value: value, .secure: "TRUE"]) {
++                    await store.setCookie(cookie)
++                }
++            }
++            webView.load(URLRequest(url: url))
++        }
++    }
++
++    @objc private func retryTapped() {
++        let retry = onRetry
++        window.close()
++        retry()
++    }
++
++    @objc private func closeTapped() {
++        window.close()
++    }
++
++    func windowWillClose(_ notification: Notification) {
++        webView.stopLoading()
++        Self.current = nil
++    }
++
++    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
++        status.stringValue = "请按页面提示完成验证，然后点击「验证完成，重试开播」"
++    }
++
++    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
++        status.stringValue = "验证页面加载失败，请关闭后重新开播"
++    }
++
++    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
++        status.stringValue = "验证页面加载失败，请关闭后重新开播"
++    }
++}
++
++/// Opens the verification window for the ready account. When the user
++/// confirms, emits {"event":"faceAuthRetry"} so the dock retries Go live.
++@_cdecl("livehime_core_open_face_auth")
++public func livehime_core_open_face_auth(_ voucher: UnsafePointer<CChar>?) {
++    let voucherText = voucher.map { String(cString: $0) }
++    DispatchQueue.main.async {
++        MainActor.assumeIsolated {
++            guard let bridge = CoreBridge.shared, let credentials = bridge.coordinator.credentials else { return }
++            FaceAuthWindowController.present(voucher: voucherText, credentials: credentials) {
++                CoreBridge.shared?.emit(["event": "faceAuthRetry"])
++            }
++        }
++    }
++}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 999bad5ca..922ecb374 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -32,6 +32,11 @@ void livehime_core_load_areas(void);
+ void livehime_core_start_live(long long area_id, long long parent_area_id);
+ void livehime_core_stop_live(void);
+ 
++/* Opens Bilibili's pre-live verification page (face verification) for the
++ * ready account, using the voucher from a "faceAuth" liveError (may be NULL).
++ * When the user confirms, {"event":"faceAuthRetry"} is emitted. */
++void livehime_core_open_face_auth(const char *voucher);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index aceaa60d3..d090f02ca 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -61,3 +61,4 @@ LiveHime.Live.Error.http="Bilibili returned HTTP %1."
+ LiveHime.Live.Error.network="Could not reach Bilibili. Check the network and try again."
+ LiveHime.Live.Error.server="Bilibili returned an unexpected response."
+ LiveHime.Live.Error.notReady="The account is not ready yet."
++LiveHime.Live.FaceAuthOpened="Bilibili requires face verification. Complete it in the window that opened, then choose Verified, retry."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 6762ff6f4..e73279467 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -61,3 +61,4 @@ LiveHime.Live.Error.http="哔哩哔哩返回 HTTP %1。"
+ LiveHime.Live.Error.network="无法连接哔哩哔哩，请检查网络后重试。"
+ LiveHime.Live.Error.server="哔哩哔哩返回了异常结果。"
+ LiveHime.Live.Error.notReady="账号尚未就绪。"
++LiveHime.Live.FaceAuthOpened="哔哩哔哩要求人脸验证。请在弹出的窗口中完成验证，然后点「验证完成，重试开播」。"
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index 273d6ef69..77f138367 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -179,7 +179,20 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 			setLiveStatus(stream_->lastError() + QStringLiteral("\n") + text("LiveHime.Live.RoomStillOpen"), true);
+ 	} else if (name == "liveError") {
+ 		requesting_ = false;
+-		setLiveStatus(errorText(event), true);
++		if (event.value("kind").toString() == "faceAuth") {
++			/* The voucher is a one-time risk token, not a credential; log
++			 * only whether Bilibili sent one. */
++			blog(LOG_INFO, "[livehime] face verification required (voucher: %s)",
++			     event.contains("voucher") ? "yes" : "no");
++			setLiveStatus(text("LiveHime.Live.FaceAuthOpened"), true);
++			const QByteArray voucher = event.value("voucher").toString().toUtf8();
++			livehime_core_open_face_auth(voucher.isEmpty() ? nullptr : voucher.constData());
++		} else {
++			setLiveStatus(errorText(event), true);
++		}
++	} else if (name == "faceAuthRetry") {
++		onGoLive();
++		return;
+ 	} else if (name == "liveStopped") {
+ 		stopping_ = false;
+ 		if (event.value("ok").toBool())

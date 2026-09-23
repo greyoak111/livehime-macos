@@ -1,0 +1,818 @@
+From 5187d1e7694b79e2f09a031f15e5ce33112076bd Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 23:23:24 +0800
+Subject: [PATCH 07/26] Open the Bilibili live room from the LiveHime dock
+
+The ready account view gains an area picker and Go live / End live.
+Go live asks the core to open the room (startLive, v0.1.2's signing) and
+hands the returned RTMP endpoint to the StreamController; End live stops
+OBS and closes the room together, then re-reads the room status. Face
+verification, expired logins and API refusals are reported in place
+without signing out, and logging out is disabled while live so a room is
+never left running.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../core/Sources/LiveHimeCore/CBridge.swift   |  93 +++++++-
+ .../LiveHimeCore/SessionCoordinator.swift     |  89 +++++++-
+ .../SessionCoordinatorTests.swift             |  76 +++++++
+ plugins/livehime/core/include/livehime-core.h |  13 +-
+ plugins/livehime/data/locale/en-US.ini        |  23 ++
+ plugins/livehime/data/locale/zh-CN.ini        |  23 ++
+ plugins/livehime/src/account-panel.cpp        | 205 ++++++++++++++++--
+ plugins/livehime/src/account-panel.hpp        |  37 +++-
+ plugins/livehime/src/livehime-dock.cpp        |   2 +-
+ 9 files changed, 525 insertions(+), 36 deletions(-)
+
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index fc721f735..cc8e9cd2f 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -2,9 +2,10 @@ import Foundation
+ 
+ /// C entry points for the Qt plugin (declared in include/livehime-core.h).
+ ///
+-/// The plugin calls these on the main thread. State changes are delivered as
+-/// a JSON object through the registered callback, also on the main thread.
+-/// The JSON never contains cookies or tokens.
++/// The plugin calls these on the main thread. State changes and live-room
++/// events are delivered as JSON objects through the registered callback, also
++/// on the main thread. Session JSON never contains cookies or tokens; the
++/// "streamEndpoint" event carries the stream key, which must not be logged.
+ public typealias LiveHimeStateCallback = @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void
+ 
+ @MainActor
+@@ -104,3 +105,89 @@ public func livehime_core_retry() { onMain { CoreBridge.shared?.coordinator.retr
+ 
+ @_cdecl("livehime_core_sign_out")
+ public func livehime_core_sign_out() { onMain { CoreBridge.shared?.coordinator.signOut() } }
++
++// MARK: Live room
++
++extension CoreBridge {
++    func emit(_ object: [String: Any]) {
++        guard let callback,
++              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
++        String(decoding: data, as: UTF8.self).withCString { callback($0, context) }
++    }
++
++    /// Error payload for the dock; `kind` selects the localized message.
++    static func errorFields(_ error: Error) -> [String: Any] {
++        switch error {
++        case BilibiliLiveError.faceAuthRequired(let voucher):
++            var fields: [String: Any] = ["kind": "faceAuth"]
++            if let voucher { fields["voucher"] = voucher }
++            return fields
++        case BilibiliLiveError.notLoggedIn, BilibiliControlError.notLoggedIn:
++            return ["kind": "sessionExpired"]
++        case BilibiliLiveError.missingRoom:
++            return ["kind": "noLiveRoom"]
++        case BilibiliLiveError.api(let code, let message):
++            return ["kind": "api", "code": code, "message": message]
++        case BilibiliLiveError.http(let status, _):
++            return ["kind": "http", "code": status]
++        case SessionCoordinator.LiveError.notReady:
++            return ["kind": "notReady"]
++        default:
++            return ["kind": SessionCoordinator.notice(for: error) == .network ? "network" : "server",
++                    "message": "\(error)"]
++        }
++    }
++
++    static func areaFields(_ area: BilibiliLiveArea) -> [String: Any] {
++        ["id": area.areaID, "parentId": area.parentAreaID, "name": area.name, "parentName": area.parentName]
++    }
++}
++
++@_cdecl("livehime_core_load_areas")
++public func livehime_core_load_areas() {
++    onMain {
++        guard let bridge = CoreBridge.shared else { return }
++        Task { @MainActor in
++            do {
++                let areas = try await bridge.coordinator.loadAreas()
++                bridge.emit(["event": "areas", "areas": areas.map(CoreBridge.areaFields)])
++            } catch {
++                bridge.emit(["event": "areasFailed"].merging(CoreBridge.errorFields(error)) { $1 })
++            }
++        }
++    }
++}
++
++/// Opens the live room in `area_id` (a leaf area from the areas event).
++/// Emits "streamEndpoint" with server and key, or "liveError".
++@_cdecl("livehime_core_start_live")
++public func livehime_core_start_live(_ areaID: Int64, _ parentAreaID: Int64) {
++    onMain {
++        guard let bridge = CoreBridge.shared else { return }
++        let area = BilibiliLiveArea(areaID: areaID, parentAreaID: parentAreaID, name: "")
++        Task { @MainActor in
++            do {
++                let endpoint = try await bridge.coordinator.startLive(area: area)
++                bridge.emit(["event": "streamEndpoint", "server": endpoint.address, "key": endpoint.key])
++            } catch {
++                bridge.emit(["event": "liveError"].merging(CoreBridge.errorFields(error)) { $1 })
++            }
++        }
++    }
++}
++
++/// Closes the live room. Emits "liveStopped" with ok true/false.
++@_cdecl("livehime_core_stop_live")
++public func livehime_core_stop_live() {
++    onMain {
++        guard let bridge = CoreBridge.shared else { return }
++        Task { @MainActor in
++            do {
++                try await bridge.coordinator.stopLive()
++                bridge.emit(["event": "liveStopped", "ok": true])
++            } catch {
++                bridge.emit(["event": "liveStopped", "ok": false].merging(CoreBridge.errorFields(error)) { $1 })
++            }
++        }
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+index 60ad6ed9f..2a43a50f9 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -37,6 +37,10 @@ public protocol BilibiliAccountAPI: Sendable {
+     func pollQR(key: String) async throws -> QRLoginPoll
+     func identity(cookieHeader: String) async throws -> BilibiliIdentity
+     func room(mid: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo
++    func roomInfo(roomID: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo
++    func areas(cookieHeader: String) async throws -> [BilibiliLiveArea]
++    func startLive(roomID: Int64, area: BilibiliLiveArea, cookieHeader: String) async throws -> BilibiliStreamConfig
++    func stopLive(roomID: Int64, cookieHeader: String) async throws
+ }
+ 
+ /// Reads cookies a previous app version left in its WebKit store.
+@@ -109,6 +113,68 @@ public final class SessionCoordinator {
+         }
+     }
+ 
++    // MARK: Live room
++
++    public enum LiveError: Error, Equatable {
++        case notReady
++        case unknownArea
++    }
++
++    public func loadAreas() async throws -> [BilibiliLiveArea] {
++        let (saved, _) = try readyAccount()
++        return try await guarded { try await self.api.areas(cookieHeader: saved.cookieHeader) }
++    }
++
++    /// Opens the live room and returns the RTMP endpoint for OBS. The room
++    /// record is refreshed afterwards so the dock shows Bilibili's view.
++    public func startLive(area: BilibiliLiveArea) async throws -> BilibiliStreamConfig {
++        let (saved, account) = try readyAccount()
++        let endpoint = try await guarded {
++            try await self.api.startLive(roomID: account.room.roomID, area: area, cookieHeader: saved.cookieHeader)
++        }
++        await refreshRoom()
++        return endpoint
++    }
++
++    public func stopLive() async throws {
++        let (saved, account) = try readyAccount()
++        do {
++            try await guarded { try await self.api.stopLive(roomID: account.room.roomID, cookieHeader: saved.cookieHeader) }
++        } catch {
++            await refreshRoom()
++            throw error
++        }
++        await refreshRoom()
++    }
++
++    /// Re-reads the room so live status and area reflect Bilibili's state.
++    /// Failures leave the current account untouched.
++    public func refreshRoom() async {
++        guard let (saved, account) = try? readyAccount(),
++              let room = try? await api.roomInfo(roomID: account.room.roomID, cookieHeader: saved.cookieHeader),
++              case .ready(let current) = state, current.mid == account.mid else { return }
++        state = .ready(LiveAccount(mid: account.mid, username: account.username, room: room))
++    }
++
++    private func readyAccount() throws -> (SessionCredentials, LiveAccount) {
++        guard case .ready(let account) = state, let saved = credentials else { throw LiveError.notReady }
++        return (saved, account)
++    }
++
++    /// Runs a live-room request; a rejected login signs out like verify does.
++    private func guarded<T>(_ body: () async throws -> T) async throws -> T {
++        do {
++            return try await body()
++        } catch {
++            if Self.isSessionRejected(error) {
++                try? store.remove()
++                credentials = nil
++                state = .signedOut(.sessionExpired)
++            }
++            throw error
++        }
++    }
++
+     /// Awaits the running action; used by tests.
+     public func waitForIdle() async { await task?.value }
+ 
+@@ -235,6 +301,27 @@ public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
+     }
+ 
+     public func room(mid: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo {
+-        try await BilibiliLiveClient(cookieHeader: cookieHeader, session: BilibiliWeb.session, diagnostics: diagnostics).fetchCurrentRoom(mid: mid)
++        try await live(cookieHeader).fetchCurrentRoom(mid: mid)
++    }
++
++    public func roomInfo(roomID: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo {
++        try await live(cookieHeader).fetchRoomInfo(roomID: roomID, cookieHeader: cookieHeader)
++    }
++
++    public func areas(cookieHeader: String) async throws -> [BilibiliLiveArea] {
++        try await live(cookieHeader).fetchAreas()
++    }
++
++    public func startLive(roomID: Int64, area: BilibiliLiveArea, cookieHeader: String) async throws -> BilibiliStreamConfig {
++        try await live(cookieHeader).startLive(roomID: roomID, areaID: Int(area.areaID), parentAreaID: area.parentAreaID,
++                                                cookieHeader: cookieHeader)
++    }
++
++    public func stopLive(roomID: Int64, cookieHeader: String) async throws {
++        try await live(cookieHeader).stopLive(roomID: roomID, cookieHeader: cookieHeader)
++    }
++
++    private func live(_ cookieHeader: String) -> BilibiliLiveClient {
++        BilibiliLiveClient(cookieHeader: cookieHeader, session: BilibiliWeb.session, diagnostics: diagnostics)
+     }
+ }
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+index f77495894..f4e65056d 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -27,6 +27,25 @@ private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
+         return try next.get()
+     }
+     func room(mid: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo { try roomResult.get() }
++
++    var liveRoom = fixtureRoom
++    var startResult: Result<BilibiliStreamConfig, Error> = .success(BilibiliStreamConfig(address: "rtmp://live-push.example/live-bvc/", code: "?streamname=k"))
++    var stopCalls = 0
++    var startedAreas: [Int64] = []
++    func roomInfo(roomID: Int64, cookieHeader: String) async throws -> BilibiliRoomInfo { liveRoom }
++    func areas(cookieHeader: String) async throws -> [BilibiliLiveArea] {
++        [BilibiliLiveArea(areaID: 7, parentAreaID: 2, name: "leaf", parentName: "parent")]
++    }
++    func startLive(roomID: Int64, area: BilibiliLiveArea, cookieHeader: String) async throws -> BilibiliStreamConfig {
++        startedAreas.append(area.areaID)
++        let endpoint = try startResult.get()
++        liveRoom = BilibiliRoomInfo(roomID: roomID, uid: 42, title: "room", liveStatus: 1, areaID: Int(area.areaID))
++        return endpoint
++    }
++    func stopLive(roomID: Int64, cookieHeader: String) async throws {
++        stopCalls += 1
++        liveRoom = BilibiliRoomInfo(roomID: roomID, uid: 42, title: "room", liveStatus: 0, areaID: liveRoom.areaID)
++    }
+ }
+ 
+ private struct StubImporter: LegacySessionImporter {
+@@ -150,6 +169,63 @@ final class SessionCoordinatorTests: XCTestCase {
+     }
+ }
+ 
++@MainActor
++final class LiveRoomTests: XCTestCase {
++    private func readyCoordinator(_ api: StubAPI) async -> SessionCoordinator {
++        let store = MemoryCredentialStore(.current(SessionCredentials(cookies: completeCookies, refreshToken: "")))
++        let c = SessionCoordinator(api: api, store: store)
++        c.restore(); await c.waitForIdle()
++        return c
++    }
++
++    func testStartLiveReturnsEndpointAndRefreshesRoom() async throws {
++        let api = StubAPI()
++        let c = await readyCoordinator(api)
++        let endpoint = try await c.startLive(area: BilibiliLiveArea(areaID: 7, parentAreaID: 2, name: ""))
++        XCTAssertEqual(endpoint.address, "rtmp://live-push.example/live-bvc/")
++        XCTAssertEqual(api.startedAreas, [7])
++        guard case .ready(let account) = c.state else { return XCTFail("\(c.state)") }
++        XCTAssertEqual(account.room.liveStatus, 1)
++
++        try await c.stopLive()
++        guard case .ready(let after) = c.state else { return XCTFail("\(c.state)") }
++        XCTAssertEqual(after.room.liveStatus, 0)
++        XCTAssertEqual(api.stopCalls, 1)
++    }
++
++    func testFaceAuthErrorKeepsSessionReady() async {
++        let api = StubAPI()
++        api.startResult = .failure(BilibiliLiveError.faceAuthRequired(voucher: "v"))
++        let c = await readyCoordinator(api)
++        do {
++            _ = try await c.startLive(area: BilibiliLiveArea(areaID: 7, name: ""))
++            XCTFail("expected face auth")
++        } catch {
++            XCTAssertEqual(error as? BilibiliLiveError, .faceAuthRequired(voucher: "v"))
++            XCTAssertEqual(CoreBridge.errorFields(error)["kind"] as? String, "faceAuth")
++        }
++        guard case .ready = c.state else { return XCTFail("face auth must not sign out: \(c.state)") }
++    }
++
++    func testRejectedLoginDuringStartLiveSignsOut() async {
++        let api = StubAPI()
++        api.startResult = .failure(BilibiliLiveError.notLoggedIn)
++        let c = await readyCoordinator(api)
++        _ = try? await c.startLive(area: BilibiliLiveArea(areaID: 7, name: ""))
++        XCTAssertEqual(c.state, .signedOut(.sessionExpired))
++    }
++
++    func testStartLiveRequiresReadySession() async {
++        let c = SessionCoordinator(api: StubAPI(), store: MemoryCredentialStore())
++        do {
++            _ = try await c.startLive(area: BilibiliLiveArea(areaID: 7, name: ""))
++            XCTFail("expected notReady")
++        } catch {
++            XCTAssertEqual(error as? SessionCoordinator.LiveError, .notReady)
++        }
++    }
++}
++
+ final class CredentialParsingTests: XCTestCase {
+     func testPollSuccessReadsSetCookieHeaders() throws {
+         let url = URL(string: "https://passport.bilibili.com/x/passport-login/web/qrcode/poll")!
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 1c4a46ceb..999bad5ca 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -4,7 +4,8 @@
+  *
+  * Call from the main thread. State changes arrive on the main thread as a
+  * JSON object: {"state": "signedOut"|"qrCode"|"verifying"|"ready"|"failed",
+- * ...}. The JSON never contains cookies or tokens. */
++ * ...}. Session JSON never contains cookies or tokens; see the live-room
++ * events below for the one message that carries the stream key. */
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -21,6 +22,16 @@ void livehime_core_cancel_qr_login(void);
+ void livehime_core_retry(void);
+ void livehime_core_sign_out(void);
+ 
++/* Live room. Results arrive through the same callback as JSON objects with
++ * an "event" field instead of "state":
++ *   {"event":"areas","areas":[{"id","parentId","name","parentName"}]}
++ *   {"event":"streamEndpoint","server","key"}   (the key is a secret: never log it)
++ *   {"event":"liveError","kind":...}             kind: faceAuth|sessionExpired|noLiveRoom|api|http|network|server|notReady
++ *   {"event":"liveStopped","ok":true|false,...} */
++void livehime_core_load_areas(void);
++void livehime_core_start_live(long long area_id, long long parent_area_id);
++void livehime_core_stop_live(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index d5e12f757..aceaa60d3 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -38,3 +38,26 @@ LiveHime.Account.Notice.noLiveRoom="This account has no live room yet."
+ LiveHime.Account.Notice.network="Could not reach Bilibili. Your login is kept; check the network and retry."
+ LiveHime.Account.Notice.server="Bilibili returned an unexpected response. Your login is kept; retry later."
+ LiveHime.Account.Notice.keychain="The login could not be read from or saved to the Keychain."
++LiveHime.Live.Area="Area"
++LiveHime.Live.LoadingAreas="Loading areas..."
++LiveHime.Live.AreasFailed="Areas unavailable"
++LiveHime.Live.GoLive="Go live"
++LiveHime.Live.EndLive="End live"
++LiveHime.Live.RoomOpen="Live"
++LiveHime.Live.RoomClosed="Offline"
++LiveHime.Live.Requesting="Asking Bilibili to open the live room..."
++LiveHime.Live.Connecting="Live room opened. Connecting the stream..."
++LiveHime.Live.OnAir="You are live."
++LiveHime.Live.Ending="Ending the stream and closing the live room..."
++LiveHime.Live.Ended="Live ended."
++LiveHime.Live.StopFailed="The live room may still be open."
++LiveHime.Live.RoomStillOpen="The Bilibili live room is still open. Use End live to close it."
++LiveHime.Live.EndBeforeSignOut="End the live stream before logging out."
++LiveHime.Live.Error.faceAuth="Bilibili requires face verification before going live."
++LiveHime.Live.Error.sessionExpired="Your login has expired. Please log in again."
++LiveHime.Live.Error.noLiveRoom="This account has no live room yet."
++LiveHime.Live.Error.api="Bilibili refused the request (code %1)."
++LiveHime.Live.Error.http="Bilibili returned HTTP %1."
++LiveHime.Live.Error.network="Could not reach Bilibili. Check the network and try again."
++LiveHime.Live.Error.server="Bilibili returned an unexpected response."
++LiveHime.Live.Error.notReady="The account is not ready yet."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index bd816c3a8..6762ff6f4 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -38,3 +38,26 @@ LiveHime.Account.Notice.noLiveRoom="该账号还没有开通直播间。"
+ LiveHime.Account.Notice.network="无法连接哔哩哔哩。登录信息已保留，请检查网络后重试。"
+ LiveHime.Account.Notice.server="哔哩哔哩返回了异常结果。登录信息已保留，请稍后重试。"
+ LiveHime.Account.Notice.keychain="无法从钥匙串读取或保存登录信息。"
++LiveHime.Live.Area="分区"
++LiveHime.Live.LoadingAreas="正在读取分区…"
++LiveHime.Live.AreasFailed="分区读取失败"
++LiveHime.Live.GoLive="开始直播"
++LiveHime.Live.EndLive="结束直播"
++LiveHime.Live.RoomOpen="直播中"
++LiveHime.Live.RoomClosed="未开播"
++LiveHime.Live.Requesting="正在向哔哩哔哩申请开播…"
++LiveHime.Live.Connecting="直播间已开启，正在连接推流…"
++LiveHime.Live.OnAir="正在直播。"
++LiveHime.Live.Ending="正在停止推流并关闭直播间…"
++LiveHime.Live.Ended="直播已结束。"
++LiveHime.Live.StopFailed="直播间可能仍在开播状态。"
++LiveHime.Live.RoomStillOpen="哔哩哔哩直播间仍处于开播状态，可点击「结束直播」关闭。"
++LiveHime.Live.EndBeforeSignOut="请先结束直播再退出登录。"
++LiveHime.Live.Error.faceAuth="哔哩哔哩要求先完成人脸验证才能开播。"
++LiveHime.Live.Error.sessionExpired="登录已失效，请重新登录。"
++LiveHime.Live.Error.noLiveRoom="该账号还没有开通直播间。"
++LiveHime.Live.Error.api="哔哩哔哩拒绝了请求（代码 %1）。"
++LiveHime.Live.Error.http="哔哩哔哩返回 HTTP %1。"
++LiveHime.Live.Error.network="无法连接哔哩哔哩，请检查网络后重试。"
++LiveHime.Live.Error.server="哔哩哔哩返回了异常结果。"
++LiveHime.Live.Error.notReady="账号尚未就绪。"
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index ac3cf68fa..273d6ef69 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -4,8 +4,9 @@
+ #include <obs-module.h>
+ 
+ #include <QByteArray>
+-#include <cstdlib>
++#include <QComboBox>
+ #include <QHBoxLayout>
++#include <QJsonArray>
+ #include <QJsonDocument>
+ #include <QLabel>
+ #include <QPixmap>
+@@ -13,17 +14,19 @@
+ #include <QStackedWidget>
+ #include <QVBoxLayout>
+ 
++#include <cstdlib>
++
+ namespace {
+ QString text(const char *key)
+ {
+ 	return QString::fromUtf8(obs_module_text(key));
+ }
+ 
+-QString noticeText(const QString &notice)
++QString keyedText(const char *prefix, const QString &suffix)
+ {
+-	if (notice.isEmpty())
++	if (suffix.isEmpty())
+ 		return QString();
+-	const QByteArray key = "LiveHime.Account.Notice." + notice.toUtf8();
++	const QByteArray key = QByteArray(prefix) + suffix.toUtf8();
+ 	return text(key.constData());
+ }
+ 
+@@ -34,10 +37,34 @@ QLabel *wrapLabel(QWidget *parent, const QString &value = QString())
+ 	return label;
+ }
+ 
++/* Localized text for a core error payload ({"kind", "code", "message"}). */
++QString errorText(const QJsonObject &error)
++{
++	const QString kind = error.value("kind").toString();
++	QString message = keyedText("LiveHime.Live.Error.", kind);
++	if (kind == "api" || kind == "http") {
++		message = message.arg(error.value("code").toInt());
++		const QString detail = error.value("message").toString();
++		if (!detail.isEmpty())
++			message += QStringLiteral("\n") + detail;
++	}
++	return message.isEmpty() ? text("LiveHime.Live.Error.server") : message;
++}
++
++bool streamBusy(StreamController::State state)
++{
++	using State = StreamController::State;
++	return state == State::Starting || state == State::Live || state == State::Reconnecting ||
++	       state == State::Stopping;
++}
++
+ enum Page { SignedOut, QRCode, Verifying, Ready, Failed };
+ } // namespace
+ 
+-AccountPanel::AccountPanel(QWidget *parent) : QWidget(parent), pages_(new QStackedWidget(this))
++AccountPanel::AccountPanel(StreamController *stream, QWidget *parent)
++	: QWidget(parent),
++	  stream_(stream),
++	  pages_(new QStackedWidget(this))
+ {
+ 	pages_->insertWidget(SignedOut, buildSignedOut());
+ 	pages_->insertWidget(QRCode, buildQRCode());
+@@ -49,9 +76,11 @@ AccountPanel::AccountPanel(QWidget *parent) : QWidget(parent), pages_(new QStack
+ 	layout->addWidget(pages_);
+ 	pages_->setCurrentIndex(Verifying);
+ 
+-	/* Development/testing override so automated runs never touch the real
+-	 * login item. */
+-	livehime_core_start(std::getenv("LIVEHIME_KEYCHAIN_SERVICE"), &AccountPanel::onCoreState, this);
++	connect(stream_, &StreamController::stateChanged, this, &AccountPanel::onStreamStateChanged);
++
++	/* LIVEHIME_KEYCHAIN_SERVICE is a development/testing override so
++	 * automated runs never touch the real login item. */
++	livehime_core_start(std::getenv("LIVEHIME_KEYCHAIN_SERVICE"), &AccountPanel::onCoreMessage, this);
+ }
+ 
+ AccountPanel::~AccountPanel()
+@@ -59,13 +88,19 @@ AccountPanel::~AccountPanel()
+ 	livehime_core_stop();
+ }
+ 
+-void AccountPanel::onCoreState(const char *json, void *context)
++void AccountPanel::onCoreMessage(const char *json, void *context)
+ {
+-	/* Delivered on the main thread by the core. */
++	/* Delivered on the main thread by the core. Never log the raw JSON:
++	 * the streamEndpoint event carries the stream key. */
+ 	auto *self = static_cast<AccountPanel *>(context);
+ 	const QJsonDocument doc = QJsonDocument::fromJson(QByteArray(json));
+-	if (doc.isObject())
+-		self->applyState(doc.object());
++	if (!doc.isObject())
++		return;
++	const QJsonObject object = doc.object();
++	if (object.contains("event"))
++		self->applyEvent(object);
++	else
++		self->applyState(object);
+ }
+ 
+ void AccountPanel::applyState(const QJsonObject &state)
+@@ -75,8 +110,9 @@ void AccountPanel::applyState(const QJsonObject &state)
+ 	blog(LOG_INFO, "[livehime] account state -> %s", name.toUtf8().constData());
+ 
+ 	if (name == "signedOut") {
+-		signedOutNotice_->setText(noticeText(state.value("notice").toString()));
++		signedOutNotice_->setText(keyedText("LiveHime.Account.Notice.", state.value("notice").toString()));
+ 		signedOutNotice_->setVisible(!signedOutNotice_->text().isEmpty());
++		areasLoaded_ = false;
+ 		pages_->setCurrentIndex(SignedOut);
+ 	} else if (name == "qrCode") {
+ 		QPixmap qr;
+@@ -91,17 +127,121 @@ void AccountPanel::applyState(const QJsonObject &state)
+ 		accountName_->setText(state.value("username").toString());
+ 		const qint64 shortId = state.value("shortRoomId").toVariant().toLongLong();
+ 		const qint64 roomId = state.value("roomId").toVariant().toLongLong();
+-		roomLine_->setText(QStringLiteral("%1 %2 · %3")
++		const bool live = state.value("liveStatus").toInt() == 1;
++		roomLine_->setText(QStringLiteral("%1 %2 · %3 · %4")
+ 					   .arg(text("LiveHime.Account.Room"))
+ 					   .arg(shortId > 0 ? shortId : roomId)
++					   .arg(text(live ? "LiveHime.Live.RoomOpen" : "LiveHime.Live.RoomClosed"))
+ 					   .arg(state.value("title").toString()));
+ 		pages_->setCurrentIndex(Ready);
++		if (!areasLoaded_) {
++			area_->clear();
++			area_->addItem(text("LiveHime.Live.LoadingAreas"));
++			livehime_core_load_areas();
++		}
+ 	} else if (name == "failed") {
+-		failedNotice_->setText(noticeText(state.value("notice").toString()));
++		failedNotice_->setText(keyedText("LiveHime.Account.Notice.", state.value("notice").toString()));
+ 		failedDetail_->setText(state.value("detail").toString());
+ 		pages_->setCurrentIndex(Failed);
+ 	}
+-	emit stateChanged(state);
++	updateLiveControls();
++}
++
++void AccountPanel::applyEvent(const QJsonObject &event)
++{
++	const QString name = event.value("event").toString();
++	blog(LOG_INFO, "[livehime] live event -> %s", name.toUtf8().constData());
++
++	if (name == "areas") {
++		area_->clear();
++		const int current = state_.value("areaId").toInt();
++		const QJsonArray areas = event.value("areas").toArray();
++		for (const QJsonValue value : areas) {
++			const QJsonObject item = value.toObject();
++			const QString label = QStringLiteral("%1 · %2").arg(item.value("parentName").toString(),
++									     item.value("name").toString());
++			area_->addItem(label, QVariantList{item.value("id").toVariant(), item.value("parentId").toVariant()});
++			if (item.value("id").toInt() == current)
++				area_->setCurrentIndex(area_->count() - 1);
++		}
++		areasLoaded_ = area_->count() > 0;
++	} else if (name == "areasFailed") {
++		area_->clear();
++		area_->addItem(text("LiveHime.Live.AreasFailed"));
++		setLiveStatus(errorText(event), true);
++	} else if (name == "streamEndpoint") {
++		requesting_ = false;
++		const QString server = event.value("server").toString();
++		const QString key = event.value("key").toString();
++		if (stream_->start(server, key))
++			setLiveStatus(text("LiveHime.Live.Connecting"));
++		else
++			setLiveStatus(stream_->lastError() + QStringLiteral("\n") + text("LiveHime.Live.RoomStillOpen"), true);
++	} else if (name == "liveError") {
++		requesting_ = false;
++		setLiveStatus(errorText(event), true);
++	} else if (name == "liveStopped") {
++		stopping_ = false;
++		if (event.value("ok").toBool())
++			setLiveStatus(text("LiveHime.Live.Ended"));
++		else
++			setLiveStatus(text("LiveHime.Live.StopFailed") + QStringLiteral("\n") + errorText(event), true);
++	}
++	updateLiveControls();
++}
++
++void AccountPanel::onGoLive()
++{
++	const QVariantList ids = area_->currentData().toList();
++	if (ids.size() != 2)
++		return;
++	requesting_ = true;
++	setLiveStatus(text("LiveHime.Live.Requesting"));
++	updateLiveControls();
++	livehime_core_start_live(ids[0].toLongLong(), ids[1].toLongLong());
++}
++
++void AccountPanel::onEndLive()
++{
++	stopping_ = true;
++	setLiveStatus(text("LiveHime.Live.Ending"));
++	updateLiveControls();
++	/* Stop OBS and close the room together; neither waits for the other so
++	 * a stuck output can never keep the room open, or the reverse. */
++	stream_->stop();
++	livehime_core_stop_live();
++}
++
++void AccountPanel::onStreamStateChanged(StreamController::State state)
++{
++	using State = StreamController::State;
++	const bool roomOpen = state_.value("liveStatus").toInt() == 1;
++	if (state == State::Live && stream_->ownsSession())
++		setLiveStatus(text("LiveHime.Live.OnAir"));
++	else if (state == State::Failed && roomOpen && !stopping_)
++		setLiveStatus(stream_->lastError() + QStringLiteral("\n") + text("LiveHime.Live.RoomStillOpen"), true);
++	updateLiveControls();
++}
++
++void AccountPanel::updateLiveControls()
++{
++	const bool ready = state_.value("state").toString() == "ready";
++	const bool roomOpen = ready && state_.value("liveStatus").toInt() == 1;
++	const bool busy = streamBusy(stream_->state());
++	const bool canStart = ready && areasLoaded_ && !requesting_ && !stopping_ && !busy;
++
++	area_->setEnabled(canStart);
++	goLive_->setEnabled(canStart);
++	endLive_->setEnabled(ready && !stopping_ && (roomOpen || busy));
++	/* Never leave a room running unattended: log out only when offline. */
++	signOut_->setEnabled(!roomOpen && !busy && !requesting_ && !stopping_);
++	signOut_->setToolTip(signOut_->isEnabled() ? QString() : text("LiveHime.Live.EndBeforeSignOut"));
++}
++
++void AccountPanel::setLiveStatus(const QString &message, bool warning)
++{
++	liveStatus_->setText(message);
++	liveStatus_->setStyleSheet(warning ? QStringLiteral("color: #e06c75;") : QStringLiteral("color: #9aa0ab;"));
+ }
+ 
+ QWidget *AccountPanel::buildSignedOut()
+@@ -151,13 +291,34 @@ QWidget *AccountPanel::buildReady()
+ 	accountName_->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 14px;"));
+ 	roomLine_ = wrapLabel(page);
+ 	roomLine_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+-	auto *signOut = new QPushButton(text("LiveHime.Account.SignOut"), page);
+-	connect(signOut, &QPushButton::clicked, [] { livehime_core_sign_out(); });
+-	auto *row = new QHBoxLayout;
+-	row->addWidget(accountName_, 1);
+-	row->addWidget(signOut);
+-	layout->addLayout(row);
++	signOut_ = new QPushButton(text("LiveHime.Account.SignOut"), page);
++	connect(signOut_, &QPushButton::clicked, [] { livehime_core_sign_out(); });
++	auto *nameRow = new QHBoxLayout;
++	nameRow->addWidget(accountName_, 1);
++	nameRow->addWidget(signOut_);
++
++	area_ = new QComboBox(page);
++	auto *areaRow = new QHBoxLayout;
++	areaRow->addWidget(new QLabel(text("LiveHime.Live.Area"), page));
++	areaRow->addWidget(area_, 1);
++
++	goLive_ = new QPushButton(text("LiveHime.Live.GoLive"), page);
++	goLive_->setStyleSheet(QStringLiteral("QPushButton:enabled { background: #fb4d5a; color: white; font-weight: 600; }"));
++	endLive_ = new QPushButton(text("LiveHime.Live.EndLive"), page);
++	connect(goLive_, &QPushButton::clicked, this, &AccountPanel::onGoLive);
++	connect(endLive_, &QPushButton::clicked, this, &AccountPanel::onEndLive);
++	auto *buttons = new QHBoxLayout;
++	buttons->addWidget(goLive_);
++	buttons->addWidget(endLive_);
++
++	liveStatus_ = wrapLabel(page);
++	liveStatus_->setTextInteractionFlags(Qt::TextSelectableByMouse);
++
++	layout->addLayout(nameRow);
+ 	layout->addWidget(roomLine_);
++	layout->addLayout(areaRow);
++	layout->addLayout(buttons);
++	layout->addWidget(liveStatus_);
+ 	return page;
+ }
+ 
+diff --git a/plugins/livehime/src/account-panel.hpp b/plugins/livehime/src/account-panel.hpp
+index 5bfdaeb26..69b07e785 100644
+--- a/plugins/livehime/src/account-panel.hpp
++++ b/plugins/livehime/src/account-panel.hpp
+@@ -1,47 +1,68 @@
+ #pragma once
+ 
++#include "stream-controller.hpp"
++
+ #include <QJsonObject>
+ #include <QWidget>
+ 
++class QComboBox;
+ class QLabel;
+ class QPushButton;
+ class QStackedWidget;
+ 
+-/* Bilibili account section of the LiveHime dock.
++/* Bilibili account and live-room section of the LiveHime dock.
+  *
+  * Renders the Swift session core's state (see core/include/livehime-core.h):
+  * signed out -> QR code -> verifying -> ready, or failed with a retry. The
+  * panel never decides login state itself; it only shows what the core
+- * reports, so a transient error can never bounce the user back to login. */
++ * reports, so a transient error can never bounce the user back to login.
++ *
++ * Once ready it drives a live session: open the room (Bilibili returns the
++ * RTMP endpoint), hand the endpoint to the StreamController, and on end
++ * stop OBS and close the room together. */
+ class AccountPanel : public QWidget {
+ 	Q_OBJECT
+ 
+ public:
+-	explicit AccountPanel(QWidget *parent = nullptr);
++	AccountPanel(StreamController *stream, QWidget *parent = nullptr);
+ 	~AccountPanel() override;
+ 
+-	/* Last reported state object; "state" is "ready" once a room is loaded. */
++	/* Last reported session state; "state" is "ready" once a room is loaded. */
+ 	const QJsonObject &state() const { return state_; }
+ 
+-signals:
+-	void stateChanged(const QJsonObject &state);
+-
+ private:
+-	static void onCoreState(const char *json, void *context);
++	static void onCoreMessage(const char *json, void *context);
+ 	void applyState(const QJsonObject &state);
++	void applyEvent(const QJsonObject &event);
++	void onGoLive();
++	void onEndLive();
++	void onStreamStateChanged(StreamController::State state);
++	void updateLiveControls();
++	void setLiveStatus(const QString &message, bool warning = false);
++
+ 	QWidget *buildSignedOut();
+ 	QWidget *buildQRCode();
+ 	QWidget *buildVerifying();
+ 	QWidget *buildReady();
+ 	QWidget *buildFailed();
+ 
++	StreamController *stream_;
+ 	QJsonObject state_;
++	bool areasLoaded_ = false;
++	bool requesting_ = false;
++	bool stopping_ = false;
++
+ 	QStackedWidget *pages_;
+ 	QLabel *signedOutNotice_;
+ 	QLabel *qrImage_;
+ 	QLabel *qrHint_;
+ 	QLabel *accountName_;
+ 	QLabel *roomLine_;
++	QComboBox *area_;
++	QPushButton *goLive_;
++	QPushButton *endLive_;
++	QPushButton *signOut_;
++	QLabel *liveStatus_;
+ 	QLabel *failedNotice_;
+ 	QLabel *failedDetail_;
+ };
+diff --git a/plugins/livehime/src/livehime-dock.cpp b/plugins/livehime/src/livehime-dock.cpp
+index be6bcb8a5..69d802e0a 100644
+--- a/plugins/livehime/src/livehime-dock.cpp
++++ b/plugins/livehime/src/livehime-dock.cpp
+@@ -84,7 +84,7 @@ LiveHimeDock::LiveHimeDock(QWidget *parent) : QWidget(parent), controller_(new S
+ 
+ 	auto *account = new QGroupBox(text("LiveHime.Account.Group"), this);
+ 	auto *accountLayout = new QVBoxLayout(account);
+-	account_ = new AccountPanel(account);
++	account_ = new AccountPanel(controller_, account);
+ 	accountLayout->addWidget(account_);
+ 
+ 	auto *layout = new QVBoxLayout(this);

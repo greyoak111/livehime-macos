@@ -1,0 +1,38 @@
+From 8139c54142a8b06467dc53b182faededc378f95f Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 22:28:58 +0800
+Subject: [PATCH 02/26] Add LiveHime macOS build script
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/build-macos.sh | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+ create mode 100755 build-aux/livehime/build-macos.sh
+
+diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
+new file mode 100755
+index 000000000..156dca20f
+--- /dev/null
++++ b/build-aux/livehime/build-macos.sh
+@@ -0,0 +1,21 @@
++#!/bin/zsh
++# Configure and build the LiveHime-branded OBS bundle (Apple Silicon).
++# Output: build_macos/frontend/${CONFIG}/LiveHime.app
++set -euo pipefail
++
++source_dir=${0:A:h:h:h}
++config=${CONFIG:-RelWithDebInfo}
++
++cmake -S "$source_dir" --preset macos \
++  -DENABLE_BROWSER=OFF \
++  -DOBS_VERSION_OVERRIDE=32.2.2 \
++  -DOBS_CODESIGN_IDENTITY=- \
++  -DSPARKLE_APPCAST_URL= -DSPARKLE_PUBLIC_KEY= \
++  -DENABLE_SERVICE_UPDATES=OFF -DENABLE_WHATSNEW=OFF \
++  -DLIVEHIME_APP_BUNDLE_ID=local.livehime.macos \
++  -DLIVEHIME_APP_NAME=LiveHime \
++  -DLIVEHIME_APP_DISPLAY_NAME=LiveHime \
++  -DOBS_USER_CONFIG_SUBDIR=LiveHime
++
++cmake --build "$source_dir/build_macos" --config "$config" --target obs-studio -- -quiet
++print -- "$source_dir/build_macos/frontend/$config/LiveHime.app"
