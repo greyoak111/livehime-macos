@@ -1,13 +1,13 @@
 # 升级 LiveHime macOS
 
-## 从 v0.1.x 升级到 v0.2.0
+## 从 v0.1.x 升级到 v0.2.x
 
 v0.2.0 把应用整个换成了带直播姬面板的 OBS，但保留了同一个应用身份：
 `CFBundleIdentifier` 仍是 `local.livehime.macos`，应用名仍是 `LiveHimeMacApp.app`，登录信息
 仍存在钥匙串项 `local.livehime.macos.session` 里。
 
 1. 先结束直播，退出 LiveHime 和 v0.1.x 内置的 OBS。
-2. 打开 `LiveHimeMacApp-v0.2.0-arm64.dmg`，把 LiveHime 拖到“应用程序”，选择“替换”。
+2. 打开最新的 `LiveHimeMacApp-<版本>-arm64.dmg`，把 LiveHime 拖到“应用程序”，选择“替换”。
 3. 打开应用。如果被系统拦下，到 系统设置 → 隐私与安全性，点“仍要打开”。
 
 升级后需要注意：

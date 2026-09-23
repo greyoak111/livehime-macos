@@ -1,7 +1,7 @@
 From b971c2bf247ae4912ff6bcb6dc15a9b67efbb5fa Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 02:47:38 +0800
-Subject: [PATCH 20/26] Show pre-live face verification as a native QR code
+Subject: [PATCH 20/29] Show pre-live face verification as a native QR code
 
 startLive can ask for face verification with need_face_auth and a qr URL
 (the fields the Windows client's FaceAuthPresenter reads). That now

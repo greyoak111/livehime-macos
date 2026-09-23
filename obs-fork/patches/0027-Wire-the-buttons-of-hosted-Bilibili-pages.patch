@@ -1,0 +1,387 @@
+From 8d07bd1d022d6e8a5d843f98795da61cdf19ed67 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 05:19:17 +0800
+Subject: [PATCH 27/29] Wire the buttons of hosted Bilibili pages
+
+The cover manager, outside the Windows client, reports Cancel and
+Confirm to the page that embeds it; opened on its own it had no parent,
+so both buttons did nothing. Stand in for that parent and close the
+window (after the success toast on Confirm).
+
+The face verification page closes itself when verification ends; retry
+going live then instead of only closing. New-window links open Bilibili
+pages in place and other sites in the default browser. In the login
+window, Forgot password and the agreements open in the browser, alerts
+show, and a sign-in that returns to the page without LoginSuccess
+(third-party login) completes once the cookies are there.
+
+Hosted pages log failed requests, page errors and toasts (host and path
+only) to diagnose problems such as cover uploads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../LiveHimeCore/BilibiliPageWindow.swift     | 179 +++++++++++++++++-
+ .../Sources/LiveHimeCore/WebLoginWindow.swift |  45 ++++-
+ plugins/livehime/src/account-panel.cpp        |   6 +
+ 3 files changed, 218 insertions(+), 12 deletions(-)
+
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+index 8983f35ee..72fcb05b9 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+@@ -5,14 +5,27 @@ import WebKit
+ /// Hosts one of Bilibili's own web pages for the logged-in account: the
+ /// pre-live verification page and the live cover manager (the same pages the
+ /// Windows client opens in CEF). Without the client's `biliBridgePc` the
+-/// pages run in their standard web mode, so the window only needs the usual
+-/// browser pieces: a file picker for uploads and page-initiated close.
++/// pages run in their standard web mode, so the window provides what a web
++/// host would: a file picker for uploads, page-initiated close, links to
++/// other sites in the default browser, and, for the cover manager, the
++/// parent page its Cancel / Confirm buttons report to.
++///
++/// Failed requests, page errors and the page's toasts are logged (host and
++/// path only, never queries, cookies or bodies) to diagnose page problems.
+ ///
+ /// The session cookies are copied into a non-persistent WebKit store that
+ /// disappears with the window. The app never completes or bypasses anything
+ /// on these pages itself.
+ @MainActor
+-final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
++final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate,
++                                WKScriptMessageHandler {
++    /// What the page closing itself (`window.close()`) means.
++    enum PageClose {
++        case dismiss
++        /// The page finished its flow; same as the confirm button.
++        case confirm
++    }
++
+     struct Options {
+         var title: String
+         var url: URL
+@@ -21,8 +34,13 @@ final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate
+         var readyText: String
+         /// When set, a default button that closes the window and calls back.
+         var confirmTitle: String?
++        var pageClose: PageClose = .dismiss
++        /// Stand in for the embedding page the cover manager reports to.
++        var coverHost = false
+     }
+ 
++    static let messageHandler = "livehime_page"
++
+     private static var open: [String: BilibiliPageWindow] = [:]
+ 
+     private let key: String
+@@ -52,11 +70,23 @@ final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate
+         self.onClose = onClose
+         let configuration = WKWebViewConfiguration()
+         configuration.websiteDataStore = .nonPersistent()
++        let content = WKUserContentController()
++        content.addUserScript(WKUserScript(source: Self.diagnosticsScript, injectionTime: .atDocumentStart,
++                                           forMainFrameOnly: true))
++        if options.coverHost {
++            content.addUserScript(WKUserScript(source: Self.coverHostScript, injectionTime: .atDocumentStart,
++                                               forMainFrameOnly: true))
++        }
++        configuration.userContentController = content
+         webView = WKWebView(frame: .zero, configuration: configuration)
++        if Bundle.main.bundleIdentifier?.hasSuffix(".dev") == true, #available(macOS 13.3, *) {
++            webView.isInspectable = true
++        }
+         status = NSTextField(labelWithString: options.loadingText)
+         window = NSWindow(contentRect: NSRect(origin: .zero, size: options.size),
+                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+         super.init()
++        content.add(WeakMessageHandler(self), name: Self.messageHandler)
+ 
+         var buttons: [NSView] = [status, NSView()]
+         let close = NSButton(title: "关闭", target: self, action: #selector(closeTapped))
+@@ -112,10 +142,39 @@ final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate
+ 
+     func windowWillClose(_ notification: Notification) {
+         webView.stopLoading()
++        webView.configuration.userContentController.removeScriptMessageHandler(forName: Self.messageHandler)
+         Self.open[key] = nil
+         onClose?()
+     }
+ 
++    // MARK: WKScriptMessageHandler
++
++    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
++        let origin = message.frameInfo.securityOrigin
++        guard message.webView === webView, message.frameInfo.isMainFrame, origin.protocol == "https",
++              origin.host == "bilibili.com" || origin.host.hasSuffix(".bilibili.com"),
++              let body = message.body as? [String: Any] else { return }
++        switch body["kind"] as? String {
++        case "log":
++            let text = String((body["message"] as? String ?? "").prefix(300))
++            CoreBridge.shared?.emit(["event": "pageLog", "page": key, "message": text])
++        case "host" where options.coverHost:
++            CoreBridge.shared?.emit(["event": "pageLog", "page": key, "message": "host \(body["action"] as? String ?? "")"])
++            switch body["action"] as? String {
++            case "cancel":
++                window.close()
++            case "confirm":
++                // Leave the page's "uploaded, awaiting review" toast readable.
++                status.stringValue = "封面已提交，等待哔哩哔哩审核"
++                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.confirmTapped() }
++            default:
++                break
++            }
++        default:
++            break
++        }
++    }
++
+     // MARK: WKNavigationDelegate
+ 
+     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+@@ -146,16 +205,103 @@ final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate
+ 
+     /// The page's own close action (`window.close()` in web mode).
+     func webViewDidClose(_ webView: WKWebView) {
+-        window.close()
++        switch options.pageClose {
++        case .dismiss: window.close()
++        case .confirm: confirmTapped()
++        }
+     }
+ 
+-    /// Links that open a new window stay inside this window.
++    /// New-window links: Bilibili pages stay in this window (they need the
++    /// session), anything else opens in the default browser.
+     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+-        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
++        guard let url = navigationAction.request.url else { return nil }
++        if Self.isBilibili(url) {
++            webView.load(navigationAction.request)
++        } else if url.scheme == "https" || url.scheme == "http" {
++            NSWorkspace.shared.open(url)
++        }
+         return nil
+     }
+ 
++    static func isBilibili(_ url: URL) -> Bool {
++        guard url.scheme == "https", let host = url.host else { return false }
++        return host == "bilibili.com" || host.hasSuffix(".bilibili.com")
++    }
++
++    // MARK: Page scripts
++
++    /// The cover manager, when not inside the Windows client, reports Cancel
++    /// and Confirm ({type: "himeLiveCover", action, data}) to the page that
++    /// embeds it. Opened on its own it has no parent, so stand in for one.
++    static let coverHostScript = """
++    (() => {
++      const host = {
++        postMessage(data) {
++          if (!data || data.type !== 'himeLiveCover') return;
++          window.webkit.messageHandlers.livehime_page.postMessage({kind: 'host', action: String(data.action || '')});
++        }
++      };
++      try { window.parent = host; } catch (e) {}
++    })();
++    """
++
++    /// Reports failed requests, page errors and toasts. Only host and path
++    /// of a URL are kept; request and response bodies are never read beyond
++    /// the API result code and message.
++    static let diagnosticsScript = """
++    (() => {
++      const send = message => {
++        try { window.webkit.messageHandlers.livehime_page.postMessage({kind: 'log', message: String(message).slice(0, 300)}); } catch (e) {}
++      };
++      const where = url => { try { const u = new URL(url, location.href); return u.host + u.pathname; } catch (e) { return String(url).split('?')[0]; } };
++      const important = url => /upload|\\/Cover\\/|UpdatePreLiveInfo/.test(url);
++      const result = body => (body && typeof body === 'object' && 'code' in body)
++        ? { ok: body.code === 0, text: ' code=' + body.code + (body.code !== 0 && (body.message || body.msg) ? ' ' + (body.message || body.msg) : '') }
++        : { ok: true, text: '' };
++      const open = XMLHttpRequest.prototype.open, sendXHR = XMLHttpRequest.prototype.send;
++      XMLHttpRequest.prototype.open = function (method, url) { this.__livehime = [method, String(url)]; return open.apply(this, arguments); };
++      XMLHttpRequest.prototype.send = function () {
++        this.addEventListener('loadend', () => {
++          const [method, url] = this.__livehime || ['?', ''];
++          let api = { ok: true, text: '' };
++          try { api = result(this.responseType === 'json' ? this.response : (this.responseType === '' || this.responseType === 'text') ? JSON.parse(this.responseText) : null); } catch (e) {}
++          if (this.status < 200 || this.status >= 300 || !api.ok || important(url)) send(`xhr ${method} ${where(url)} -> ${this.status}${api.text}`);
++        });
++        return sendXHR.apply(this, arguments);
++      };
++      const originalFetch = window.fetch;
++      window.fetch = function (input, init) {
++        const url = typeof input === 'string' ? input : (input && input.url) || '';
++        const method = (init && init.method) || (input && input.method) || 'GET';
++        return originalFetch.apply(this, arguments).then(response => {
++          if (!response.ok || important(url)) {
++            response.clone().json().then(body => send(`fetch ${method} ${where(url)} -> ${response.status}${result(body).text}`),
++                                         () => send(`fetch ${method} ${where(url)} -> ${response.status}`));
++          }
++          return response;
++        }, error => { send(`fetch ${method} ${where(url)} failed: ${error && error.message}`); throw error; });
++      };
++      window.addEventListener('error', event => {
++        const target = event.target;
++        if (target && target !== window && (target.src || target.href)) send('load failed ' + where(target.src || target.href));
++        else send('error ' + event.message);
++      }, true);
++      window.addEventListener('unhandledrejection', event => {
++        const reason = event.reason;
++        send('rejection ' + ((reason && (reason.message || reason.msg)) || reason));
++      });
++      let lastToast = '';
++      new MutationObserver(records => {
++        for (const record of records) for (const node of record.addedNodes) {
++          if (node.nodeType !== 1 || !/toast/i.test(node.className || '')) continue;
++          const text = (node.textContent || '').trim();
++          if (text && text !== lastToast) { lastToast = text; send('toast ' + text); }
++        }
++      }).observe(document, {childList: true, subtree: true});
++    })();
++    """
++
+     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
+                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+         let alert = NSAlert()
+@@ -187,7 +333,10 @@ enum BilibiliPages {
+         return .init(title: "哔哩哔哩开播身份验证", url: components.url!, size: NSSize(width: 560, height: 640),
+                      loadingText: "正在载入哔哩哔哩官方验证页面…",
+                      readyText: "请按页面提示完成验证，然后点击「验证完成，重试开播」",
+-                     confirmTitle: "验证完成，重试开播")
++                     confirmTitle: "验证完成，重试开播",
++                     // The page closes itself when verification ends; retry
++                     // then (a failed check just asks for verification again).
++                     pageClose: .confirm)
+     }
+ 
+     /// The Windows client's cover manager (upload, crop, history, review).
+@@ -196,7 +345,7 @@ enum BilibiliPages {
+         // The cover editor (templates, preview, mobile/web previews) needs
+         // about 1080 x 620 points of page to show without clipping.
+         size: NSSize(width: 1080, height: 680), loadingText: "正在载入哔哩哔哩封面管理…",
+-        readyText: "封面修改后可能需要哔哩哔哩审核", confirmTitle: nil)
++        readyText: "封面修改后可能需要哔哩哔哩审核", confirmTitle: nil, coverHost: true)
+ }
+ 
+ /// Opens the verification window for the ready account. When the user
+@@ -319,3 +468,17 @@ public func livehime_core_open_face_auth_qr(_ url: UnsafePointer<CChar>?) {
+         }
+     }
+ }
++
++/// WKUserContentController retains its handlers; this breaks the cycle
++/// between a window's controller and its web view.
++final class WeakMessageHandler: NSObject, WKScriptMessageHandler {
++    private weak var target: WKScriptMessageHandler?
++
++    init(_ target: WKScriptMessageHandler) {
++        self.target = target
++    }
++
++    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
++        target?.userContentController(controller, didReceive: message)
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/WebLoginWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/WebLoginWindow.swift
+index eb0750501..b50535009 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/WebLoginWindow.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/WebLoginWindow.swift
+@@ -11,7 +11,7 @@ import WebKit
+ /// The page runs in a non-persistent WebKit store. On success the cookies
+ /// become SessionCredentials for the Keychain and the page data is dropped.
+ @MainActor
+-final class WebLoginWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler,
++final class WebLoginWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
+                             WKScriptMessageHandlerWithReply {
+     private static var current: WebLoginWindow?
+     static let loginURL = URL(string: "https://live.bilibili.com/p/html/live-pc-blink/mini-login-v2/")!
+@@ -59,6 +59,7 @@ final class WebLoginWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WK
+         bridge.onEvent = { [weak self] event in self?.handle(event) }
+ 
+         webView.navigationDelegate = self
++        webView.uiDelegate = self
+         window.title = "哔哩哔哩登录"
+         window.contentMinSize = NSSize(width: 820, height: 460)
+         window.contentView = webView
+@@ -173,7 +174,8 @@ final class WebLoginWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WK
+     }
+ 
+     /// Cookies can arrive shortly after the success callback; poll briefly.
+-    private func collectCookies(attempt: Int = 0) {
++    /// `attempts` 1 only checks once (after a page load).
++    private func collectCookies(attempt: Int = 0, attempts: Int = 20) {
+         guard !completed else { return }
+         webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+             guard let self, !self.completed else { return }
+@@ -184,8 +186,10 @@ final class WebLoginWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WK
+                 self.completed = true
+                 self.onComplete(credentials)
+                 self.window.close()
+-            } else if attempt < 20 {
+-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.collectCookies(attempt: attempt + 1) }
++            } else if attempt + 1 < attempts {
++                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
++                    self.collectCookies(attempt: attempt + 1, attempts: attempts)
++                }
+             }
+         }
+     }
+@@ -194,6 +198,39 @@ final class WebLoginWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WK
+ 
+     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+         webView.evaluateJavaScript(AuthWebViewBridge.nativeAuthBridgeScript, completionHandler: nil)
++        // Third-party (QQ / WeChat / Weibo) login and some verification
++        // steps come back to the page already signed in, without calling
++        // LoginSuccess. The store starts empty, so a complete jar means the
++        // account signed in here.
++        collectCookies(attempts: 1)
++    }
++
++    // MARK: WKUIDelegate
++
++    /// "Forgot password", the user agreement and the privacy policy open a
++    /// new window; show them in the default browser.
++    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
++                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
++        if let url = navigationAction.request.url, url.scheme == "https" || url.scheme == "http" {
++            NSWorkspace.shared.open(url)
++        }
++        return nil
++    }
++
++    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
++                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
++        let alert = NSAlert()
++        alert.messageText = message
++        alert.beginSheetModal(for: window) { _ in completionHandler() }
++    }
++
++    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
++                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
++        let alert = NSAlert()
++        alert.messageText = message
++        alert.addButton(withTitle: "确定")
++        alert.addButton(withTitle: "取消")
++        alert.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn) }
+     }
+ 
+     func windowWillClose(_ notification: Notification) {
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index 6e525d8d5..4eb026f3a 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -188,6 +188,12 @@ void AccountPanel::applyState(const QJsonObject &state)
+ void AccountPanel::applyEvent(const QJsonObject &event)
+ {
+ 	const QString name = event.value("event").toString();
++	if (name == "pageLog") {
++		/* Bilibili page diagnostics: host/path, status and API code only. */
++		blog(LOG_INFO, "[livehime] page %s: %s", event.value("page").toString().toUtf8().constData(),
++		     event.value("message").toString().toUtf8().constData());
++		return;
++	}
+ 	blog(LOG_INFO, "[livehime] live event -> %s", name.toUtf8().constData());
+ 
+ 	if (name == "sessionMaintenance") {

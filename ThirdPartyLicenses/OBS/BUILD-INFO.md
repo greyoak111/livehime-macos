@@ -1,4 +1,4 @@
-# OBS component used by LiveHime macOS v0.2.0
+# OBS component used by LiveHime macOS v0.2.1
 
 Since v0.2.0 the app itself is a modified OBS Studio build (not a nested
 OBS.app as in v0.1.x).
@@ -10,9 +10,9 @@ OBS.app as in v0.1.x).
 - License: GNU GPL v2 or any later version (see `COPYING`)
 - Build: `BUNDLE_ID=local.livehime.macos build-aux/livehime/build-macos.sh`
   (Xcode generator, RelWithDebInfo, arm64, `ENABLE_BROWSER=OFF`,
-  `OBS_VERSION_OVERRIDE=32.2.2`, `LIVEHIME_APP_VERSION=0.2.0`,
+  `OBS_VERSION_OVERRIDE=32.2.2`, `LIVEHIME_APP_VERSION=0.2.1`,
   `OBS_USER_CONFIG_SUBDIR=LiveHime`)
-- Bundled files: [`DEPENDENCY-INVENTORY-v0.2.0.txt`](DEPENDENCY-INVENTORY-v0.2.0.txt)
+- Bundled files: [`DEPENDENCY-INVENTORY-v0.2.1.txt`](DEPENDENCY-INVENTORY-v0.2.1.txt)
 
 Rebuild steps are in [`obs-fork/README.md`](../../obs-fork/README.md). The
 repository does not contain generated app bundles, prebuilt dependency

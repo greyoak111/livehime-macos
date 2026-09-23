@@ -1,0 +1,23 @@
+From af55910d4601210f12938035c8bd6f2039af30fe Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 05:49:21 +0800
+Subject: [PATCH 29/29] Bump LiveHime to 0.2.1
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/build-macos.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
+index 6fa67cd33..0db84b9a2 100755
+--- a/build-aux/livehime/build-macos.sh
++++ b/build-aux/livehime/build-macos.sh
+@@ -20,7 +20,7 @@ cmake -S "$source_dir" --preset macos \
+   -DLIVEHIME_APP_BUNDLE_ID="$bundle_id" \
+   -DLIVEHIME_APP_NAME=LiveHime \
+   -DLIVEHIME_APP_DISPLAY_NAME=LiveHime \
+-  -DLIVEHIME_APP_VERSION=0.2.0 \
++  -DLIVEHIME_APP_VERSION=0.2.1 \
+   -DOBS_USER_CONFIG_SUBDIR=LiveHime
+ 
+ cmake --build "$source_dir/build_macos" --config "$config" --target obs-studio -- -quiet

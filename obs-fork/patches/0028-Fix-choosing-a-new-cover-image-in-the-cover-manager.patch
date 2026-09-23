@@ -1,0 +1,398 @@
+From aac85bf69f6b1b69b3c120079057da0a0dcb097e Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 05:41:55 +0800
+Subject: [PATCH 28/29] Fix choosing a new cover image in the cover manager
+
+Two things the page relies on in Chromium fail in WebKit:
+- Re-upload clicks a file input that is never added to the document;
+  WebKit may collect it while the open panel is up, so the chosen file
+  never arrives. Keep such inputs in the document until the choice.
+- Its image loader appends ?<timestamp> to blob: URLs, which WebKit
+  cannot load, so the editor kept the previous picture and Confirm
+  uploaded the old cover again. Drop the query from blob: URLs.
+
+Adds test hooks for hosted pages (script evaluation, real clicks, a
+preset file for the chooser via LIVEHIME_E2E_PICK_FILE) and an E2E check
+that replaced the room cover with a chosen local image.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  15 +++
+ build-aux/livehime/tests/e2e-cover.mjs        |  87 ++++++++++++++
+ .../LiveHimeCore/BilibiliPageWindow.swift     | 107 ++++++++++++++++++
+ plugins/livehime/core/include/livehime-core.h |  11 ++
+ plugins/livehime/src/automation.cpp           |  58 ++++++++++
+ 5 files changed, 278 insertions(+)
+ create mode 100644 build-aux/livehime/tests/e2e-cover.mjs
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 31012862d..5bff92c4e 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -55,3 +55,18 @@ area to the given directory:
+ ```bash
+ node e2e-floating.mjs <websocket password> <screen width> <screen height> <crop dir>
+ ```
++
++## Cover manager check
++
++`e2e-cover.mjs` drives Bilibili's cover manager in the real window: a real
++click on "重新上传", the file chooser answered with
++`LIVEHIME_E2E_PICK_FILE`, then checks that the editor canvas shows the
++chosen image. With `--submit` it also clicks "确定" and checks that the
++room cover changed. `--submit` replaces the signed-in account's live room
++cover (it goes to Bilibili review), so run it only with the account
++owner's consent:
++
++```bash
++open --env LIVEHIME_E2E_PICK_FILE=/path/to/image.jpg build_macos/frontend/RelWithDebInfo/LiveHime.app
++node e2e-cover.mjs <websocket password> image.jpg [--submit]
++```
+diff --git a/build-aux/livehime/tests/e2e-cover.mjs b/build-aux/livehime/tests/e2e-cover.mjs
+new file mode 100644
+index 000000000..3c56811f6
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-cover.mjs
+@@ -0,0 +1,87 @@
++// Cover manager: re-upload a local image and confirm, through a real click.
++// Usage: node e2e-cover.mjs <ws password> <file name picked by LIVEHIME_E2E_PICK_FILE> [--submit]
++import { createHash } from 'node:crypto';
++const [password, fileName] = process.argv.slice(2);
++const submit = process.argv.includes('--submit');
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const ws = new WebSocket('ws://127.0.0.1:4466');
++let id = 1; const pend = new Map();
++const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: t, requestData: d })).responseData?.responseData;
++const page = async (script) => { const r = await vendor('HostedPage', { page: 'cover', script }); return r?.result ? JSON.parse(r.result) : r; };
++let fails = 0;
++const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
++// The cover editor component (Vue 2) and a leaf element by its exact text.
++const helpers = `
++  const editor = () => { for (const el of document.querySelectorAll('*')) { const vm = el.__vue__; if (vm && 'rawSrc' in vm && 'hasCoverImage' in vm && 'isUploading' in vm && vm.handleReload) return vm; } return null; };
++  const clipper = () => { for (const el of document.querySelectorAll('*')) { const vm = el.__vue__; if (vm && typeof vm.exportEditedCanvas === 'function') return vm; } return null; };
++  const byText = (text) => [...document.querySelectorAll('body *')].filter(e => e.children.length === 0 && e.textContent.trim() === text && e.getBoundingClientRect().width > 0);
++  const center = (e) => { const r = e.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; };
++`;
++const state = () => page(helpers + `const vm = editor(); return vm && { rawName: vm.rawSrc && vm.rawSrc.name || null, rawType: vm.rawSrc && vm.rawSrc.constructor.name, status: vm.rawSrcStatus, has: vm.hasCoverImage, uploading: vm.isUploading };`);
++
++ws.onmessage = async (ev) => {
++  const m = JSON.parse(ev.data);
++  if (m.op === 0) { const { challenge, salt } = m.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + salt) + challenge), eventSubscriptions: 0 } })); return; }
++  if (m.op === 7) { pend.get(m.d.requestId)?.(m.d); return; }
++  if (m.op !== 2) return;
++  try {
++    let acct;
++    for (let i = 0; i < 40; i++) { acct = await vendor('GetAccountState'); if (acct?.state === 'ready') break; await sleep(500); }
++    check('account ready', acct?.state === 'ready', acct?.state);
++    await vendor('HostedPage', { open: 'cover' });
++    let st;
++    for (let i = 0; i < 40; i++) { await sleep(500); st = await state(); if (st && st.status === 'ready') break; }
++    check('cover editor loaded with the current cover', st?.status === 'ready', JSON.stringify(st));
++    const before = await page(helpers + `const vm = editor(); return vm && vm.liveCover;`);
++    console.log('room cover before:', JSON.stringify(before));
++    const target = await page(helpers + `const e = byText('重新上传')[0]; return e && center(e);`);
++    check('re-upload button found', !!target?.x, JSON.stringify(target));
++    const clicked = await vendor('HostedPage', { page: 'cover', click: target });
++    check('real click sent', clicked?.clicked);
++    for (let i = 0; i < 16; i++) { await sleep(500); st = await state(); if (st?.rawName) break; }
++    check('page took the local image', st?.rawName === fileName, JSON.stringify(st));
++    // What Confirm would upload: the editor canvas the export draws from, compared with the
++    // chosen file (average colour of each, centre-cropped to 4:3).
++    await sleep(2500);
++    const cmp = await page(helpers + `
++      const vm = editor();
++      const avg = (source, w, h) => { const c = document.createElement('canvas'); c.width = 48; c.height = 36;
++        const s = Math.min(w / 4, h / 3), sw = 4 * s, sh = 3 * s; const g = c.getContext('2d');
++        g.drawImage(source, (w - sw) / 2, (h - sh) / 2, sw, sh, 0, 0, 48, 36);
++        const d = g.getImageData(0, 0, 48, 36).data; let r = 0, gg = 0, b = 0; for (let i = 0; i < d.length; i += 4) { r += d[i]; gg += d[i + 1]; b += d[i + 2]; }
++        const n = d.length / 4; return [r / n, gg / n, b / n].map(v => Math.round(v)); };
++      let stage = 'export';
++      try {
++        const exported = clipper().getInternalCanvas();
++        stage = 'read file';
++        const url = await new Promise(res => { const f = new FileReader(); f.onload = () => res(f.result); f.readAsDataURL(vm.rawSrc); });
++        stage = 'load file';
++        const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('image load')); i.src = url; });
++        stage = 'measure export';
++        const e = avg(exported, exported.width, exported.height);
++        stage = 'measure file';
++        return { exported: e, chosen: avg(img, img.naturalWidth, img.naturalHeight), size: [exported.width, exported.height], editorImg: String(vm.imgSrc).slice(0, 60) };
++      } catch (err) { return { stage, err: String(err && (err.name + ': ' + err.message)), editorImg: String(vm.imgSrc).slice(0, 60) }; }`);
++    const dist = cmp?.exported ? Math.hypot(...cmp.exported.map((v, i) => v - cmp.chosen[i])) : 999;
++    check('export (what Confirm uploads) shows the chosen image', dist < 12, JSON.stringify(cmp) + ' dist=' + dist.toFixed(1));
++    if (submit && st?.rawName === fileName && dist < 12) {
++      await sleep(1500);
++      const ok = await page(helpers + `const e = byText('确定').filter(e => e.closest('.action-bar'))[0] || byText('确定')[0]; return e && center(e);`);
++      check('confirm button found', !!ok?.x, JSON.stringify(ok));
++      await vendor('HostedPage', { page: 'cover', click: ok });
++      let closed = false;
++      for (let i = 0; i < 30; i++) { await sleep(500); const r = await vendor('HostedPage', { page: 'cover', script: 'return 1' }); if (r?.result?.includes?.('page not open') || r?.error) { closed = true; break; } }
++      check('window closed after the upload (host confirm)', closed);
++      // Reopen: the room's current cover should now be the submitted one.
++      await sleep(1500);
++      await vendor('HostedPage', { open: 'cover' });
++      let now;
++      for (let i = 0; i < 40; i++) { await sleep(500); now = await page(helpers + `const vm = editor(); return vm && vm.rawSrcStatus === 'ready' ? { cover: vm.liveCover, auditing: vm.isAuditing } : null;`); if (now?.cover) break; }
++      console.log('room cover after reopening:', JSON.stringify(now));
++      check('room cover changed', now?.cover && JSON.stringify(now.cover) !== JSON.stringify(before), '');
++    }
++  } catch (e) { check('run', false, e.stack); }
++  console.log(fails ? `${fails} failed` : 'all passed'); process.exit(fails ? 1 : 0);
++};
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+index 72fcb05b9..003110d59 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+@@ -73,6 +73,8 @@ final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate
+         let content = WKUserContentController()
+         content.addUserScript(WKUserScript(source: Self.diagnosticsScript, injectionTime: .atDocumentStart,
+                                            forMainFrameOnly: true))
++        content.addUserScript(WKUserScript(source: Self.webKitCompatibilityScript, injectionTime: .atDocumentStart,
++                                           forMainFrameOnly: true))
+         if options.coverHost {
+             content.addUserScript(WKUserScript(source: Self.coverHostScript, injectionTime: .atDocumentStart,
+                                                forMainFrameOnly: true))
+@@ -194,6 +196,12 @@ final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate
+     /// `<input type="file">` for cover uploads.
+     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
++        CoreBridge.shared?.emit(["event": "pageLog", "page": key, "message": "file chooser opened"])
++        // Tests: pick this file after a person's reaction time, without the panel.
++        if let path = ProcessInfo.processInfo.environment["LIVEHIME_E2E_PICK_FILE"], !path.isEmpty {
++            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { completionHandler([URL(fileURLWithPath: path)]) }
++            return
++        }
+         let panel = NSOpenPanel()
+         panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+         panel.canChooseDirectories = false
+@@ -224,6 +232,40 @@ final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate
+         return nil
+     }
+ 
++    // MARK: Test hooks (driven through the obs-websocket automation vendor)
++
++    static func page(_ key: String) -> BilibiliPageWindow? { open[key] }
++
++    /// Runs `script` as an async function body in the page; `done` gets the
++    /// JSON of its return value, or {"error": ...}.
++    func evaluate(_ script: String, done: @escaping (String) -> Void) {
++        let body = "return JSON.stringify(await (async () => { \(script) })());"
++        webView.callAsyncJavaScript(body, arguments: [:], in: nil, in: .page) { result in
++            switch result {
++            case .success(let value): done(value as? String ?? "null")
++            case .failure(let error):
++                let text = (try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription]))
++                done(text.map { String(decoding: $0, as: UTF8.self) } ?? "{}")
++            }
++        }
++    }
++
++    /// A real mouse click at page coordinates (CSS pixels from the top left),
++    /// so the page sees a user gesture.
++    func click(x: Double, y: Double) {
++        let local = webView.isFlipped ? NSPoint(x: x, y: y) : NSPoint(x: x, y: webView.bounds.height - y)
++        let location = webView.convert(local, to: nil)
++        window.makeKeyAndOrderFront(nil)
++        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
++            if let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
++                                              timestamp: ProcessInfo.processInfo.systemUptime,
++                                              windowNumber: window.windowNumber, context: nil, eventNumber: 0,
++                                              clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0) {
++                window.sendEvent(event)
++            }
++        }
++    }
++
+     static func isBilibili(_ url: URL) -> Bool {
+         guard url.scheme == "https", let host = url.host else { return false }
+         return host == "bilibili.com" || host.hasSuffix(".bilibili.com")
+@@ -246,6 +288,42 @@ final class BilibiliPageWindow: NSObject, NSWindowDelegate, WKNavigationDelegate
+     })();
+     """
+ 
++    /// The pages are written for the Windows client's Chromium; two things
++    /// they rely on fail in WebKit:
++    /// - A file input that is never added to the document can be garbage
++    ///   collected while the open panel is up, so its change event (the
++    ///   chosen image) never arrives. Keep it in the document until then.
++    /// - Image loaders add "?<timestamp>" to every non-data URL. Chromium
++    ///   ignores a query on a blob: URL, WebKit fails to load it, so a newly
++    ///   chosen local image never reaches the cover editor and Confirm
++    ///   uploads the previous picture again. Drop the query from blob: URLs.
++    static let webKitCompatibilityScript = """
++    (() => {
++      const click = HTMLInputElement.prototype.click;
++      HTMLInputElement.prototype.click = function () {
++        if (this.type === 'file' && !this.isConnected && document.body) {
++          this.style.display = 'none';
++          document.body.appendChild(this);
++          const done = () => setTimeout(() => this.remove(), 0);
++          this.addEventListener('change', done, {once: true});
++          this.addEventListener('cancel', done, {once: true});
++        }
++        return click.apply(this, arguments);
++      };
++      const clean = value => (typeof value === 'string' && value.startsWith('blob:')) ? value.replace(/\\?\\d+$/, '') : value;
++      const src = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
++      Object.defineProperty(HTMLImageElement.prototype, 'src', {
++        configurable: true, enumerable: src.enumerable, get: src.get,
++        set(value) { src.set.call(this, clean(value)); }
++      });
++      const setAttribute = Element.prototype.setAttribute;
++      Element.prototype.setAttribute = function (name, value) {
++        if (this instanceof HTMLImageElement && String(name).toLowerCase() === 'src') value = clean(value);
++        return setAttribute.call(this, name, value);
++      };
++    })();
++    """
++
+     /// Reports failed requests, page errors and toasts. Only host and path
+     /// of a URL are kept; request and response bodies are never read beyond
+     /// the API result code and message.
+@@ -482,3 +560,32 @@ final class WeakMessageHandler: NSObject, WKScriptMessageHandler {
+         target?.userContentController(controller, didReceive: message)
+     }
+ }
++
++public typealias LiveHimePageResultCallback = @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void
++
++/// Test hook: evaluates a script in the open hosted page `key` ("cover",
++/// "faceAuth"). `done` runs on the main thread with the JSON result.
++@_cdecl("livehime_core_page_eval")
++public func livehime_core_page_eval(_ key: UnsafePointer<CChar>?, _ script: UnsafePointer<CChar>?,
++                                    _ done: LiveHimePageResultCallback?, _ context: UnsafeMutableRawPointer?) {
++    let name = key.map { String(cString: $0) } ?? ""
++    let source = script.map { String(cString: $0) } ?? ""
++    MainActor.assumeIsolated {
++        guard let page = BilibiliPageWindow.page(name) else {
++            done?("{\"error\":\"page not open\"}", context)
++            return
++        }
++        page.evaluate(source) { json in json.withCString { done?($0, context) } }
++    }
++}
++
++/// Test hook: clicks the open hosted page `key` at page coordinates.
++@_cdecl("livehime_core_page_click")
++public func livehime_core_page_click(_ key: UnsafePointer<CChar>?, _ x: Double, _ y: Double) -> Int32 {
++    let name = key.map { String(cString: $0) } ?? ""
++    return MainActor.assumeIsolated {
++        guard let page = BilibiliPageWindow.page(name) else { return 0 }
++        page.click(x: x, y: y)
++        return 1
++    }
++}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 8dff0ddfe..387c55779 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -48,6 +48,17 @@ void livehime_core_open_face_auth_qr(const char *url);
+  * the ready account; emits {"event":"coverWindowClosed"} when it closes. */
+ void livehime_core_open_cover_page(void);
+ 
++/* Test hooks for the hosted pages above (automation only). Call on the
++ * main thread. page_eval runs `script` as an async function body in the
++ * open page `key` ("cover", "faceAuth") and calls `done` on the main thread
++ * with the JSON of its return value or {"error":...}. page_click sends a
++ * real mouse click at page coordinates; returns 0 when the page is not
++ * open. With LIVEHIME_E2E_PICK_FILE set, a page's file chooser picks that
++ * file instead of showing the open panel. */
++typedef void (*livehime_page_result_callback)(const char *result_json, void *context);
++void livehime_core_page_eval(const char *key, const char *script, livehime_page_result_callback done, void *context);
++int livehime_core_page_click(const char *key, double x, double y);
++
+ /* Room activity. Once the account is ready the core keeps the room's danmaku
+  * connection open and emits:
+  *   {"event":"danmakuStatus","status":"connecting|connected|reconnecting|stopped"}
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 495949e11..3c98d85e7 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -19,6 +19,11 @@
+ #include <QMetaObject>
+ #include <QPointer>
+ 
++#include <chrono>
++#include <future>
++#include <memory>
++#include <string>
++
+ namespace {
+ obs_websocket_vendor vendor = nullptr;
+ QPointer<LiveHimeDock> target;
+@@ -164,6 +169,57 @@ void floatingChat(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
++/* Hosted Bilibili pages for tests: {"open":"cover"} opens the cover
++ * manager; {"page","script"} evaluates an async function body there and
++ * returns its JSON as "result"; {"page","click":{"x","y"}} clicks at page
++ * coordinates. */
++void hostedPage(obs_data_t *request, obs_data_t *response, void *)
++{
++	const std::string open = obs_data_get_string(request, "open");
++	const std::string page = obs_data_get_string(request, "page");
++	const std::string script = obs_data_get_string(request, "script");
++	if (open == "cover") {
++		onUiThread([] { livehime_core_open_cover_page(); });
++		obs_data_set_bool(response, "opened", true);
++		return;
++	}
++	if (obs_data_has_user_value(request, "click")) {
++		OBSDataAutoRelease click = obs_data_get_obj(request, "click");
++		const double x = obs_data_get_double(click, "x"), y = obs_data_get_double(click, "y");
++		int ok = 0;
++		onUiThread([&] { ok = livehime_core_page_click(page.c_str(), x, y); });
++		obs_data_set_bool(response, "clicked", ok != 0);
++		return;
++	}
++	if (script.empty())
++		return;
++	/* The result arrives later on the main thread; wait here, on the
++	 * websocket thread. */
++	auto result = std::make_shared<std::promise<std::string>>();
++	std::future<std::string> future = result->get_future();
++	auto *holder = new std::shared_ptr<std::promise<std::string>>(result);
++	const bool ran = onUiThread([&] {
++		livehime_core_page_eval(
++			page.c_str(), script.c_str(),
++			[](const char *json, void *context) {
++				auto *promise = static_cast<std::shared_ptr<std::promise<std::string>> *>(context);
++				(*promise)->set_value(json ? json : "null");
++				delete promise;
++			},
++			holder);
++	});
++	if (!ran) {
++		delete holder;
++		obs_data_set_string(response, "error", "dock unavailable");
++		return;
++	}
++	if (future.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
++		obs_data_set_string(response, "error", "timeout");
++		return;
++	}
++	obs_data_set_string(response, "result", future.get().c_str());
++}
++
+ void startQRLogin(obs_data_t *, obs_data_t *, void *)
+ {
+ 	onUiThread([] { livehime_core_start_qr_login(); });
+@@ -192,6 +248,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "FloatingChat", floatingChat, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "StartQRLogin", startQRLogin, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "CancelQRLogin", cancelQRLogin, nullptr);
++	obs_websocket_vendor_register_request(vendor, "HostedPage", hostedPage, nullptr);
+ }
+ 
+ void UnregisterAutomation()
+@@ -206,6 +263,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "FloatingChat");
+ 		obs_websocket_vendor_unregister_request(vendor, "StartQRLogin");
+ 		obs_websocket_vendor_unregister_request(vendor, "CancelQRLogin");
++		obs_websocket_vendor_unregister_request(vendor, "HostedPage");
+ 		vendor = nullptr;
+ 	}
+ 	target.clear();
