@@ -1,0 +1,180 @@
+From daad1d07361fd2acb676ca240d8333bdefd42fb5 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 06:08:20 +0800
+Subject: [PATCH 30/30] Add a styled DMG packager with install notes
+
+package-dmg.sh builds the release DMG with a background (arrow from the
+app to Applications, bilingual install, upgrade and first-launch notes),
+fixed icon positions, no toolbar, and the app icon as the volume icon.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/dmg/background.swift | 95 +++++++++++++++++++++++++
+ build-aux/livehime/package-dmg.sh       | 56 +++++++++++++++
+ 2 files changed, 151 insertions(+)
+ create mode 100644 build-aux/livehime/dmg/background.swift
+ create mode 100755 build-aux/livehime/package-dmg.sh
+
+diff --git a/build-aux/livehime/dmg/background.swift b/build-aux/livehime/dmg/background.swift
+new file mode 100644
+index 000000000..25feee6a9
+--- /dev/null
++++ b/build-aux/livehime/dmg/background.swift
+@@ -0,0 +1,95 @@
++// Draws the LiveHime DMG window background (640 x 440 points).
++// Usage: swift background.swift <out.png> <scale> <app icon .icns> <version>
++// Finder places the app icon at (170, 180) and Applications at (470, 180),
++// icon centres in points from the top left; package-dmg.sh uses the same
++// numbers.
++import AppKit
++
++let args = CommandLine.arguments
++let (out, scale, iconPath, version) = (args[1], CGFloat(Double(args[2]) ?? 1), args[3], args[4])
++let size = NSSize(width: 640, height: 440)
++let accent = NSColor(srgbRed: 0.984, green: 0.302, blue: 0.353, alpha: 1)   // #fb4d5a
++let ink = NSColor(srgbRed: 0.13, green: 0.14, blue: 0.16, alpha: 1)
++let muted = NSColor(srgbRed: 0.45, green: 0.47, blue: 0.51, alpha: 1)
++
++let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
++                           bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
++                           colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
++rep.size = size
++NSGraphicsContext.saveGraphicsState()
++let bitmap = NSGraphicsContext(bitmapImageRep: rep)!
++// A flipped context so text and images draw upright with a top-left origin.
++NSGraphicsContext.current = NSGraphicsContext(cgContext: bitmap.cgContext, flipped: true)
++// Top-left origin, like Finder's icon positions.
++let flip = NSAffineTransform()
++flip.translateX(by: 0, yBy: size.height)
++flip.scaleX(by: 1, yBy: -1)
++flip.concat()
++
++// Background: soft warm white with a faint accent glow at the top.
++NSColor(srgbRed: 0.975, green: 0.973, blue: 0.978, alpha: 1).setFill()
++NSRect(origin: .zero, size: size).fill()
++NSGradient(colors: [accent.withAlphaComponent(0.10), accent.withAlphaComponent(0)])!
++    .draw(in: NSRect(x: 0, y: 0, width: size.width, height: 150), angle: 90)
++
++func draw(_ text: String, _ font: NSFont, _ color: NSColor, centerX: CGFloat = 320, y: CGFloat) {
++    let paragraph = NSMutableParagraphStyle()
++    paragraph.alignment = .center
++    let attributed = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color, .paragraphStyle: paragraph])
++    let height = attributed.size().height
++    attributed.draw(in: NSRect(x: centerX - 300, y: y, width: 600, height: height + 2))
++}
++
++// Title with the app icon.
++if let icon = NSImage(contentsOfFile: iconPath) {
++    icon.draw(in: NSRect(x: 214, y: 28, width: 32, height: 32), from: .zero, operation: .sourceOver, fraction: 1,
++              respectFlipped: true, hints: nil)
++}
++let title = NSAttributedString(string: "安装 LiveHime", attributes: [.font: NSFont.systemFont(ofSize: 22, weight: .semibold), .foregroundColor: ink])
++title.draw(at: NSPoint(x: 252, y: 31))
++draw("Install LiveHime \(version)  ·  哔哩哔哩直播姬 macOS 第三方版", .systemFont(ofSize: 12), muted, y: 66)
++
++// Arrow from the app to Applications.
++let arrow = NSBezierPath()
++arrow.move(to: NSPoint(x: 252, y: 180))
++arrow.curve(to: NSPoint(x: 382, y: 180), controlPoint1: NSPoint(x: 290, y: 158), controlPoint2: NSPoint(x: 344, y: 158))
++arrow.lineWidth = 3
++arrow.lineCapStyle = .round
++arrow.setLineDash([2, 9], count: 2, phase: 0)
++accent.setStroke()
++arrow.stroke()
++let head = NSBezierPath()
++head.move(to: NSPoint(x: 370, y: 166))
++head.line(to: NSPoint(x: 388, y: 182))
++head.line(to: NSPoint(x: 366, y: 188))
++head.lineWidth = 3
++head.lineCapStyle = .round
++head.lineJoinStyle = .round
++head.stroke()
++draw("拖进来 / Drag here", .systemFont(ofSize: 11, weight: .medium), accent, y: 196)
++
++// Notes card.
++let card = NSBezierPath(roundedRect: NSRect(x: 40, y: 282, width: 560, height: 118), xRadius: 12, yRadius: 12)
++NSColor.white.withAlphaComponent(0.85).setFill()
++card.fill()
++NSColor(white: 0, alpha: 0.06).setStroke()
++card.lineWidth = 1
++card.stroke()
++let notes: [(String, String)] = [
++    ("① 把 LiveHime 拖到右边的“应用程序”即可完成安装。", "Drag LiveHime onto Applications to install."),
++    ("② 升级时选择“替换”，登录信息和 OBS 设置都会保留。", "Upgrading? Choose Replace. Your login and settings are kept."),
++    ("③ 首次打开被拦截：系统设置 → 隐私与安全性 → 仍要打开。", "Blocked on first launch? System Settings → Privacy & Security → Open Anyway."),
++]
++var y: CGFloat = 294
++for (zh, en) in notes {
++    NSAttributedString(string: zh, attributes: [.font: NSFont.systemFont(ofSize: 12.5, weight: .medium), .foregroundColor: ink])
++        .draw(at: NSPoint(x: 60, y: y))
++    NSAttributedString(string: en, attributes: [.font: NSFont.systemFont(ofSize: 10.5), .foregroundColor: muted])
++        .draw(at: NSPoint(x: 78, y: y + 17))
++    y += 35
++}
++draw("第三方社区项目，与哔哩哔哩官方无关  ·  Unofficial community project, not affiliated with Bilibili",
++     .systemFont(ofSize: 10), muted.withAlphaComponent(0.8), y: 412)
++
++NSGraphicsContext.restoreGraphicsState()
++try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
+diff --git a/build-aux/livehime/package-dmg.sh b/build-aux/livehime/package-dmg.sh
+new file mode 100755
+index 000000000..76fee5645
+--- /dev/null
++++ b/build-aux/livehime/package-dmg.sh
+@@ -0,0 +1,56 @@
++#!/bin/zsh
++# Packages a built LiveHime.app as the release DMG: the app (renamed to
++# LiveHimeMacApp.app, the name v0.1.x installed), an Applications link, a
++# background with install notes, and the app icon as the volume icon.
++# Usage: package-dmg.sh <LiveHime.app> <version> <out.dmg>
++set -euo pipefail
++
++app=$1 version=$2 out=${3:A}
++here=${0:A:h}
++volume="LiveHime $version"
++work=$(mktemp -d)
++trap 'hdiutil detach "/Volumes/$volume" -quiet 2>/dev/null || true; rm -rf "$work"' EXIT
++
++mkdir -p "$work/root/.background"
++ditto "$app" "$work/root/LiveHimeMacApp.app"
++ln -s /Applications "$work/root/Applications"
++icon="$work/root/LiveHimeMacApp.app/Contents/Resources/AppIcon.icns"
++swift "$here/dmg/background.swift" "$work/bg.png" 1 "$icon" "$version"
++swift "$here/dmg/background.swift" "$work/bg@2x.png" 2 "$icon" "$version"
++tiffutil -cathidpicheck "$work/bg.png" "$work/bg@2x.png" -out "$work/root/.background/background.tiff" 2>/dev/null
++cp "$icon" "$work/root/.VolumeIcon.icns"
++
++hdiutil detach "/Volumes/$volume" -quiet 2>/dev/null || true
++hdiutil create -quiet -volname "$volume" -srcfolder "$work/root" -fs HFS+ -format UDRW -size 400m "$work/rw.dmg"
++hdiutil attach -quiet -readwrite -noverify -noautoopen "$work/rw.dmg"
++SetFile -a C "/Volumes/$volume"
++
++# Window: 640 x 440 content, no toolbar, icons at the background's spots.
++osascript <<OSA
++tell application "Finder"
++  tell disk "$volume"
++    open
++    set current view of container window to icon view
++    set toolbar visible of container window to false
++    set statusbar visible of container window to false
++    set bounds of container window to {200, 120, 840, 588}
++    set options to icon view options of container window
++    set arrangement of options to not arranged
++    set icon size of options to 112
++    set text size of options to 13
++    set background picture of options to file ".background:background.tiff"
++    set position of item "LiveHimeMacApp.app" of container window to {170, 180}
++    set position of item "Applications" of container window to {470, 180}
++    update without registering applications
++    delay 1
++    close
++  end tell
++end tell
++OSA
++sync
++rm -rf "/Volumes/$volume/.fseventsd"
++hdiutil detach -quiet "/Volumes/$volume"
++rm -f "$out"
++hdiutil convert -quiet "$work/rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$out"
++hdiutil verify -quiet "$out"
++print -- "$out"

@@ -1,7 +1,7 @@
 From b37badb75c7a855df1959e2dfcb3c6a0b8adb671 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 22:55:50 +0800
-Subject: [PATCH 04/29] Add LiveHime control dock plugin with streaming
+Subject: [PATCH 04/30] Add LiveHime control dock plugin with streaming
  controller
 
 plugins/livehime adds a "LiveHime" dock to the main window. Its

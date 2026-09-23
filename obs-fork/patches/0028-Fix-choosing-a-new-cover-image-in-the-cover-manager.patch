@@ -1,7 +1,7 @@
 From aac85bf69f6b1b69b3c120079057da0a0dcb097e Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 05:41:55 +0800
-Subject: [PATCH 28/29] Fix choosing a new cover image in the cover manager
+Subject: [PATCH 28/30] Fix choosing a new cover image in the cover manager
 
 Two things the page relies on in Chromium fail in WebKit:
 - Re-upload clicks a file input that is never added to the document;

@@ -7,7 +7,7 @@ upstream OBS Studio, so the released app can be rebuilt from public sources
 
 - Upstream: https://github.com/obsproject/obs-studio
 - Base: tag `32.2.2`, commit `ba2f32bdf791005443988a4955e963663e16b1ed`
-- Patches: `patches/0001-…` to `patches/0029-…` (`git format-patch --binary`)
+- Patches: `patches/0001-…` to `patches/0030-…` (`git format-patch --binary`)
 
 The plugin lives in `plugins/livehime` after applying: a Qt C++ dock and a
 Swift core (`plugins/livehime/core`, SwiftPM, `swift test`). The series also
@@ -33,6 +33,7 @@ BUNDLE_ID=local.livehime.macos ./build-aux/livehime/build-macos.sh
 ```
 
 The app is written to `build_macos/frontend/RelWithDebInfo/LiveHime.app`;
-releases ship it renamed to `LiveHimeMacApp.app`. The build script signs with
+releases ship it renamed to `LiveHimeMacApp.app`, packaged with
+`build-aux/livehime/package-dmg.sh <LiveHime.app> <version> <out.dmg>`. The build script signs with
 a local self-signed development identity it creates on first use; `SIGN=0`
 skips signing.

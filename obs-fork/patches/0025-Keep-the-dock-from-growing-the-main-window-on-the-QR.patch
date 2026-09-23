@@ -1,7 +1,7 @@
 From e8c513c868edf78f561d4a9ce09132fcf766fbfa Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 03:46:13 +0800
-Subject: [PATCH 25/29] Keep the dock from growing the main window on the QR
+Subject: [PATCH 25/30] Keep the dock from growing the main window on the QR
  login page
 
 The QR page is the tallest account page; its minimum height propagated up

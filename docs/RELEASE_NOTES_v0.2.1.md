@@ -23,6 +23,10 @@ password/SMS login) now all work.
 - **外部链接 / External links：** 页面里指向其他网站的链接改用默认浏览器打开。
   Links to other sites open in your default browser.
 
+- **安装包 / Installer：** DMG 打开后有安装指引：箭头提示拖到“应用程序”，并用中英双语说明升级会保留登录、
+  首次打开被拦截时怎么办。
+  The DMG window now shows an arrow to Applications and bilingual notes on upgrading and first launch.
+
 ## 诊断 / Diagnostics
 
 这些网页现在会把失败的请求、页面错误和页面提示写进 OBS 日志。日志只记录域名、路径和返回码，不记录 Cookie、
@@ -47,5 +51,5 @@ Open the DMG, drag LiveHime onto Applications and choose Replace. Login and sett
 
 ## 源码 / Source
 
-基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)（共 29 个）。
-The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/) (29 patches).
+基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)（共 30 个）。
+The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/) (30 patches).
