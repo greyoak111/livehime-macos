@@ -1,7 +1,7 @@
 From 6abf4580ee6cb62cc83a12e1fa895266bd5f2276 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 00:44:04 +0800
-Subject: [PATCH 17/39] Add a "LiveHime danmaku" overlay source
+Subject: [PATCH 17/43] Add a "LiveHime danmaku" overlay source
 
 A native OBS source that shows the latest room messages (chat, gifts,
 Super Chats, guard purchases) on the canvas without a browser source.
@@ -581,3 +581,6 @@ index fa3d77397..81f01ebb6 100644
  	obs_frontend_remove_event_callback(onFrontendEvent, nullptr);
 +	DanmakuOverlayHub::destroy();
  }
+-- 
+2.54.0 (Apple Git-157)
+

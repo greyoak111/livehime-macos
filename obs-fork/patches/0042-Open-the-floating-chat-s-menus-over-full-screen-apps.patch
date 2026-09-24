@@ -1,0 +1,239 @@
+From 35a488ba889d4e77017a578063907986625a31b4 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 23:29:06 +0800
+Subject: [PATCH 42/43] Open the floating chat's menus over full-screen apps
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The "⋯" menu and the danmaku right-click menu are separate popup windows
+and stayed out of another app's full-screen Space. Before each popup they
+now join all Spaces as a full-screen auxiliary, non-activating panel. The
+exclusive behaviour bits Qt sets are cleared first (AppKit throws on
+conflicting combinations), and a refusal is logged instead of thrown.
+The FloatingChat test hook can pop the menu up; e2e-float-fullscreen.mjs
+checks it over a full-screen app.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../livehime/tests/e2e-float-fullscreen.mjs   | 21 +++++++++++-
+ plugins/livehime/src/automation.cpp           | 11 ++++++-
+ plugins/livehime/src/danmaku-feed.cpp         |  3 ++
+ plugins/livehime/src/floating-chat.cpp        |  2 ++
+ plugins/livehime/src/floating-chat.hpp        |  4 +++
+ plugins/livehime/src/window-native.hpp        |  6 ++++
+ plugins/livehime/src/window-native.mm         | 32 +++++++++++++++++++
+ 7 files changed, 77 insertions(+), 2 deletions(-)
+
+diff --git a/build-aux/livehime/tests/e2e-float-fullscreen.mjs b/build-aux/livehime/tests/e2e-float-fullscreen.mjs
+index cda42bfee..df355bc1f 100644
+--- a/build-aux/livehime/tests/e2e-float-fullscreen.mjs
++++ b/build-aux/livehime/tests/e2e-float-fullscreen.mjs
+@@ -3,9 +3,10 @@
+ // another app's normal window while LiveHime is inactive.
+ // Usage: swiftc -O fullscreen-probe.swift -o /tmp/fullscreen-probe
+ //        node e2e-float-fullscreen.mjs <ws password> <LiveHime pid> /tmp/fullscreen-probe
++// The "⋯" menu must also open over the full-screen window.
+ // The probe takes over the screen for a few seconds per case.
+ import { createHash } from 'node:crypto';
+-import { execFileSync } from 'node:child_process';
++import { execFile, execFileSync } from 'node:child_process';
+ const [password, pid, helper] = process.argv.slice(2);
+ const sha = (s) => createHash('sha256').update(s).digest('base64');
+ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+@@ -53,6 +54,24 @@ for (const onTop of [true, false]) {
+   if (!ok) fails++;
+   console.log(`${ok ? 'PASS' : 'FAIL'}  on_top=true, LiveHime inactive: chat in front of the other app's window (layer ${layer})`);
+ }
++{
++  // The "⋯" menu opened while another app is full screen.
++  await vendor('FloatingChat', { visible: true, on_top: true, x: 120, y: 160, w: 340, h: 460 });
++  await sleep(800);
++  const probe = new Promise((ok) => execFile(helper, [pid, '4'], { encoding: 'utf8' }, (_, out) => ok(out)));
++  await sleep(2500);
++  const st = await vendor('FloatingChat', { menu: true });
++  const out = await probe;
++  await vendor('FloatingChat', { menu: false });
++  const targets = out.split('\n').filter((l) => / target /.test(l));
++  const menu = targets.find((l) => !/340x460/.test(l));
++  const z = (l) => Number((l?.match(/z=(\d+)/) || [])[1] ?? 99);
++  const helperZ = Number((out.match(/z=(\d+) helper/) || [])[1] ?? -1);
++  const ok = /fullscreen=true/.test(out) && st?.menu_visible && menu && z(menu) < helperZ;
++  if (!ok) fails++;
++  console.log(`${ok ? 'PASS' : 'FAIL'}  "⋯" menu over a full-screen app: menu_visible=${st?.menu_visible}, menu window ${menu ? menu.trim() : 'not on screen'}`);
++  await sleep(1500);
++}
+ await vendor('FloatingChat', { visible: false, on_top: true });
+ ws.close();
+ await sleep(1500);
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index f85a3248e..51bd6d1b3 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -18,6 +18,7 @@
+ #include <QAction>
+ #include <QJsonDocument>
+ #include <QMainWindow>
++#include <QMenu>
+ #include <QMetaEnum>
+ #include <QMetaObject>
+ #include <QPointer>
+@@ -133,7 +134,8 @@ void injectOverlayEvent(obs_data_t *request, obs_data_t *response, void *)
+ }
+ 
+ /* Floating chat control for tests: optional visible, on_top, pinned,
+- * capturable, opacity, and geometry x/y/w/h (points). Replies with the
++ * capturable, opacity, geometry x/y/w/h (points), and menu (true pops the
++ * "⋯" menu up under its button, false closes it). Replies with the
+  * resulting state. */
+ void floatingChat(obs_data_t *request, obs_data_t *response, void *)
+ {
+@@ -156,9 +158,16 @@ void floatingChat(obs_data_t *request, obs_data_t *response, void *)
+ 		if (obs_data_has_user_value(request, "visible"))
+ 			chat->setVisible(obs_data_get_bool(request, "visible"));
+ 		chat->setOptions(options);
++		if (obs_data_has_user_value(request, "menu")) {
++			if (obs_data_get_bool(request, "menu"))
++				chat->moreMenu()->popup(chat->mapToGlobal(QPoint(chat->width() - 40, 40)));
++			else
++				chat->moreMenu()->hide();
++		}
+ 		options = chat->options();
+ 		const QRect geometry = chat->geometry();
+ 		obs_data_set_bool(response, "visible", chat->isVisible());
++		obs_data_set_bool(response, "menu_visible", chat->moreMenu()->isVisible());
+ 		obs_data_set_bool(response, "on_top", options.onTop);
+ 		obs_data_set_bool(response, "pinned", options.pinned);
+ 		obs_data_set_bool(response, "capturable", options.capturable);
+diff --git a/plugins/livehime/src/danmaku-feed.cpp b/plugins/livehime/src/danmaku-feed.cpp
+index 50ff4ff84..b95383105 100644
+--- a/plugins/livehime/src/danmaku-feed.cpp
++++ b/plugins/livehime/src/danmaku-feed.cpp
+@@ -1,5 +1,7 @@
+ #include "danmaku-feed.hpp"
+ 
++#include "window-native.hpp"
++
+ #include <livehime-core.h>
+ #include <obs-module.h>
+ 
+@@ -214,6 +216,7 @@ void DanmakuFeed::showMenu(const QPoint &pos)
+ 	if (!item)
+ 		return;
+ 	QMenu menu(this);
++	AllowMenuOverFullScreen(&menu);
+ 	const QString line = item->text();
+ 	const qint64 uid = item->data(kUidRole).toLongLong();
+ 	const QString user = item->data(kUserRole).toString();
+diff --git a/plugins/livehime/src/floating-chat.cpp b/plugins/livehime/src/floating-chat.cpp
+index 3f6d1b465..c01a42350 100644
+--- a/plugins/livehime/src/floating-chat.cpp
++++ b/plugins/livehime/src/floating-chat.cpp
+@@ -70,6 +70,8 @@ FloatingChat::FloatingChat(QWidget *parent) : QWidget(parent, Qt::Tool | Qt::Fra
+ 
+ 	/* "⋯" menu: opacity and screen-capture visibility. */
+ 	auto *menu = new QMenu(this);
++	moreMenu_ = menu;
++	AllowMenuOverFullScreen(menu);
+ 	auto *opacityRow = new QWidget(menu);
+ 	auto *opacityLayout = new QHBoxLayout(opacityRow);
+ 	opacityLayout->setContentsMargins(12, 6, 12, 6);
+diff --git a/plugins/livehime/src/floating-chat.hpp b/plugins/livehime/src/floating-chat.hpp
+index ce24c1ed5..9f614e577 100644
+--- a/plugins/livehime/src/floating-chat.hpp
++++ b/plugins/livehime/src/floating-chat.hpp
+@@ -8,6 +8,7 @@
+ class DanmakuFeed;
+ class QCheckBox;
+ class QLabel;
++class QMenu;
+ class QSizeGrip;
+ class QSlider;
+ class QToolButton;
+@@ -25,6 +26,8 @@ public:
+ 	explicit FloatingChat(QWidget *parent = nullptr);
+ 
+ 	DanmakuFeed *feed() { return feed_; }
++	/* The "⋯" menu (tests open it with popup()). */
++	QMenu *moreMenu() const { return moreMenu_; }
+ 	void toggle();
+ 
+ 	struct Options {
+@@ -56,6 +59,7 @@ private:
+ 	QToolButton *onTop_;
+ 	QToolButton *pin_;
+ 	QToolButton *more_;
++	QMenu *moreMenu_;
+ 	QSlider *opacity_;
+ 	QLabel *opacityValue_;
+ 	QCheckBox *capturable_;
+diff --git a/plugins/livehime/src/window-native.hpp b/plugins/livehime/src/window-native.hpp
+index be8e9cd24..593d3dd66 100644
+--- a/plugins/livehime/src/window-native.hpp
++++ b/plugins/livehime/src/window-native.hpp
+@@ -8,6 +8,12 @@ class QWidget;
+  * record the window (NSWindow sharingType). */
+ void ApplyNativeWindowOptions(QWidget *window, bool floating, bool capturable);
+ 
++/* Lets `menu` (and its submenus) open over another app's full-screen Space,
++ * where the floating chat can sit: each popup window becomes a
++ * non-activating panel that may join any Space. Call once after creating it. */
++class QMenu;
++void AllowMenuOverFullScreen(QMenu *menu);
++
+ /* The window-server id (CGWindowID) of a shown window, or 0. */
+ unsigned int NativeWindowNumber(QWidget *window);
+ 
+diff --git a/plugins/livehime/src/window-native.mm b/plugins/livehime/src/window-native.mm
+index ec6201faf..dac92093d 100644
+--- a/plugins/livehime/src/window-native.mm
++++ b/plugins/livehime/src/window-native.mm
+@@ -2,6 +2,7 @@
+ 
+ #import <AppKit/AppKit.h>
+ #import <objc/runtime.h>
++#include <QMenu>
+ #include <QWidget>
+ 
+ #include <obs.h>
+@@ -73,6 +74,37 @@ void ApplyNativeWindowOptions(QWidget *window, bool floating, bool capturable)
+ 	nswindow.sharingType = capturable ? NSWindowSharingReadOnly : NSWindowSharingNone;
+ }
+ 
++void AllowMenuOverFullScreen(QMenu *menu)
++{
++	QObject::connect(menu, &QMenu::aboutToShow, menu, [menu] {
++		NSView *view = (__bridge NSView *)reinterpret_cast<void *>(menu->winId());
++		NSWindow *nswindow = view.window;
++		if (!nswindow)
++			return;
++		/* Replace the members of each mutually exclusive group Qt may have
++		 * set (AppKit throws on conflicting combinations); if AppKit still
++		 * refuses, the menu just stays out of full-screen Spaces. */
++		NSWindowCollectionBehavior behavior = nswindow.collectionBehavior;
++		behavior &= ~(NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorFullScreenPrimary |
++			      NSWindowCollectionBehaviorFullScreenNone | NSWindowCollectionBehaviorFullScreenAllowsTiling);
++		behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
++		@try {
++			nswindow.collectionBehavior = behavior;
++			if ([nswindow isKindOfClass:[NSPanel class]])
++				nswindow.styleMask |= NSWindowStyleMaskNonactivatingPanel;
++		} @catch (NSException *exception) {
++			blog(LOG_WARNING, "[livehime] menu window behaviour: %s", exception.reason.UTF8String);
++		}
++		for (QAction *action : menu->actions()) {
++			QMenu *sub = QMenu::menuInAction(action);
++			if (sub && !sub->property("livehime.fullScreenMenu").toBool()) {
++				sub->setProperty("livehime.fullScreenMenu", true);
++				AllowMenuOverFullScreen(sub);
++			}
++		}
++	});
++}
++
+ unsigned int NativeWindowNumber(QWidget *window)
+ {
+ 	NSView *view = (__bridge NSView *)reinterpret_cast<void *>(window->winId());
+-- 
+2.54.0 (Apple Git-157)
+

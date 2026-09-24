@@ -1,7 +1,7 @@
 From faea428dc5cdc45984d690d33fa4a0ce6d2bd482 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 23:05:03 +0800
-Subject: [PATCH 05/39] Show LiveHime name and version in window title; dock
+Subject: [PATCH 05/43] Show LiveHime name and version in window title; dock
  panel on first run
 
 Add LIVEHIME_APP_VERSION, used as the bundle's marketing version and in
@@ -166,3 +166,6 @@ index 2dea26a5c..7b6760251 100644
  	if (dock)
  		dock->controller()->handleFrontendEvent(event);
  }
+-- 
+2.54.0 (Apple Git-157)
+

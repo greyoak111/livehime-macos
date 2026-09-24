@@ -1,7 +1,7 @@
 From daad1d07361fd2acb676ca240d8333bdefd42fb5 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 06:08:20 +0800
-Subject: [PATCH 30/39] Add a styled DMG packager with install notes
+Subject: [PATCH 30/43] Add a styled DMG packager with install notes
 
 package-dmg.sh builds the release DMG with a background (arrow from the
 app to Applications, bilingual install, upgrade and first-launch notes),
@@ -178,3 +178,6 @@ index 000000000..76fee5645
 +hdiutil convert -quiet "$work/rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$out"
 +hdiutil verify -quiet "$out"
 +print -- "$out"
+-- 
+2.54.0 (Apple Git-157)
+

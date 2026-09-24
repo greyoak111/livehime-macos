@@ -1,0 +1,735 @@
+From 9a67614b73d1cb91f3c2b61c394902003a328b62 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 23:11:57 +0800
+Subject: [PATCH 41/43] Reply to viewers from the danmaku feed; keep the
+ floating chat on top
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Danmaku replies: "回复 @TA" in the feed's right-click menu (or a double
+click) sets a reply target shown above the send box; the danmaku is sent
+with the viewer's uid and the target danmaku id, as the web room and
+LiveHime for Windows do. Incoming replies show as "@name" in the feed and
+the overlay; chat events now carry dmid and replyTo.
+
+Floating chat on top: Qt drops Qt::Tool windows to the normal level when
+the app is inactive, so other apps covered the chat, and another app's
+full-screen Space only admits non-activating panels. The chat window is
+now a non-activating panel while "置顶" is on and gets its floating level
+back after activation changes. e2e-float-fullscreen.mjs covers both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            | 11 +++
+ .../livehime/tests/e2e-float-fullscreen.mjs   | 59 ++++++++++++++++
+ .../livehime/tests/fullscreen-probe.swift     | 44 ++++++++++++
+ .../core/Sources/LiveHimeCore/CBridge.swift   | 13 +++-
+ .../Sources/LiveHimeCore/DanmakuClient.swift  |  2 +-
+ .../LiveHimeCore/DanmakuProtocol.swift        | 15 +++-
+ .../LiveHimeCore/LiveRoomActions.swift        | 20 +++++-
+ .../LiveHimeCore/SessionCoordinator.swift     | 14 ++--
+ .../DanmakuProtocolTests.swift                | 11 +++
+ .../SessionCoordinatorTests.swift             | 13 +++-
+ plugins/livehime/core/include/livehime-core.h |  5 ++
+ plugins/livehime/data/locale/en-US.ini        |  3 +
+ plugins/livehime/data/locale/zh-CN.ini        |  3 +
+ plugins/livehime/src/danmaku-feed.cpp         | 68 +++++++++++++++++--
+ plugins/livehime/src/danmaku-feed.hpp         | 11 ++-
+ plugins/livehime/src/danmaku-overlay.cpp      |  4 +-
+ plugins/livehime/src/window-native.mm         | 49 +++++++++++++
+ 17 files changed, 324 insertions(+), 21 deletions(-)
+ create mode 100644 build-aux/livehime/tests/e2e-float-fullscreen.mjs
+ create mode 100644 build-aux/livehime/tests/fullscreen-probe.swift
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 39d55379c..e549cacf2 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -56,6 +56,17 @@ area to the given directory:
+ node e2e-floating.mjs <websocket password> <screen width> <screen height> <crop dir>
+ ```
+ 
++`e2e-float-fullscreen.mjs` checks "置顶" against other apps: a probe app goes
++full screen in its own Space and the chat must be in front of it (and absent
++with "置顶" off); then the probe covers the chat with a normal, active window
++and the chat must stay in front at the floating level. The probe takes over
++the screen for a few seconds per case:
++
++```bash
++swiftc -O fullscreen-probe.swift -o /tmp/fullscreen-probe
++node e2e-float-fullscreen.mjs <websocket password> <LiveHime pid> /tmp/fullscreen-probe
++```
++
+ ## Cover manager check
+ 
+ `e2e-cover.mjs` drives Bilibili's cover manager in the real window: a real
+diff --git a/build-aux/livehime/tests/e2e-float-fullscreen.mjs b/build-aux/livehime/tests/e2e-float-fullscreen.mjs
+new file mode 100644
+index 000000000..cda42bfee
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-float-fullscreen.mjs
+@@ -0,0 +1,59 @@
++// Floating chat over other apps: with "on top" on, the chat must stay in front of another app's
++// full-screen window (and, as a control, must not show there with "on top" off), and stay above
++// another app's normal window while LiveHime is inactive.
++// Usage: swiftc -O fullscreen-probe.swift -o /tmp/fullscreen-probe
++//        node e2e-float-fullscreen.mjs <ws password> <LiveHime pid> /tmp/fullscreen-probe
++// The probe takes over the screen for a few seconds per case.
++import { createHash } from 'node:crypto';
++import { execFileSync } from 'node:child_process';
++const [password, pid, helper] = process.argv.slice(2);
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++let ws, id = 1; const pend = new Map();
++for (let i = 0; i < 60; i++) {
++  try { ws = new WebSocket('ws://127.0.0.1:4466'); await new Promise((ok, bad) => { ws.onopen = ok; ws.onerror = bad; }); break; }
++  catch { await sleep(1000); }
++}
++await new Promise((ok) => {
++  ws.onmessage = (m) => {
++    const msg = JSON.parse(m.data);
++    if (msg.op === 0) {
++      const a = msg.d.authentication;
++      ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + a.salt) + a.challenge) } }));
++    } else if (msg.op === 2) ok();
++    else if (msg.op === 7) { pend.get(msg.d.requestId)?.(msg.d); pend.delete(msg.d.requestId); }
++  };
++});
++const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: t, requestData: d })).responseData?.responseData;
++await sleep(3000);
++let fails = 0;
++for (const onTop of [true, false]) {
++  const st = await vendor('FloatingChat', { visible: true, on_top: onTop, x: 120, y: 160, w: 340, h: 460 });
++  await sleep(800);
++  const out = execFileSync(helper, [pid, '3'], { encoding: 'utf8' });
++  const full = /fullscreen=true/.test(out);
++  const seen = out.split('\n').some((l) => /onscreen .*bounds=120,160,340x460/.test(l));
++  const front = (who) => Number((out.match(new RegExp(`z=(\\d+) ${who}`)) || [])[1] ?? -1);
++  const inFront = seen && front('target') < front('helper');
++  const ok = full && (onTop ? inFront : !seen);
++  if (!ok) fails++;
++  console.log(`${ok ? 'PASS' : 'FAIL'}  on_top=${onTop}: helper fullscreen=${full}, floating chat on screen there=${seen}  (state ${JSON.stringify({ v: st?.visible, top: st?.on_top, x: st?.x, y: st?.y, w: st?.w, h: st?.h })})`);
++  console.log(out.trim().split('\n').map((l) => '      ' + l).join('\n'));
++  await sleep(1500);
++}
++{
++  // Normal desktop: another app's window covers the chat's area and is active.
++  await vendor('FloatingChat', { visible: true, on_top: true, x: 120, y: 160, w: 340, h: 460 });
++  await sleep(800);
++  const out = execFileSync(helper, [pid, '2', 'window'], { encoding: 'utf8' });
++  const front = (who) => Number((out.match(new RegExp(`z=(\\d+) ${who}`)) || [])[1] ?? -1);
++  const layer = Number((out.match(/z=\d+ target layer=(\d+) 340x460/) || [])[1] ?? -1);
++  const ok = front('target') >= 0 && front('target') < front('helper') && layer >= 3;
++  if (!ok) fails++;
++  console.log(`${ok ? 'PASS' : 'FAIL'}  on_top=true, LiveHime inactive: chat in front of the other app's window (layer ${layer})`);
++}
++await vendor('FloatingChat', { visible: false, on_top: true });
++ws.close();
++await sleep(1500);
++process.exit(fails ? 1 : 0);
+diff --git a/build-aux/livehime/tests/fullscreen-probe.swift b/build-aux/livehime/tests/fullscreen-probe.swift
+new file mode 100644
+index 000000000..41822fe7c
+--- /dev/null
++++ b/build-aux/livehime/tests/fullscreen-probe.swift
+@@ -0,0 +1,44 @@
++// Test probe for e2e-float-fullscreen.mjs: goes full screen in its own Space (or, with "window",
++// covers the screen with a normal window), then prints the front-to-back order of its windows and
++// those of process <pid>. Usage: fullscreen-probe <pid> [seconds] [window]
++import AppKit
++let pid = Int32(CommandLine.arguments[1])!
++let hold = CommandLine.arguments.count > 2 ? Double(CommandLine.arguments[2])! : 3
++// "window": stay a normal window covering the target area instead of going full screen.
++let windowed = CommandLine.arguments.count > 3 && CommandLine.arguments[3] == "window"
++let app = NSApplication.shared
++app.setActivationPolicy(.regular)
++let win = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 600, height: 400), styleMask: [.titled, .resizable],
++                   backing: .buffered, defer: false)
++win.collectionBehavior = [.fullScreenPrimary]
++win.backgroundColor = .darkGray
++win.title = "LiveHime fullscreen test"
++win.makeKeyAndOrderFront(nil)
++app.activate(ignoringOtherApps: true)
++if windowed {
++    win.setFrame(NSRect(x: 0, y: 0, width: 900, height: 900), display: true)
++} else {
++    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { win.toggleFullScreen(nil) }
++}
++DispatchQueue.main.asyncAfter(deadline: .now() + 0.8 + hold) {
++    let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
++    let mine = list.filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid }
++    // Front-to-back order: where our full-screen window and the target's windows sit.
++    let me = ProcessInfo.processInfo.processIdentifier
++    for (i, w) in list.enumerated() {
++        let owner = w[kCGWindowOwnerPID as String] as? Int32
++        if owner == me || owner == pid {
++            let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
++            print("z=\(i) \(owner == me ? "helper" : "target") layer=\(w[kCGWindowLayer as String] ?? 0) \(b["Width"] ?? 0)x\(b["Height"] ?? 0)")
++        }
++    }
++    let full = win.styleMask.contains(.fullScreen)
++    print("fullscreen=\(full)")
++    for w in mine {
++        let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
++        print("onscreen id=\(w[kCGWindowNumber as String] ?? 0) layer=\(w[kCGWindowLayer as String] ?? 0) bounds=\(b["X"] ?? 0),\(b["Y"] ?? 0),\(b["Width"] ?? 0)x\(b["Height"] ?? 0)")
++    }
++    if !windowed { win.toggleFullScreen(nil) }
++    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { exit(0) }
++}
++app.run()
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index da7291898..5cfef04b3 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -73,9 +73,11 @@ final class CoreBridge {
+     static func fields(for event: LiveRoomEvent) -> [String: Any] {
+         var f: [String: Any] = ["event": "room"]
+         switch event {
+-        case let .chat(uid, user, text, medal):
++        case let .chat(uid, user, text, medal, id, replyTo):
+             f.merge(["kind": "chat", "uid": uid, "user": user, "text": text]) { $1 }
+             if let medal { f["medal"] = medal }
++            if let id { f["dmid"] = id }
++            if let replyTo { f["replyTo"] = replyTo }
+         case let .gift(user, name, count, paid, totalCoin):
+             f.merge(["kind": "gift", "user": user, "name": name, "count": count, "paid": paid, "totalCoin": totalCoin]) { $1 }
+         case let .superChat(user, text, price, seconds):
+@@ -269,12 +271,19 @@ public func livehime_core_stop_live() {
+ 
+ @_cdecl("livehime_core_send_danmaku")
+ public func livehime_core_send_danmaku(_ text: UnsafePointer<CChar>?) {
++    livehime_core_send_danmaku_reply(text, 0, nil)
++}
++
++@_cdecl("livehime_core_send_danmaku_reply")
++public func livehime_core_send_danmaku_reply(_ text: UnsafePointer<CChar>?, _ replyUID: Int64,
++                                             _ replyDanmakuID: UnsafePointer<CChar>?) {
+     let message = text.map { String(cString: $0) } ?? ""
++    let reply = replyUID > 0 ? DanmakuReply(uid: replyUID, danmakuID: replyDanmakuID.map { String(cString: $0) } ?? "") : nil
+     onMain {
+         guard let bridge = CoreBridge.shared else { return }
+         Task { @MainActor in
+             do {
+-                try await bridge.coordinator.sendDanmaku(message)
++                try await bridge.coordinator.sendDanmaku(message, reply: reply)
+                 bridge.emit(["event": "danmakuSent", "ok": true])
+             } catch {
+                 bridge.emit(["event": "danmakuSent", "ok": false].merging(CoreBridge.errorFields(error)) { $1 })
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+index 2165339f8..11131b4ac 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+@@ -125,7 +125,7 @@ public final class DanmakuSpeaker: NSObject, AVSpeechSynthesizerDelegate {
+ 
+     static func line(for event: LiveRoomEvent) -> String? {
+         switch event {
+-        case .chat(_, let user, let text, _): return "\(user)说：\(text)"
++        case .chat(_, let user, let text, _, _, _): return "\(user)说：\(text)"
+         case .gift(let user, let name, let count, _, _): return "感谢\(user)送的\(count)个\(name)"
+         case .superChat(let user, let text, _, _): return "\(user)的醒目留言：\(text)"
+         case .guardBought(let user, _, let name, _): return "感谢\(user)开通\(name)"
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+index 6215881ad..af2c0b74d 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+@@ -90,7 +90,9 @@ struct DanmakuPacket: Equatable {
+ 
+ /// Room activity delivered to the dock.
+ public enum LiveRoomEvent: Equatable, Sendable {
+-    case chat(uid: Int64, user: String, text: String, medal: String?)
++    /// `id` is the danmaku's own id (what a reply points at); `replyTo` is the
++    /// name of the viewer this danmaku replies to, if it is a reply.
++    case chat(uid: Int64, user: String, text: String, medal: String?, id: String? = nil, replyTo: String? = nil)
+     case gift(user: String, name: String, count: Int, paid: Bool, totalCoin: Int)
+     case superChat(user: String, text: String, price: Int, seconds: Int)
+     case guardBought(user: String, level: Int, name: String, count: Int)
+@@ -127,7 +129,16 @@ enum DanmakuParser {
+             if info.count > 3, let m = info[3] as? [Any], m.count > 1, let name = m[1] as? String, !name.isEmpty {
+                 medal = "\(name) \(int(m[0]))"
+             }
+-            return .chat(uid: int64(user[0]), user: user[1] as? String ?? "", text: text, medal: medal)
++            // info[0][15].extra is a JSON string with the danmaku id and reply details.
++            var id: String?, replyTo: String?
++            if let meta = info[0] as? [Any], meta.count > 15, let more = meta[15] as? [String: Any],
++               let extra = (more["extra"] as? String)?.data(using: .utf8),
++               let fields = try? JSONSerialization.jsonObject(with: extra) as? [String: Any] {
++                id = (fields["id_str"] as? String).flatMap { $0.isEmpty ? nil : $0 }
++                replyTo = (fields["reply_uname"] as? String).flatMap { $0.isEmpty ? nil : $0 }
++            }
++            return .chat(uid: int64(user[0]), user: user[1] as? String ?? "", text: text, medal: medal,
++                         id: id, replyTo: replyTo)
+         case "SEND_GIFT", "SEND_GIFT_V2":
+             return .gift(user: data["uname"] as? String ?? "",
+                          name: data["giftName"] as? String ?? data["gift_name"] as? String ?? "",
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+index 35d79ab16..320f12bcb 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+@@ -11,6 +11,16 @@ public struct DanmakuConnectInfo: Equatable, Sendable {
+     public let buvid: String
+ }
+ 
++/// The danmaku a sent danmaku replies to: the viewer's uid and that danmaku's id.
++public struct DanmakuReply: Equatable, Sendable {
++    public let uid: Int64
++    public let danmakuID: String
++    public init(uid: Int64, danmakuID: String) {
++        self.uid = uid
++        self.danmakuID = danmakuID
++    }
++}
++
+ /// Room operations beyond start/stop: danmaku server discovery, sending
+ /// danmaku and editing the title. Errors use BilibiliLiveError like the
+ /// rest of the client.
+@@ -64,11 +74,17 @@ extension BilibiliLiveClient {
+         return DanmakuConnectInfo(token: token, servers: servers, buvid: buvid)
+     }
+ 
+-    public func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws {
++    /// `reply` makes it a reply to a viewer's danmaku. The web room sends the target's uid as
++    /// `reply_mid` and the target danmaku id as `replay_dmid` (sic); LiveHime for Windows names the
++    /// latter `reply_dmid`, so both are sent.
++    public func sendDanmaku(roomID: Int64, text: String, reply: DanmakuReply? = nil, cookieHeader: String) async throws {
+         let csrf = try csrf(from: cookieHeader)
++        let replyMID = reply.map { String($0.uid) } ?? "0"
++        let replyDMID = reply?.danmakuID ?? ""
+         let body = form([
+             ("bubble", "0"), ("msg", text), ("color", "16777215"), ("mode", "1"), ("room_type", "0"),
+-            ("jumpfrom", "0"), ("reply_mid", "0"), ("reply_attr", "0"), ("replay_dmid", ""),
++            ("jumpfrom", "0"), ("reply_mid", replyMID), ("reply_attr", "0"), ("replay_dmid", replyDMID),
++            ("reply_dmid", replyDMID),
+             ("statistics", #"{"appId":100,"platform":5}"#), ("fontsize", "25"),
+             ("rnd", String(Int(Date().timeIntervalSince1970))), ("roomid", String(roomID)),
+             ("csrf", csrf), ("csrf_token", csrf)
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+index 57a6ad9c0..e03434ff2 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -42,7 +42,7 @@ public protocol BilibiliAccountAPI: Sendable {
+     func startLive(roomID: Int64, area: BilibiliLiveArea, cookieHeader: String) async throws -> BilibiliStreamConfig
+     func stopLive(roomID: Int64, cookieHeader: String) async throws
+     func upstream(roomID: Int64, cookieHeader: String) async throws -> BilibiliStreamConfig
+-    func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws
++    func sendDanmaku(roomID: Int64, text: String, reply: DanmakuReply?, cookieHeader: String) async throws
+     func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws
+     func refreshSessionIfNeeded(_ current: SessionCredentials) async throws -> SessionCredentials?
+     func confirmRefresh(renewed: SessionCredentials, previousRefreshToken: String) async throws
+@@ -236,11 +236,15 @@ public final class SessionCoordinator {
+         await refreshRoom()
+     }
+ 
+-    public func sendDanmaku(_ text: String) async throws {
++    /// Sends a danmaku; with `reply`, as a reply to that viewer (shown as "@name").
++    public func sendDanmaku(_ text: String, reply: DanmakuReply? = nil) async throws {
+         let (saved, account) = try readyAccount()
+         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+         guard !message.isEmpty else { return }
+-        try await guarded { try await self.api.sendDanmaku(roomID: account.room.roomID, text: message, cookieHeader: saved.cookieHeader) }
++        try await guarded {
++            try await self.api.sendDanmaku(roomID: account.room.roomID, text: message, reply: reply,
++                                           cookieHeader: saved.cookieHeader)
++        }
+     }
+ 
+     public func updateTitle(_ title: String) async throws {
+@@ -454,8 +458,8 @@ public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
+         try await live(cookieHeader).fetchUpstream(roomID: roomID)
+     }
+ 
+-    public func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws {
+-        try await live(cookieHeader).sendDanmaku(roomID: roomID, text: text, cookieHeader: cookieHeader)
++    public func sendDanmaku(roomID: Int64, text: String, reply: DanmakuReply?, cookieHeader: String) async throws {
++        try await live(cookieHeader).sendDanmaku(roomID: roomID, text: text, reply: reply, cookieHeader: cookieHeader)
+     }
+ 
+     public func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws {
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+index 19a782f8a..036e143f4 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+@@ -31,6 +31,17 @@ final class DanmakuProtocolTests: XCTestCase {
+         XCTAssertEqual(DanmakuPacket.decode(frame), [DanmakuPacket(version: 1, operation: 7, body: body)])
+     }
+ 
++    func testChatCarriesDanmakuIDAndReplyTarget() {
++        let extra = #"{"id_str":"a1b2c3","reply_uname":"观众A","reply_mid":42}"#
++        var meta: [Any] = Array(repeating: 0, count: 15)
++        meta.append(["extra": extra])
++        let object: [String: Any] = ["cmd": "DANMU_MSG", "info": [meta, "欢迎", [7, "主播"]]]
++        XCTAssertEqual(DanmakuParser.event(from: object),
++                       .chat(uid: 7, user: "主播", text: "欢迎", medal: nil, id: "a1b2c3", replyTo: "观众A"))
++        let plain: [String: Any] = ["cmd": "DANMU_MSG", "info": [[0], "你好", [8, "观众B"]]]
++        XCTAssertEqual(DanmakuParser.event(from: plain), .chat(uid: 8, user: "观众B", text: "你好", medal: nil))
++    }
++
+     func testTruncatedFrameIsIgnored() {
+         let frame = DanmakuPacket.encode(.message, body: Data("{}".utf8))
+         XCTAssertEqual(DanmakuPacket.decode(frame.prefix(10)), [])
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+index 9a32f80f1..5af08ba29 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -67,8 +67,12 @@ private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
+         if add { keywords.append(keyword) } else { keywords.removeAll { $0 == keyword } }
+     }
+     var sentDanmaku: [String] = []
++    var sentReplies: [DanmakuReply?] = []
+     var titles: [String] = []
+-    func sendDanmaku(roomID: Int64, text: String, cookieHeader: String) async throws { sentDanmaku.append(text) }
++    func sendDanmaku(roomID: Int64, text: String, reply: DanmakuReply?, cookieHeader: String) async throws {
++        sentDanmaku.append(text)
++        sentReplies.append(reply)
++    }
+     func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws {
+         titles.append(title)
+         liveRoom = BilibiliRoomInfo(roomID: roomID, uid: 42, title: title, liveStatus: liveRoom.liveStatus, areaID: liveRoom.areaID)
+@@ -280,6 +284,13 @@ final class LiveRoomTests: XCTestCase {
+         XCTAssertEqual(api.sentDanmaku, ["你好"])
+     }
+ 
++    func testSendDanmakuPassesReplyTarget() async throws {
++        let api = StubAPI()
++        let c = await readyCoordinator(api)
++        try await c.sendDanmaku("欢迎", reply: DanmakuReply(uid: 7, danmakuID: "123"))
++        XCTAssertEqual(api.sentReplies, [DanmakuReply(uid: 7, danmakuID: "123")])
++    }
++
+     func testUpdateTitleRefreshesRoom() async throws {
+         let api = StubAPI()
+         let c = await readyCoordinator(api)
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 92d94feb2..4f05056fc 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -74,8 +74,13 @@ int livehime_core_page_click(const char *key, double x, double y);
+  *   {"event":"danmakuStatus","status":"connecting|connected|reconnecting|stopped"}
+  *   {"event":"room","kind":"chat|gift|superChat|guard|enter|follow|share|
+  *            watched|likes|onlineRank|liveStarted|liveEnded|roomChanged",...}
++ *   chat carries uid, user, text and, when known, medal, dmid (its danmaku id)
++ *   and replyTo (the name of the viewer it replies to).
+  * Actions reply with {"event":"danmakuSent"|"titleUpdated","ok":...}. */
+ void livehime_core_send_danmaku(const char *text);
++/* Sends `text` as a reply to viewer `reply_uid`'s danmaku `reply_danmaku_id`
++ * (the "dmid" of a chat event; may be empty). Replies with "danmakuSent". */
++void livehime_core_send_danmaku_reply(const char *text, long long reply_uid, const char *reply_danmaku_id);
+ void livehime_core_update_title(const char *title);
+ void livehime_core_set_tts(int enabled);
+ 
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 5f72a1b79..93c8ff16a 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -105,6 +105,9 @@ LiveHime.Overlay.ShowGifts="Show gifts"
+ LiveHime.Overlay.ShowSuperChats="Show Super Chats"
+ LiveHime.Overlay.ShowGuards="Show guard purchases"
+ LiveHime.Feature.GiftsOnly="Gifts and Super Chats only"
++LiveHime.Feature.ReplyUser="Reply to @%1"
++LiveHime.Feature.ReplyingTo="Replying to @%1"
++LiveHime.Feature.CancelReply="Cancel reply (Esc)"
+ LiveHime.Feature.Copy="Copy"
+ LiveHime.Feature.MuteUser="Mute %1"
+ LiveHime.Feature.MuteSession="For this stream"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 0f1fc4be8..3f441b8b2 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -105,6 +105,9 @@ LiveHime.Overlay.ShowGifts="显示礼物"
+ LiveHime.Overlay.ShowSuperChats="显示醒目留言"
+ LiveHime.Overlay.ShowGuards="显示上舰"
+ LiveHime.Feature.GiftsOnly="只看礼物和留言"
++LiveHime.Feature.ReplyUser="回复 @%1"
++LiveHime.Feature.ReplyingTo="回复 @%1"
++LiveHime.Feature.CancelReply="取消回复（Esc）"
+ LiveHime.Feature.Copy="复制"
+ LiveHime.Feature.MuteUser="禁言 %1"
+ LiveHime.Feature.MuteSession="本场直播"
+diff --git a/plugins/livehime/src/danmaku-feed.cpp b/plugins/livehime/src/danmaku-feed.cpp
+index 1c8167913..50ff4ff84 100644
+--- a/plugins/livehime/src/danmaku-feed.cpp
++++ b/plugins/livehime/src/danmaku-feed.cpp
+@@ -12,7 +12,9 @@
+ #include <QMenu>
+ #include <QPushButton>
+ #include <QScrollBar>
++#include <QShortcut>
+ #include <QTimer>
++#include <QToolButton>
+ #include <QVBoxLayout>
+ 
+ #include <algorithm>
+@@ -24,6 +26,11 @@ QString text(const char *key)
+ }
+ 
+ constexpr int kMaxFeedItems = 300;
++
++/* Item data beyond the text: the sender, and the danmaku id a reply points at. */
++constexpr int kUidRole = Qt::UserRole;
++constexpr int kUserRole = Qt::UserRole + 1;
++constexpr int kDanmakuIdRole = Qt::UserRole + 2;
+ } // namespace
+ 
+ DanmakuFeed::DanmakuFeed(bool compact, QWidget *parent) : QWidget(parent)
+@@ -43,6 +50,11 @@ DanmakuFeed::DanmakuFeed(bool compact, QWidget *parent) : QWidget(parent)
+ 	list_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+ 	list_->setContextMenuPolicy(Qt::CustomContextMenu);
+ 	connect(list_, &QListWidget::customContextMenuRequested, this, &DanmakuFeed::showMenu);
++	connect(list_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
++		const qint64 uid = item->data(kUidRole).toLongLong();
++		if (uid > 0)
++			replyTo(uid, item->data(kUserRole).toString(), item->data(kDanmakuIdRole).toString());
++	});
+ 	if (compact)
+ 		list_->setFrameShape(QFrame::NoFrame);
+ 
+@@ -55,12 +67,29 @@ DanmakuFeed::DanmakuFeed(bool compact, QWidget *parent) : QWidget(parent)
+ 	auto *sendRow = new QHBoxLayout;
+ 	sendRow->addWidget(message_, 1);
+ 	sendRow->addWidget(send_);
++	new QShortcut(QKeySequence(Qt::Key_Escape), message_, this, &DanmakuFeed::clearReply, Qt::WidgetShortcut);
++
++	/* "Replying to @name ×" above the send box while a reply target is set. */
++	replyBar_ = new QWidget(this);
++	replyLabel_ = new QLabel(replyBar_);
++	replyLabel_->setStyleSheet(QStringLiteral("QLabel { color: #fb7299; }"));
++	auto *cancelReply = new QToolButton(replyBar_);
++	cancelReply->setText(QStringLiteral("×"));
++	cancelReply->setAutoRaise(true);
++	cancelReply->setToolTip(text("LiveHime.Feature.CancelReply"));
++	connect(cancelReply, &QToolButton::clicked, this, &DanmakuFeed::clearReply);
++	auto *replyRow = new QHBoxLayout(replyBar_);
++	replyRow->setContentsMargins(2, 0, 0, 0);
++	replyRow->addWidget(replyLabel_, 1);
++	replyRow->addWidget(cancelReply);
++	replyBar_->hide();
+ 
+ 	auto *layout = new QVBoxLayout(this);
+ 	layout->setContentsMargins(0, 0, 0, 0);
+ 	layout->setSpacing(compact ? 4 : 6);
+ 	layout->addWidget(pinned_);
+ 	layout->addWidget(list_, 1);
++	layout->addWidget(replyBar_);
+ 	layout->addLayout(sendRow);
+ 	setReady(false);
+ }
+@@ -76,6 +105,7 @@ void DanmakuFeed::setReady(bool ready)
+ 	if (ready_ && !ready) {
+ 		list_->clear();
+ 		pinned_->hide();
++		clearReply();
+ 	}
+ 	ready_ = ready;
+ 	message_->setEnabled(ready);
+@@ -93,6 +123,7 @@ void DanmakuFeed::handleEvent(const QJsonObject &event)
+ 		send_->setEnabled(ready_);
+ 		if (event.value("ok").toBool()) {
+ 			message_->clear();
++			clearReply();
+ 		} else {
+ 			const QString detail = event.value("message").toString();
+ 			append(text("LiveHime.Feature.SendFailed") + (detail.isEmpty() ? QString() : QStringLiteral("：") + detail),
+@@ -117,9 +148,13 @@ void DanmakuFeed::handleEvent(const QJsonObject &event)
+ 		if (giftsOnly_)
+ 			return;
+ 		const QString medal = event.value("medal").toString();
++		const QString replyTo = event.value("replyTo").toString();
+ 		append((medal.isEmpty() ? QString() : QStringLiteral("[%1] ").arg(medal)) + user + QStringLiteral("：") +
++			       (replyTo.isEmpty() ? QString() : QStringLiteral("@%1 ").arg(replyTo)) +
+ 			       event.value("text").toString(),
+ 		       QString(), event.value("uid").toVariant().toLongLong(), user);
++		if (QListWidgetItem *item = list_->item(list_->count() - 1))
++			item->setData(kDanmakuIdRole, event.value("dmid").toString());
+ 	} else if (kind == "gift") {
+ 		append(text("LiveHime.Feature.Gift").arg(user, event.value("name").toString()).arg(event.value("count").toInt()),
+ 		       QStringLiteral("#e0a040"));
+@@ -154,8 +189,8 @@ void DanmakuFeed::append(const QString &line, const QString &color, qint64 uid,
+ 	if (!color.isEmpty())
+ 		item->setForeground(QColor(color));
+ 	if (uid > 0) {
+-		item->setData(Qt::UserRole, uid);
+-		item->setData(Qt::UserRole + 1, user);
++		item->setData(kUidRole, uid);
++		item->setData(kUserRole, user);
+ 	}
+ 	list_->addItem(item);
+ 	while (list_->count() > kMaxFeedItems)
+@@ -180,9 +215,14 @@ void DanmakuFeed::showMenu(const QPoint &pos)
+ 		return;
+ 	QMenu menu(this);
+ 	const QString line = item->text();
++	const qint64 uid = item->data(kUidRole).toLongLong();
++	const QString user = item->data(kUserRole).toString();
++	if (uid > 0 && ready_) {
++		const QString danmakuId = item->data(kDanmakuIdRole).toString();
++		menu.addAction(text("LiveHime.Feature.ReplyUser").arg(user), this,
++			       [this, uid, user, danmakuId] { replyTo(uid, user, danmakuId); });
++	}
+ 	menu.addAction(text("LiveHime.Feature.Copy"), this, [line] { QApplication::clipboard()->setText(line); });
+-	const qint64 uid = item->data(Qt::UserRole).toLongLong();
+-	const QString user = item->data(Qt::UserRole + 1).toString();
+ 	if (uid > 0) {
+ 		QMenu *mute = menu.addMenu(text("LiveHime.Feature.MuteUser").arg(user));
+ 		const std::pair<const char *, int> choices[] = {{"LiveHime.Feature.MuteSession", 0},
+@@ -194,6 +234,24 @@ void DanmakuFeed::showMenu(const QPoint &pos)
+ 	menu.exec(list_->viewport()->mapToGlobal(pos));
+ }
+ 
++void DanmakuFeed::replyTo(qint64 uid, const QString &user, const QString &danmakuId)
++{
++	if (!ready_)
++		return;
++	replyUid_ = uid;
++	replyDanmakuId_ = danmakuId;
++	replyLabel_->setText(text("LiveHime.Feature.ReplyingTo").arg(user));
++	replyBar_->show();
++	message_->setFocus();
++}
++
++void DanmakuFeed::clearReply()
++{
++	replyUid_ = 0;
++	replyDanmakuId_.clear();
++	replyBar_->hide();
++}
++
+ void DanmakuFeed::send()
+ {
+ 	const QByteArray message = message_->text().trimmed().toUtf8();
+@@ -201,5 +259,5 @@ void DanmakuFeed::send()
+ 		return;
+ 	sending_ = true;
+ 	send_->setEnabled(false);
+-	livehime_core_send_danmaku(message.constData());
++	livehime_core_send_danmaku_reply(message.constData(), replyUid_, replyDanmakuId_.toUtf8().constData());
+ }
+diff --git a/plugins/livehime/src/danmaku-feed.hpp b/plugins/livehime/src/danmaku-feed.hpp
+index fd6799b7d..1bfca0fad 100644
+--- a/plugins/livehime/src/danmaku-feed.hpp
++++ b/plugins/livehime/src/danmaku-feed.hpp
+@@ -11,8 +11,9 @@ class QTimer;
+ 
+ /* The live danmaku feed with its send box: chat, gifts, Super Chats (the
+  * latest one pinned for its paid duration), guards and entries, a right-
+- * click menu to copy or mute, and sending. Used by the dock's danmaku tab
+- * and by the floating chat window, both fed from the same core events. */
++ * click menu to reply, copy or mute, and sending (optionally as a reply,
++ * shown as "@name"). Used by the dock's danmaku tab and by the floating chat
++ * window, both fed from the same core events. */
+ class DanmakuFeed : public QWidget {
+ 	Q_OBJECT
+ 
+@@ -31,6 +32,8 @@ private:
+ 		    const QString &user = QString());
+ 	void pinSuperChat(const QString &line, int seconds);
+ 	void showMenu(const QPoint &pos);
++	void replyTo(qint64 uid, const QString &user, const QString &danmakuId);
++	void clearReply();
+ 	void send();
+ 
+ 	bool showEntries_ = false;
+@@ -41,6 +44,10 @@ private:
+ 	QLabel *pinned_;
+ 	QTimer *pinnedTimer_;
+ 	QListWidget *list_;
++	QWidget *replyBar_;
++	QLabel *replyLabel_;
++	qint64 replyUid_ = 0;
++	QString replyDanmakuId_;
+ 	QLineEdit *message_;
+ 	QPushButton *send_;
+ };
+diff --git a/plugins/livehime/src/danmaku-overlay.cpp b/plugins/livehime/src/danmaku-overlay.cpp
+index 2db15b13e..6c9a569a9 100644
+--- a/plugins/livehime/src/danmaku-overlay.cpp
++++ b/plugins/livehime/src/danmaku-overlay.cpp
+@@ -230,7 +230,9 @@ void DanmakuOverlayHub::push(const QJsonObject &event)
+ 	message.kind = kind;
+ 	if (kind == "chat") {
+ 		message.name = user + QStringLiteral("：");
+-		message.body = event.value("text").toString();
++		const QString replyTo = event.value("replyTo").toString();
++		message.body = (replyTo.isEmpty() ? QString() : QStringLiteral("@%1 ").arg(replyTo)) +
++			       event.value("text").toString();
+ 	} else if (kind == "gift") {
+ 		message.body =
+ 			text("LiveHime.Feature.Gift").arg(user, event.value("name").toString()).arg(event.value("count").toInt());
+diff --git a/plugins/livehime/src/window-native.mm b/plugins/livehime/src/window-native.mm
+index ba72c8e19..ec6201faf 100644
+--- a/plugins/livehime/src/window-native.mm
++++ b/plugins/livehime/src/window-native.mm
+@@ -1,6 +1,7 @@
+ #include "window-native.hpp"
+ 
+ #import <AppKit/AppKit.h>
++#import <objc/runtime.h>
+ #include <QWidget>
+ 
+ #include <obs.h>
+@@ -9,6 +10,36 @@
+ #include <mutex>
+ #include <string>
+ 
++namespace {
++const void *kFloatingKey = &kFloatingKey;
++
++/* Qt drops Qt::Tool windows to the normal level whenever LiveHime stops
++ * being the active app, which lets other apps' windows cover the floating
++ * chat. Put windows marked floating back after Qt's own handling. */
++void keepFloatingWhenInactive()
++{
++	static bool installed = false;
++	if (installed)
++		return;
++	installed = true;
++	for (NSNotificationName name : {NSApplicationDidResignActiveNotification, NSApplicationDidBecomeActiveNotification}) {
++		[[NSNotificationCenter defaultCenter]
++			addObserverForName:name
++				    object:nil
++				     queue:[NSOperationQueue mainQueue]
++				usingBlock:^(NSNotification *) {
++					dispatch_async(dispatch_get_main_queue(), ^{
++						for (NSWindow *w in NSApp.windows) {
++							if ([objc_getAssociatedObject(w, kFloatingKey) boolValue] &&
++							    w.level != NSFloatingWindowLevel)
++								w.level = NSFloatingWindowLevel;
++						}
++					});
++				}];
++	}
++}
++} // namespace
++
+ void ApplyNativeWindowOptions(QWidget *window, bool floating, bool capturable)
+ {
+ 	NSView *view = (__bridge NSView *)reinterpret_cast<void *>(window->winId());
+@@ -16,7 +47,25 @@ void ApplyNativeWindowOptions(QWidget *window, bool floating, bool capturable)
+ 	if (!nswindow)
+ 		return;
+ 	nswindow.hidesOnDeactivate = NO;
++	/* Another app's full-screen Space only admits windows that do not
++	 * activate their app: a panel with the non-activating style. Qt makes
++	 * Qt::Tool windows NSPanels; clicking such a panel no longer brings
++	 * LiveHime forward, but its text fields still take keyboard input. */
++	if ([nswindow isKindOfClass:[NSPanel class]]) {
++		NSWindowStyleMask mask = nswindow.styleMask;
++		if (floating)
++			mask |= NSWindowStyleMaskNonactivatingPanel;
++		else
++			mask &= ~NSWindowStyleMaskNonactivatingPanel;
++		if (mask != nswindow.styleMask)
++			nswindow.styleMask = mask;
++		((NSPanel *)nswindow).floatingPanel = floating;
++		((NSPanel *)nswindow).becomesKeyOnlyIfNeeded = floating;
++	}
+ 	nswindow.level = floating ? NSFloatingWindowLevel : NSNormalWindowLevel;
++	objc_setAssociatedObject(nswindow, kFloatingKey, @(floating), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++	if (floating)
++		keepFloatingWhenInactive();
+ 	NSWindowCollectionBehavior behavior = NSWindowCollectionBehaviorFullScreenAuxiliary;
+ 	if (floating)
+ 		behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces;
+-- 
+2.54.0 (Apple Git-157)
+

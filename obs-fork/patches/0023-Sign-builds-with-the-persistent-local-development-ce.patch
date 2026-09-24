@@ -1,7 +1,7 @@
 From 0273f8914ccdfac2280c8fe2b43c5db006334235 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 03:18:55 +0800
-Subject: [PATCH 23/39] Sign builds with the persistent local development
+Subject: [PATCH 23/43] Sign builds with the persistent local development
  certificate
 
 Ad-hoc signatures change on every build and macOS kept denying screen
@@ -169,3 +169,6 @@ index 000000000..2ecab47df
 +            print("Local development identity ready: " + identity()["sha1"])
 +    except (RuntimeError, OSError, ValueError, KeyError) as error:
 +        parser.exit(1, f"local-signing: {error}\n")
+-- 
+2.54.0 (Apple Git-157)
+

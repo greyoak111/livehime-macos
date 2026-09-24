@@ -1,7 +1,7 @@
 From b971c2bf247ae4912ff6bcb6dc15a9b67efbb5fa Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 02:47:38 +0800
-Subject: [PATCH 20/39] Show pre-live face verification as a native QR code
+Subject: [PATCH 20/43] Show pre-live face verification as a native QR code
 
 startLive can ask for face verification with need_face_auth and a qr URL
 (the fields the Windows client's FaceAuthPresenter reads). That now
@@ -372,3 +372,6 @@ index 32484b66a..cc80d4c3c 100644
  			/* The voucher is a one-time risk token, not a credential; log
  			 * only whether Bilibili sent one. */
  			blog(LOG_INFO, "[livehime] face verification required (voucher: %s)",
+-- 
+2.54.0 (Apple Git-157)
+

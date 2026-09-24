@@ -1,7 +1,7 @@
 From e961773a6afbaa737b5de285e40b610a1d369216 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 23:45:27 +0800
-Subject: [PATCH 09/39] Replace manual stream test with live room features in
+Subject: [PATCH 09/43] Replace manual stream test with live room features in
  the dock
 
 The dock's lower half becomes a live-room area: stats (watched, likes,
@@ -1638,3 +1638,6 @@ index e5c23a577..4757c9e00 100644
  	QTimer statsTimer_;
  	QElapsedTimer liveClock_;
  	uint64_t lastBytes_ = 0;
+-- 
+2.54.0 (Apple Git-157)
+
