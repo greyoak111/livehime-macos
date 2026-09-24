@@ -1,0 +1,1910 @@
+From 9433facf87119bc2339b72c8b0baf56e94cfa753 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 17:23:58 +0800
+Subject: [PATCH 37/39] Redo the danmaku overlay as a chat list in a canvas box
+
+The danmaku source now draws a chat list itself (Qt into a texture):
+newest message at the bottom, older ones above until the box is full,
+names in Bilibili pink, gifts gold, guards purple, Super Chats on a red
+strip, long messages wrapped, an optional rounded plate behind the
+messages. It redraws only when a message arrives or expires.
+
+Its box works like the captions': OBS's transform controls size it,
+and "Position on canvas" places it (bottom left by default). The box
+sync / placement and the texture upload are shared modules now
+(CanvasBox, OverlayFrame) used by both sources.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/e2e-overlay.mjs |  93 +++--
+ plugins/livehime/CMakeLists.txt          |   4 +
+ plugins/livehime/data/locale/en-US.ini   |  29 +-
+ plugins/livehime/data/locale/zh-CN.ini   |  29 +-
+ plugins/livehime/src/automation.cpp      |  12 +
+ plugins/livehime/src/canvas-box.cpp      | 327 ++++++++++++++++++
+ plugins/livehime/src/canvas-box.hpp      |  35 ++
+ plugins/livehime/src/caption-overlay.cpp | 410 +----------------------
+ plugins/livehime/src/caption-overlay.hpp |  11 -
+ plugins/livehime/src/danmaku-overlay.cpp | 354 +++++++++++++------
+ plugins/livehime/src/danmaku-overlay.hpp |  12 +-
+ plugins/livehime/src/overlay-frame.cpp   |  98 ++++++
+ plugins/livehime/src/overlay-frame.hpp   |  35 ++
+ plugins/livehime/src/plugin-main.cpp     |   7 +-
+ 14 files changed, 875 insertions(+), 581 deletions(-)
+ create mode 100644 plugins/livehime/src/canvas-box.cpp
+ create mode 100644 plugins/livehime/src/canvas-box.hpp
+ create mode 100644 plugins/livehime/src/overlay-frame.cpp
+ create mode 100644 plugins/livehime/src/overlay-frame.hpp
+
+diff --git a/build-aux/livehime/tests/e2e-overlay.mjs b/build-aux/livehime/tests/e2e-overlay.mjs
+index eef54fe06..0c042517e 100644
+--- a/build-aux/livehime/tests/e2e-overlay.mjs
++++ b/build-aux/livehime/tests/e2e-overlay.mjs
+@@ -1,9 +1,12 @@
+-// Checks the "LiveHime danmaku" overlay source renders injected messages.
+-// Works in a temporary scene that is removed afterwards.
++// The "LiveHime danmaku" source: a chat list (newest at the bottom) in a
++// box sized and placed like the captions. Injected room events only; works
++// in a temporary scene that is removed afterwards.
++// Usage: node e2e-overlay.mjs <ws password> [screenshot dir]
+ import { createHash } from 'node:crypto';
+ import { writeFileSync } from 'node:fs';
+ import zlib from 'node:zlib';
+ 
++const [password, shotDir] = process.argv.slice(2);
+ const sha = (s) => createHash('sha256').update(s).digest('base64');
+ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+ const ws = new WebSocket('ws://127.0.0.1:4466');
+@@ -14,16 +17,15 @@ const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName
+ let fails = 0;
+ const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
+ 
+-// Minimal PNG decode (8-bit RGBA, non-interlaced) to count visible pixels.
+-function visiblePixels(png) {
++function decode(png) {
+   let o = 8, w = 0, h = 0; const idat = [];
+   while (o < png.length) {
+     const len = png.readUInt32BE(o), type = png.toString('ascii', o + 4, o + 8), data = png.subarray(o + 8, o + 8 + len);
+-    if (type === 'IHDR') { w = data.readUInt32BE(0); h = data.readUInt32BE(4); if (data[8] !== 8 || data[9] !== 6) return { w, h, count: -1 }; }
++    if (type === 'IHDR') { w = data.readUInt32BE(0); h = data.readUInt32BE(4); }
+     if (type === 'IDAT') idat.push(data);
+     o += 12 + len;
+   }
+-  const raw = zlib.inflateSync(Buffer.concat(idat)), stride = w * 4; let prev = Buffer.alloc(stride), count = 0;
++  const raw = zlib.inflateSync(Buffer.concat(idat)), stride = w * 4, out = Buffer.alloc(w * h * 4); let prev = Buffer.alloc(stride);
+   for (let y = 0; y < h; y++) {
+     const f = raw[y * (stride + 1)], line = Buffer.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
+     for (let x = 0; x < stride; x++) {
+@@ -31,41 +33,66 @@ function visiblePixels(png) {
+       const p = f === 1 ? a : f === 2 ? b : f === 3 ? (a + b) >> 1 : f === 4 ? (() => { const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c); return pa <= pb && pa <= pc ? a : pb <= pc ? b : c; })() : 0;
+       line[x] = (line[x] + p) & 255;
+     }
+-    for (let x = 3; x < stride; x += 4) if (line[x] > 128) count++;
+-    prev = line;
++    line.copy(out, y * stride); prev = line;
+   }
+-  return { w, h, count };
+-}
+-
+-async function shot(name) {
+-  const r = await req('GetSourceScreenshot', { sourceName: name, imageFormat: 'png' });
+-  const png = Buffer.from(r.responseData.imageData.split(',')[1], 'base64');
+-  return { png, ...visiblePixels(png) };
++  return { w, h, px: out };
+ }
++const opaque = (img) => { let n = 0; for (let i = 3; i < img.px.length; i += 4) if (img.px[i] > 16) n++; return n; };
+ 
+ ws.onmessage = async (ev) => {
+   const m = JSON.parse(ev.data);
+-  if (m.op === 0) { const { challenge, salt } = m.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(process.argv[2] + salt) + challenge), eventSubscriptions: 0 } })); }
+-  else if (m.op === 7) pend.get(m.d.requestId)?.(m.d);
+-  else if (m.op === 2) {
+-    for (let i = 0; i < 40 && !(await req('GetVersion')).requestStatus.result; i++) await sleep(500);
+-    const scene = 'livehime-e2e', input = 'livehime-e2e-danmaku';
++  if (m.op === 0) { const { challenge, salt } = m.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + salt) + challenge), eventSubscriptions: 0 } })); return; }
++  if (m.op === 7) { pend.get(m.d.requestId)?.(m.d); return; }
++  if (m.op !== 2) return;
++  for (let i = 0; i < 40 && !(await req('GetVersion')).requestStatus.result; i++) await sleep(500);
++  const scene = 'livehime-e2e-overlay', name = 'livehime-e2e-danmaku';
++  const shot = async () => decode(Buffer.from((await req('GetSourceScreenshot', { sourceName: name, imageFormat: 'png' })).responseData.imageData.split(',')[1], 'base64'));
++  const shown = async () => (await vendor('OverlayState', { source: name }))?.shown ?? '';
++  try {
+     await req('CreateScene', { sceneName: scene });
+-    const created = await req('CreateInput', { sceneName: scene, inputName: input, inputKind: 'livehime_danmaku_overlay', inputSettings: { lifetime: 0 } });
+-    check('overlay source can be created', created.requestStatus.result, created.requestStatus.comment);
+-    await sleep(800);
+-    const empty = await shot(input);
+-    check('empty overlay renders nothing', empty.count === 0, `${empty.w}x${empty.h}, ${empty.count} px`);
+-    for (const [user, text] of [['观众A', '主播好！'], ['观众B', '这个画面好清楚'], ['观众C', 'hello LiveHime']])
+-      await vendor('InjectOverlayEvent', { kind: 'chat', user, text });
+-    await vendor('InjectOverlayEvent', { kind: 'gift', user: '观众D', name: '小心心', count: 3 });
+-    await sleep(1200);
+-    const full = await shot(input);
+-    writeFileSync(process.argv[3] || '/tmp/overlay.png', full.png);
+-    check('injected messages are drawn', full.count > 500, `${full.w}x${full.h}, ${full.count} px`);
++    const created = await req('CreateInput', { sceneName: scene, inputName: name, inputKind: 'livehime_danmaku_overlay', inputSettings: { lifetime: 0 } });
++    check('overlay source created', created.requestStatus.result, created.requestStatus.comment);
++    await sleep(600);
++    const itemId = (await req('GetSceneItemId', { sceneName: scene, sourceName: name })).responseData.sceneItemId;
++    const transform = async () => (await req('GetSceneItemTransform', { sceneName: scene, sceneItemId: itemId })).responseData.sceneItemTransform;
++    const video = (await req('GetVideoSettings')).responseData, W = video.baseWidth, H = video.baseHeight, M = 40;
++    let tf = await transform();
++    check('box of 640x720 at the bottom left', tf.boundsType === 'OBS_BOUNDS_MAX_ONLY' && tf.width === 640 && tf.height === 720 && tf.positionX === M && tf.positionY + tf.height === H - M, `pos ${tf.positionX},${tf.positionY} ${tf.width}x${tf.height} canvas ${W}x${H}`);
++    check('empty list draws nothing', opaque(await shot()) === 0);
++
++    await vendor('InjectOverlayEvent', { kind: 'chat', user: '观众A', text: '主播晚上好', uid: 1 });
++    await vendor('InjectOverlayEvent', { kind: 'chat', user: '观众B', text: '这段字幕好清楚', uid: 2 });
++    await vendor('InjectOverlayEvent', { kind: 'gift', user: '观众C', name: '小心心', count: 3 });
++    await vendor('InjectOverlayEvent', { kind: 'superChat', user: '观众D', text: '加油！', price: 30, seconds: 60 });
++    await vendor('InjectOverlayEvent', { kind: 'chat', user: '观众E', text: '一条很长很长的弹幕，看看它会不会在框里自动换行而不是被截断，也看看后面的消息会不会把前面的顶上去', uid: 5 });
++    await sleep(600);
++    const lines = (await shown()).split('\n');
++    check('messages listed oldest to newest', lines.length === 5 && lines[0] === '观众A：主播晚上好' && lines[4].startsWith('观众E：'), JSON.stringify(lines));
++    const img = await shot();
++    if (shotDir) writeFileSync(shotDir + '/danmaku-list.png', await (async () => Buffer.from((await req('GetSourceScreenshot', { sourceName: name, imageFormat: 'png' })).responseData.imageData.split(',')[1], 'base64'))());
++    let lowest = 0, highest = img.h; for (let y = 0; y < img.h; y++) for (let x = 0; x < img.w; x += 4) if (img.px[(y * img.w + x) * 4 + 3] > 16) { lowest = Math.max(lowest, y); highest = Math.min(highest, y); }
++    check('list sits at the bottom of the box', lowest > img.h - 24 && highest > img.h / 3, `ink rows ${highest}-${lowest} of ${img.h}`);
++
++    for (let i = 1; i <= 40; i++) await vendor('InjectOverlayEvent', { kind: 'chat', user: `刷屏${i}`, text: `第${i}条`, uid: 100 + i });
++    await sleep(600);
++    const full = (await shown()).split('\n');
++    check('a full box keeps the newest messages', full.at(-1) === '刷屏40：第40条' && !full.includes('观众A：主播晚上好') && full.length < 40, `${full.length} rows, last ${full.at(-1)}`);
++
++    await req('SetSceneItemTransform', { sceneName: scene, sceneItemId: itemId, sceneItemTransform: { boundsWidth: 900, boundsHeight: 500 } });
++    await sleep(500);
++    tf = await transform();
++    const settings = (await req('GetInputSettings', { inputName: name })).responseData.inputSettings;
++    check('resizing the box resizes the list, anchored bottom left', settings.width === 900 && settings.height === 500 && tf.scaleX === 1 && tf.positionX === M && tf.positionY + tf.height === H - M, `${settings.width}x${settings.height} pos ${tf.positionX},${tf.positionY}`);
++    await req('SetInputSettings', { inputName: name, inputSettings: { placement: 4 } });
++    await sleep(500);
++    tf = await transform();
++    check('bottom-right placement', tf.positionX + tf.width === W - M && tf.positionY + tf.height === H - M, `pos ${tf.positionX},${tf.positionY}`);
++  } catch (e) { check('run', false, e.stack); }
++  finally {
+     await req('RemoveScene', { sceneName: scene });
++    await sleep(800);
+     const gone = await req('GetSceneList');
+     check('temporary scene removed', !gone.responseData.scenes.some((s) => s.sceneName === scene));
+-    console.log(fails ? `${fails} failed` : 'all passed'); process.exit(fails ? 1 : 0);
+   }
++  console.log(fails ? `${fails} failed` : 'all passed'); process.exit(fails ? 1 : 0);
+ };
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 1378420ee..9462de012 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -30,6 +30,8 @@ target_sources(
+     src/account-panel.hpp
+     src/automation.cpp
+     src/automation.hpp
++    src/canvas-box.cpp
++    src/canvas-box.hpp
+     src/caption-controller.cpp
+     src/caption-controller.hpp
+     src/caption-overlay.cpp
+@@ -46,6 +48,8 @@ target_sources(
+     src/floating-chat.hpp
+     src/livehime-dock.cpp
+     src/livehime-dock.hpp
++    src/overlay-frame.cpp
++    src/overlay-frame.hpp
+     src/plugin-main.cpp
+     src/plugin-settings.cpp
+     src/plugin-settings.hpp
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 1752fe34f..5f72a1b79 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -153,9 +153,9 @@ LiveHime.Captions.Linger="Linger"
+ LiveHime.Captions.LingerHint="Seconds a caption stays after speech stops; 0 keeps it."
+ LiveHime.Captions.SourceHint="Turn on live captions and choose the audio source in the LiveHime dock's Captions tab."
+ LiveHime.Captions.Status.muted="Listening (the audio source is muted, so no captions)"
+-LiveHime.Captions.Width="Width"
+-LiveHime.Captions.Height="Height"
+-LiveHime.Captions.SizeHint="Size of the caption box. Resize here; dragging the frame on the canvas scales the text."
++LiveHime.Box.Width="Width"
++LiveHime.Box.Height="Height"
++LiveHime.Box.SizeHint="Size of the box. You can also drag its frame on the canvas; the text is not stretched."
+ LiveHime.Captions.HAlign="Horizontal alignment"
+ LiveHime.Captions.VAlign="Vertical alignment"
+ LiveHime.Captions.Align.Left="Left"
+@@ -169,14 +169,15 @@ LiveHime.Captions.OutlineColor="Outline color"
+ LiveHime.Captions.Background="Background plate"
+ LiveHime.Captions.BackgroundColor="Plate color"
+ LiveHime.Captions.Padding="Padding"
+-LiveHime.Captions.Placement="Position on canvas"
+-LiveHime.Captions.PlacementHint="Where the caption box sits on the stream. Moving it by hand on the canvas switches to Free."
+-LiveHime.Captions.Margin="Distance from edge"
+-LiveHime.Captions.Place.BottomCenter="Bottom center"
+-LiveHime.Captions.Place.TopCenter="Top center"
+-LiveHime.Captions.Place.Center="Center"
+-LiveHime.Captions.Place.BottomLeft="Bottom left"
+-LiveHime.Captions.Place.BottomRight="Bottom right"
+-LiveHime.Captions.Place.TopLeft="Top left"
+-LiveHime.Captions.Place.TopRight="Top right"
+-LiveHime.Captions.Place.Free="Free"
++LiveHime.Box.Placement="Position on canvas"
++LiveHime.Box.PlacementHint="Where the box sits on the stream. Moving it by hand on the canvas switches to Free."
++LiveHime.Box.Margin="Distance from edge"
++LiveHime.Box.Place.BottomCenter="Bottom center"
++LiveHime.Box.Place.TopCenter="Top center"
++LiveHime.Box.Place.Center="Center"
++LiveHime.Box.Place.BottomLeft="Bottom left"
++LiveHime.Box.Place.BottomRight="Bottom right"
++LiveHime.Box.Place.TopLeft="Top left"
++LiveHime.Box.Place.TopRight="Top right"
++LiveHime.Box.Place.Free="Free"
++LiveHime.Overlay.NameColor="Name color"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 677136570..0f1fc4be8 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -153,9 +153,9 @@ LiveHime.Captions.Linger="停留时间"
+ LiveHime.Captions.LingerHint="说完之后字幕保留的秒数；设为 0 时一直保留。"
+ LiveHime.Captions.SourceHint="在直播姬面板的「字幕」页开启语音字幕并选择音频来源。"
+ LiveHime.Captions.Status.muted="正在识别（音频来源已静音，暂时没有字幕）"
+-LiveHime.Captions.Width="宽度"
+-LiveHime.Captions.Height="高度"
+-LiveHime.Captions.SizeHint="字幕框的大小。改大小请在这里设置；在画面里拖动边框会缩放文字。"
++LiveHime.Box.Width="宽度"
++LiveHime.Box.Height="高度"
++LiveHime.Box.SizeHint="框的大小。也可以直接在画面里拖动边框调整，文字不会被拉伸。"
+ LiveHime.Captions.HAlign="水平对齐"
+ LiveHime.Captions.VAlign="垂直对齐"
+ LiveHime.Captions.Align.Left="左"
+@@ -169,14 +169,15 @@ LiveHime.Captions.OutlineColor="描边颜色"
+ LiveHime.Captions.Background="背景底板"
+ LiveHime.Captions.BackgroundColor="底板颜色"
+ LiveHime.Captions.Padding="边距"
+-LiveHime.Captions.Placement="画面位置"
+-LiveHime.Captions.PlacementHint="字幕框在直播画面上的位置。在画面里手动拖动字幕框后会自动改为“自由摆放”。"
+-LiveHime.Captions.Margin="离画面边缘"
+-LiveHime.Captions.Place.BottomCenter="底部居中"
+-LiveHime.Captions.Place.TopCenter="顶部居中"
+-LiveHime.Captions.Place.Center="画面中央"
+-LiveHime.Captions.Place.BottomLeft="左下"
+-LiveHime.Captions.Place.BottomRight="右下"
+-LiveHime.Captions.Place.TopLeft="左上"
+-LiveHime.Captions.Place.TopRight="右上"
+-LiveHime.Captions.Place.Free="自由摆放"
++LiveHime.Box.Placement="画面位置"
++LiveHime.Box.PlacementHint="在直播画面上的位置。在画面里手动拖动之后会自动改为“自由摆放”。"
++LiveHime.Box.Margin="离画面边缘"
++LiveHime.Box.Place.BottomCenter="底部居中"
++LiveHime.Box.Place.TopCenter="顶部居中"
++LiveHime.Box.Place.Center="画面中央"
++LiveHime.Box.Place.BottomLeft="左下"
++LiveHime.Box.Place.BottomRight="右下"
++LiveHime.Box.Place.TopLeft="左上"
++LiveHime.Box.Place.TopRight="右上"
++LiveHime.Box.Place.Free="自由摆放"
++LiveHime.Overlay.NameColor="用户名颜色"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 4ae107054..f85a3248e 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -195,6 +195,16 @@ void captions(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
++/* What the danmaku overlay source {"source"} currently shows (tests). */
++void overlayState(obs_data_t *request, obs_data_t *response, void *)
++{
++	const QString name = QString::fromUtf8(obs_data_get_string(request, "source"));
++	onUiThread([&] {
++		const QString shown = DanmakuOverlayHub::instance() ? DanmakuOverlayHub::instance()->shownText(name) : QString();
++		obs_data_set_string(response, "shown", shown.toUtf8().constData());
++	});
++}
++
+ /* Hosted Bilibili pages for tests: {"open":"cover"} opens the cover
+  * manager; {"page","script"} evaluates an async function body there and
+  * returns its JSON as "result"; {"page","click":{"x","y"}} clicks at page
+@@ -276,6 +286,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "CancelQRLogin", cancelQRLogin, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "HostedPage", hostedPage, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Captions", captions, nullptr);
++	obs_websocket_vendor_register_request(vendor, "OverlayState", overlayState, nullptr);
+ }
+ 
+ void UnregisterAutomation()
+@@ -292,6 +303,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "CancelQRLogin");
+ 		obs_websocket_vendor_unregister_request(vendor, "HostedPage");
+ 		obs_websocket_vendor_unregister_request(vendor, "Captions");
++		obs_websocket_vendor_unregister_request(vendor, "OverlayState");
+ 		vendor = nullptr;
+ 	}
+ 	target.clear();
+diff --git a/plugins/livehime/src/canvas-box.cpp b/plugins/livehime/src/canvas-box.cpp
+new file mode 100644
+index 000000000..0bcb74637
+--- /dev/null
++++ b/plugins/livehime/src/canvas-box.cpp
+@@ -0,0 +1,327 @@
++#include "canvas-box.hpp"
++
++#include <obs-module.h>
++
++#include <QCoreApplication>
++#include <QMetaObject>
++#include <QString>
++
++#include <cmath>
++#include <cstring>
++#include <functional>
++#include <map>
++
++using namespace CanvasBox;
++
++
++namespace {
++/* Sources whose scene items are boxes. */
++bool isBoxItem(obs_sceneitem_t *item)
++{
++	obs_source_t *source = obs_sceneitem_get_source(item);
++	if (!source)
++		return false;
++	const char *id = obs_source_get_unversioned_id(source);
++	return strcmp(id, "livehime_captions") == 0 || strcmp(id, "livehime_danmaku_overlay") == 0;
++}
++
++/* Runs on the UI thread: item_transform arrives from the video thread. */
++template<typename Fn> void onUi(Fn &&fn)
++{
++	if (QCoreApplication *app = QCoreApplication::instance())
++		QMetaObject::invokeMethod(app, std::forward<Fn>(fn), Qt::QueuedConnection);
++}
++
++void setSourceSize(obs_source_t *source, int width, int height)
++{
++	OBSDataAutoRelease settings = obs_source_get_settings(source);
++	if (obs_data_get_int(settings, "width") == width && obs_data_get_int(settings, "height") == height)
++		return;
++	OBSDataAutoRelease changes = obs_data_create();
++	obs_data_set_int(changes, "width", width);
++	obs_data_set_int(changes, "height", height);
++	obs_source_update(source, changes);
++}
++
++/* Last position and box we gave each item (UI thread), to tell a resize
++ * (keep the anchor) from the user moving the box (stop anchoring). */
++struct Placed {
++	vec2 pos;
++	vec2 bounds;
++};
++std::map<QString, Placed> placedItems;
++
++QString itemKey(obs_sceneitem_t *item)
++{
++	obs_source_t *scene = obs_scene_get_source(obs_sceneitem_get_scene(item));
++	return QString::fromUtf8(obs_source_get_uuid(scene)) + QChar(':') + QString::number(obs_sceneitem_get_id(item));
++}
++
++bool near(float a, float b)
++{
++	return std::fabs(a - b) < 0.5f;
++}
++
++/* Puts the box where the source's "placement" says (bottom centre by
++ * default). Moving the box by hand switches the source to free placement;
++ * resizing keeps it anchored. `force` re-applies after a settings change. */
++void placeItem(obs_sceneitem_t *item, bool force)
++{
++	obs_source_t *source = obs_sceneitem_get_source(item);
++	OBSDataAutoRelease settings = obs_source_get_settings(source);
++	const int placement = static_cast<int>(obs_data_get_int(settings, "placement"));
++	const QString key = itemKey(item);
++	if (placement == Free || obs_sceneitem_get_rot(item) != 0.0f) {
++		placedItems.erase(key);
++		return;
++	}
++	vec2 bounds, pos;
++	obs_sceneitem_get_bounds(item, &bounds);
++	obs_sceneitem_get_pos(item, &pos);
++	auto previous = placedItems.find(key);
++	if (!force && previous != placedItems.end() && near(bounds.x, previous->second.bounds.x) &&
++	    near(bounds.y, previous->second.bounds.y) &&
++	    (!near(pos.x, previous->second.pos.x) || !near(pos.y, previous->second.pos.y))) {
++		/* Same size, new place: the user moved it. */
++		placedItems.erase(previous);
++		OBSDataAutoRelease changes = obs_data_create();
++		obs_data_set_int(changes, "placement", Free);
++		obs_source_update(source, changes);
++		return;
++	}
++
++	obs_video_info video;
++	if (!obs_get_video_info(&video))
++		return;
++	const float canvasWidth = float(video.base_width), canvasHeight = float(video.base_height);
++	const float margin = float(obs_data_get_int(settings, "margin"));
++	float left = (canvasWidth - bounds.x) / 2, top = canvasHeight - margin - bounds.y;
++	switch (placement) {
++	case TopCenter:
++		top = margin;
++		break;
++	case Center:
++		top = (canvasHeight - bounds.y) / 2;
++		break;
++	case BottomLeft:
++		left = margin;
++		break;
++	case BottomRight:
++		left = canvasWidth - margin - bounds.x;
++		break;
++	case TopLeft:
++		left = margin;
++		top = margin;
++		break;
++	case TopRight:
++		left = canvasWidth - margin - bounds.x;
++		top = margin;
++		break;
++	default:
++		break;
++	}
++	/* The item's position is its alignment point, not always the corner. */
++	const uint32_t align = obs_sceneitem_get_alignment(item);
++	vec2 target;
++	target.x = left + ((align & OBS_ALIGN_LEFT) ? 0 : (align & OBS_ALIGN_RIGHT) ? bounds.x : bounds.x / 2);
++	target.y = top + ((align & OBS_ALIGN_TOP) ? 0 : (align & OBS_ALIGN_BOTTOM) ? bounds.y : bounds.y / 2);
++	placedItems[key] = {target, bounds};
++	if (!near(pos.x, target.x) || !near(pos.y, target.y))
++		obs_sceneitem_set_pos(item, &target);
++}
++
++/* The item's box is the caption box: take it as the source size, or turn a
++ * plain (scaled) item into a bounding-box item of the same visible size. */
++void syncItem(obs_sceneitem_t *item)
++{
++	if (!isBoxItem(item))
++		return;
++	obs_source_t *source = obs_sceneitem_get_source(item);
++	const int width = static_cast<int>(obs_source_get_width(source));
++	const int height = static_cast<int>(obs_source_get_height(source));
++	if (obs_sceneitem_get_bounds_type(item) == OBS_BOUNDS_NONE) {
++		vec2 scale;
++		obs_sceneitem_get_scale(item, &scale);
++		const int boxWidth = std::max(16, static_cast<int>(std::lround(width * std::fabs(scale.x))));
++		const int boxHeight = std::max(16, static_cast<int>(std::lround(height * std::fabs(scale.y))));
++		vec2 bounds;
++		vec2_set(&bounds, float(boxWidth), float(boxHeight));
++		vec2 one;
++		vec2_set(&one, scale.x < 0 ? -1.0f : 1.0f, scale.y < 0 ? -1.0f : 1.0f);
++		obs_sceneitem_defer_update_begin(item);
++		obs_sceneitem_set_scale(item, &one);
++		obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_MAX_ONLY);
++		obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_CENTER);
++		obs_sceneitem_set_bounds(item, &bounds);
++		obs_sceneitem_defer_update_end(item);
++		setSourceSize(source, boxWidth, boxHeight);
++		return;
++	}
++	vec2 bounds;
++	obs_sceneitem_get_bounds(item, &bounds);
++	const int boxWidth = std::max(16, static_cast<int>(std::lround(bounds.x)));
++	const int boxHeight = std::max(16, static_cast<int>(std::lround(bounds.y)));
++	if (boxWidth != width || boxHeight != height)
++		setSourceSize(source, boxWidth, boxHeight);
++	placeItem(item, false);
++}
++
++void itemTransformed(void *, calldata_t *data)
++{
++	OBSSceneItem item = static_cast<obs_sceneitem_t *>(calldata_ptr(data, "item"));
++	if (!item || !isBoxItem(item))
++		return;
++	onUi([item] { syncItem(item); });
++}
++
++void itemAdded(void *, calldata_t *data)
++{
++	itemTransformed(nullptr, data);
++}
++
++void attachScene(obs_source_t *sceneSource)
++{
++	signal_handler_t *handler = obs_source_get_signal_handler(sceneSource);
++	signal_handler_disconnect(handler, "item_add", itemAdded, nullptr);
++	signal_handler_disconnect(handler, "item_transform", itemTransformed, nullptr);
++	signal_handler_connect(handler, "item_add", itemAdded, nullptr);
++	signal_handler_connect(handler, "item_transform", itemTransformed, nullptr);
++}
++
++void sourceCreated(void *, calldata_t *data)
++{
++	auto *source = static_cast<obs_source_t *>(calldata_ptr(data, "source"));
++	if (source && obs_group_or_scene_from_source(source))
++		attachScene(source);
++}
++
++/* Items of every scene (and group) that show `source`. */
++void forEachItemOf(obs_source_t *source, const std::function<void(obs_sceneitem_t *)> &fn)
++{
++	struct Context {
++		obs_source_t *source;
++		const std::function<void(obs_sceneitem_t *)> *fn;
++	} context{source, &fn};
++	obs_enum_scenes(
++		[](void *param, obs_source_t *sceneSource) {
++			if (obs_scene_t *scene = obs_group_or_scene_from_source(sceneSource))
++				obs_scene_enum_items(
++					scene,
++					[](obs_scene_t *, obs_sceneitem_t *item, void *p) {
++						auto *ctx = static_cast<Context *>(p);
++						if (obs_sceneitem_get_source(item) == ctx->source)
++							(*ctx->fn)(item);
++						return true;
++					},
++					param);
++			return true;
++		},
++		&context);
++}
++} // namespace
++
++void CanvasBox::PushSize(obs_source_t *source, int width, int height)
++{
++	OBSWeakSource weak = OBSGetWeakRef(source);
++	onUi([weak, width, height] {
++		OBSSourceAutoRelease strong = obs_weak_source_get_source(weak);
++		if (!strong)
++			return;
++		forEachItemOf(strong, [width, height](obs_sceneitem_t *item) {
++			if (obs_sceneitem_get_bounds_type(item) == OBS_BOUNDS_NONE)
++				return; /* syncItem converts it on its next transform */
++			vec2 bounds;
++			obs_sceneitem_get_bounds(item, &bounds);
++			if (std::lround(bounds.x) == width && std::lround(bounds.y) == height)
++				return;
++			vec2_set(&bounds, float(width), float(height));
++			obs_sceneitem_set_bounds(item, &bounds);
++		});
++	});
++}
++
++void CanvasBox::Place(obs_source_t *source)
++{
++	OBSWeakSource weak = OBSGetWeakRef(source);
++	onUi([weak] {
++		OBSSourceAutoRelease strong = obs_weak_source_get_source(weak);
++		if (strong)
++			forEachItemOf(strong, [](obs_sceneitem_t *item) { placeItem(item, true); });
++	});
++}
++
++void CanvasBox::Attach()
++{
++	signal_handler_connect(obs_get_signal_handler(), "source_create", sourceCreated, nullptr);
++}
++
++void CanvasBox::AttachExisting()
++{
++	obs_enum_scenes(
++		[](void *, obs_source_t *sceneSource) {
++			attachScene(sceneSource);
++			if (obs_scene_t *scene = obs_group_or_scene_from_source(sceneSource))
++				obs_scene_enum_items(scene, [](obs_scene_t *, obs_sceneitem_t *item, void *) {
++					if (isBoxItem(item))
++						syncItem(item);
++					return true;
++				}, nullptr);
++			return true;
++		},
++		nullptr);
++}
++
++void CanvasBox::Detach()
++{
++	signal_handler_disconnect(obs_get_signal_handler(), "source_create", sourceCreated, nullptr);
++}
++
++void CanvasBox::Tracker::update(obs_source_t *source, obs_data_t *settings)
++{
++	const int w = static_cast<int>(obs_data_get_int(settings, "width"));
++	const int h = static_cast<int>(obs_data_get_int(settings, "height"));
++	const int p = static_cast<int>(obs_data_get_int(settings, "placement"));
++	const int m = static_cast<int>(obs_data_get_int(settings, "margin"));
++	if (!source)
++		return;
++	if ((w != width || h != height) && width >= 0)
++		PushSize(source, w, h);
++	if ((p != placement || m != margin) && placement >= 0)
++		Place(source);
++	width = w;
++	height = h;
++	placement = p;
++	margin = m;
++}
++
++void CanvasBox::SetDefaults(obs_data_t *settings, int width, int height, Placement placement, int margin)
++{
++	obs_data_set_default_int(settings, "width", width);
++	obs_data_set_default_int(settings, "height", height);
++	obs_data_set_default_int(settings, "placement", placement);
++	obs_data_set_default_int(settings, "margin", margin);
++}
++
++void CanvasBox::AddProperties(obs_properties_t *props)
++{
++	auto t = [](const char *key) { return obs_module_text(key); };
++	obs_property_t *place = obs_properties_add_list(props, "placement", t("LiveHime.Box.Placement"),
++							OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
++	for (const auto &[key, value] : {std::pair{"LiveHime.Box.Place.BottomCenter", BottomCenter},
++					 std::pair{"LiveHime.Box.Place.TopCenter", TopCenter},
++					 std::pair{"LiveHime.Box.Place.Center", Center},
++					 std::pair{"LiveHime.Box.Place.BottomLeft", BottomLeft},
++					 std::pair{"LiveHime.Box.Place.BottomRight", BottomRight},
++					 std::pair{"LiveHime.Box.Place.TopLeft", TopLeft},
++					 std::pair{"LiveHime.Box.Place.TopRight", TopRight},
++					 std::pair{"LiveHime.Box.Place.Free", Free}})
++		obs_property_list_add_int(place, t(key), value);
++	obs_property_set_long_description(place, t("LiveHime.Box.PlacementHint"));
++	obs_property_t *margin = obs_properties_add_int(props, "margin", t("LiveHime.Box.Margin"), 0, 1000, 5);
++	obs_property_int_set_suffix(margin, " px");
++	obs_property_t *width = obs_properties_add_int(props, "width", t("LiveHime.Box.Width"), 16, 7680, 10);
++	obs_property_int_set_suffix(width, " px");
++	obs_property_t *height = obs_properties_add_int(props, "height", t("LiveHime.Box.Height"), 16, 4320, 10);
++	obs_property_int_set_suffix(height, " px");
++	obs_property_set_long_description(height, t("LiveHime.Box.SizeHint"));
++}
+diff --git a/plugins/livehime/src/canvas-box.hpp b/plugins/livehime/src/canvas-box.hpp
+new file mode 100644
+index 000000000..ea09187ae
+--- /dev/null
++++ b/plugins/livehime/src/canvas-box.hpp
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <obs.hpp>
++
++/* A LiveHime overlay (captions, danmaku) on the canvas is a box of the size
++ * the user sets, placed where the user chooses, and OBS's own transform
++ * controls size that box instead of scaling the text:
++ * - scene items of these sources use a bounding box (max size only) and the
++ *   source takes it as its "width" and "height";
++ * - "placement" anchors the box (bottom centre, a corner, ...) at "margin"
++ *   pixels from the canvas edge; resizing keeps the anchor, moving the box
++ *   by hand switches the source to Free;
++ * - width/height/placement changed in the source's properties are pushed
++ *   to its items (Tracker). */
++namespace CanvasBox {
++enum Placement { BottomCenter = 0, TopCenter, Center, BottomLeft, BottomRight, TopLeft, TopRight, Free };
++
++/* Attach at module load (scenes created later); AttachExisting once the
++ * scene collection has loaded or changed. */
++void Attach();
++void AttachExisting();
++void Detach();
++
++void PushSize(obs_source_t *source, int width, int height);
++void Place(obs_source_t *source);
++
++void SetDefaults(obs_data_t *settings, int width, int height, Placement placement, int margin = 40);
++void AddProperties(obs_properties_t *props);
++
++/* Call from a source's update(): pushes size / placement changes. */
++struct Tracker {
++	int width = -1, height = -1, placement = -1, margin = -1;
++	void update(obs_source_t *source, obs_data_t *settings);
++};
++} // namespace CanvasBox
+diff --git a/plugins/livehime/src/caption-overlay.cpp b/plugins/livehime/src/caption-overlay.cpp
+index 01ddb4591..da6259606 100644
+--- a/plugins/livehime/src/caption-overlay.cpp
++++ b/plugins/livehime/src/caption-overlay.cpp
+@@ -1,4 +1,6 @@
+ #include "caption-overlay.hpp"
++#include "canvas-box.hpp"
++#include "overlay-frame.hpp"
+ 
+ #include <obs-module.h>
+ #include <obs.hpp>
+@@ -20,8 +22,6 @@
+ #include <map>
+ #include <vector>
+ 
+-void CaptionItemSync_PushSize(obs_source_t *source, int width, int height);
+-void CaptionItemSync_Place(obs_source_t *source);
+ 
+ namespace {
+ constexpr int kDefaultWidth = 1920;
+@@ -32,26 +32,8 @@ constexpr int kDefaultFontSize = 48;
+ constexpr const char *kDefaultFace = "Hiragino Sans GB";
+ 
+ enum HAlign { AlignLeft = 0, AlignCenter = 1, AlignRight = 2 };
+-/* Where the caption box sits on the canvas. */
+-enum Placement {
+-	PlaceBottomCenter = 0,
+-	PlaceTopCenter,
+-	PlaceCenter,
+-	PlaceBottomLeft,
+-	PlaceBottomRight,
+-	PlaceTopLeft,
+-	PlaceTopRight,
+-	PlaceFree,
+-};
+-constexpr int kDefaultMargin = 40;
+ enum VAlign { AlignTop = 0, AlignMiddle = 1, AlignBottom = 2 };
+ 
+-/* OBS colors are 0xAABBGGRR. */
+-QColor obsColor(long long value)
+-{
+-	const auto v = static_cast<uint32_t>(value);
+-	return QColor(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF);
+-}
+ 
+ struct Style {
+ 	int width = kDefaultWidth;
+@@ -74,18 +56,13 @@ struct Style {
+ 
+ struct CaptionOverlay {
+ 	obs_source_t *self = nullptr;
+-	int placement = -1; /* last applied, to notice changes */
+-	int margin = -1;
++	CanvasBox::Tracker box;
+ 	/* Style and layout: UI thread (update + hub). */
+ 	Style style;
+ 	QString shown;
+ 	bool dirty = true;
+ 
+-	/* Rendered frame, handed to the graphics thread. */
+-	std::mutex frameMutex;
+-	QImage pending;
+-	bool hasPending = false;
+-	gs_texture_t *texture = nullptr;
++	OverlayFrame frame;
+ 	std::atomic<int> width{kDefaultWidth};
+ 	std::atomic<int> height{kDefaultHeight};
+ };
+@@ -188,22 +165,8 @@ QImage render(const std::vector<QString> &lines, const Style &style)
+ 	for (size_t i = 0; i < lines.size(); i++) {
+ 		const double width = metrics.horizontalAdvance(lines[i]);
+ 		const QPointF origin(lineX(width), top + lineHeight * i + (lineHeight - metrics.height()) / 2 + metrics.ascent());
+-		QPainterPath path;
+-		path.addText(origin, style.font, lines[i]);
+-		if (style.shadow) {
+-			painter.setPen(Qt::NoPen);
+-			painter.setBrush(QColor(0, 0, 0, 140));
+-			painter.drawPath(path.translated(2.5, 3));
+-		}
+-		if (style.outline && style.outlineWidth > 0) {
+-			QPen pen(style.outlineColor, style.outlineWidth * 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+-			painter.setPen(pen);
+-			painter.setBrush(Qt::NoBrush);
+-			painter.drawPath(path);
+-		}
+-		painter.setPen(Qt::NoPen);
+-		painter.setBrush(style.color);
+-		painter.drawPath(path);
++		PaintText(painter, origin, style.font, lines[i], style.color, style.outline, style.outlineWidth,
++			  style.outlineColor, style.shadow);
+ 	}
+ 	return image;
+ }
+@@ -295,275 +258,10 @@ void CaptionOverlayHub::refresh()
+ 			continue;
+ 		overlay->shown = shown;
+ 		overlay->dirty = false;
+-		QImage image = render(lines, style);
+-		std::lock_guard frame(overlay->frameMutex);
+-		overlay->pending = std::move(image);
+-		overlay->hasPending = true;
++		overlay->frame.post(render(lines, style));
+ 	}
+ }
+ 
+-/* ---- scene item sync ---- */
+-
+-namespace {
+-constexpr const char *kSourceId = "livehime_captions";
+-
+-bool isCaptionItem(obs_sceneitem_t *item)
+-{
+-	obs_source_t *source = obs_sceneitem_get_source(item);
+-	return source && strcmp(obs_source_get_unversioned_id(source), kSourceId) == 0;
+-}
+-
+-/* Runs on the UI thread: item_transform arrives from the video thread. */
+-template<typename Fn> void onUi(Fn &&fn)
+-{
+-	if (QCoreApplication *app = QCoreApplication::instance())
+-		QMetaObject::invokeMethod(app, std::forward<Fn>(fn), Qt::QueuedConnection);
+-}
+-
+-void setSourceSize(obs_source_t *source, int width, int height)
+-{
+-	OBSDataAutoRelease settings = obs_source_get_settings(source);
+-	if (obs_data_get_int(settings, "width") == width && obs_data_get_int(settings, "height") == height)
+-		return;
+-	OBSDataAutoRelease changes = obs_data_create();
+-	obs_data_set_int(changes, "width", width);
+-	obs_data_set_int(changes, "height", height);
+-	obs_source_update(source, changes);
+-}
+-
+-/* Last position and box we gave each item (UI thread), to tell a resize
+- * (keep the anchor) from the user moving the box (stop anchoring). */
+-struct Placed {
+-	vec2 pos;
+-	vec2 bounds;
+-};
+-std::map<QString, Placed> placedItems;
+-
+-QString itemKey(obs_sceneitem_t *item)
+-{
+-	obs_source_t *scene = obs_scene_get_source(obs_sceneitem_get_scene(item));
+-	return QString::fromUtf8(obs_source_get_uuid(scene)) + QChar(':') + QString::number(obs_sceneitem_get_id(item));
+-}
+-
+-bool near(float a, float b)
+-{
+-	return std::fabs(a - b) < 0.5f;
+-}
+-
+-/* Puts the box where the source's "placement" says (bottom centre by
+- * default). Moving the box by hand switches the source to free placement;
+- * resizing keeps it anchored. `force` re-applies after a settings change. */
+-void placeItem(obs_sceneitem_t *item, bool force)
+-{
+-	obs_source_t *source = obs_sceneitem_get_source(item);
+-	OBSDataAutoRelease settings = obs_source_get_settings(source);
+-	const int placement = static_cast<int>(obs_data_get_int(settings, "placement"));
+-	const QString key = itemKey(item);
+-	if (placement == PlaceFree || obs_sceneitem_get_rot(item) != 0.0f) {
+-		placedItems.erase(key);
+-		return;
+-	}
+-	vec2 bounds, pos;
+-	obs_sceneitem_get_bounds(item, &bounds);
+-	obs_sceneitem_get_pos(item, &pos);
+-	auto previous = placedItems.find(key);
+-	if (!force && previous != placedItems.end() && near(bounds.x, previous->second.bounds.x) &&
+-	    near(bounds.y, previous->second.bounds.y) &&
+-	    (!near(pos.x, previous->second.pos.x) || !near(pos.y, previous->second.pos.y))) {
+-		/* Same size, new place: the user moved it. */
+-		placedItems.erase(previous);
+-		OBSDataAutoRelease changes = obs_data_create();
+-		obs_data_set_int(changes, "placement", PlaceFree);
+-		obs_source_update(source, changes);
+-		return;
+-	}
+-
+-	obs_video_info video;
+-	if (!obs_get_video_info(&video))
+-		return;
+-	const float canvasWidth = float(video.base_width), canvasHeight = float(video.base_height);
+-	const float margin = float(obs_data_get_int(settings, "margin"));
+-	float left = (canvasWidth - bounds.x) / 2, top = canvasHeight - margin - bounds.y;
+-	switch (placement) {
+-	case PlaceTopCenter:
+-		top = margin;
+-		break;
+-	case PlaceCenter:
+-		top = (canvasHeight - bounds.y) / 2;
+-		break;
+-	case PlaceBottomLeft:
+-		left = margin;
+-		break;
+-	case PlaceBottomRight:
+-		left = canvasWidth - margin - bounds.x;
+-		break;
+-	case PlaceTopLeft:
+-		left = margin;
+-		top = margin;
+-		break;
+-	case PlaceTopRight:
+-		left = canvasWidth - margin - bounds.x;
+-		top = margin;
+-		break;
+-	default:
+-		break;
+-	}
+-	/* The item's position is its alignment point, not always the corner. */
+-	const uint32_t align = obs_sceneitem_get_alignment(item);
+-	vec2 target;
+-	target.x = left + ((align & OBS_ALIGN_LEFT) ? 0 : (align & OBS_ALIGN_RIGHT) ? bounds.x : bounds.x / 2);
+-	target.y = top + ((align & OBS_ALIGN_TOP) ? 0 : (align & OBS_ALIGN_BOTTOM) ? bounds.y : bounds.y / 2);
+-	placedItems[key] = {target, bounds};
+-	if (!near(pos.x, target.x) || !near(pos.y, target.y))
+-		obs_sceneitem_set_pos(item, &target);
+-}
+-
+-/* The item's box is the caption box: take it as the source size, or turn a
+- * plain (scaled) item into a bounding-box item of the same visible size. */
+-void syncItem(obs_sceneitem_t *item)
+-{
+-	if (!isCaptionItem(item))
+-		return;
+-	obs_source_t *source = obs_sceneitem_get_source(item);
+-	const int width = static_cast<int>(obs_source_get_width(source));
+-	const int height = static_cast<int>(obs_source_get_height(source));
+-	if (obs_sceneitem_get_bounds_type(item) == OBS_BOUNDS_NONE) {
+-		vec2 scale;
+-		obs_sceneitem_get_scale(item, &scale);
+-		const int boxWidth = std::max(16, static_cast<int>(std::lround(width * std::fabs(scale.x))));
+-		const int boxHeight = std::max(16, static_cast<int>(std::lround(height * std::fabs(scale.y))));
+-		vec2 bounds;
+-		vec2_set(&bounds, float(boxWidth), float(boxHeight));
+-		vec2 one;
+-		vec2_set(&one, scale.x < 0 ? -1.0f : 1.0f, scale.y < 0 ? -1.0f : 1.0f);
+-		obs_sceneitem_defer_update_begin(item);
+-		obs_sceneitem_set_scale(item, &one);
+-		obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_MAX_ONLY);
+-		obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_CENTER);
+-		obs_sceneitem_set_bounds(item, &bounds);
+-		obs_sceneitem_defer_update_end(item);
+-		setSourceSize(source, boxWidth, boxHeight);
+-		return;
+-	}
+-	vec2 bounds;
+-	obs_sceneitem_get_bounds(item, &bounds);
+-	const int boxWidth = std::max(16, static_cast<int>(std::lround(bounds.x)));
+-	const int boxHeight = std::max(16, static_cast<int>(std::lround(bounds.y)));
+-	if (boxWidth != width || boxHeight != height)
+-		setSourceSize(source, boxWidth, boxHeight);
+-	placeItem(item, false);
+-}
+-
+-void itemTransformed(void *, calldata_t *data)
+-{
+-	OBSSceneItem item = static_cast<obs_sceneitem_t *>(calldata_ptr(data, "item"));
+-	if (!item || !isCaptionItem(item))
+-		return;
+-	onUi([item] { syncItem(item); });
+-}
+-
+-void itemAdded(void *, calldata_t *data)
+-{
+-	itemTransformed(nullptr, data);
+-}
+-
+-void attachScene(obs_source_t *sceneSource)
+-{
+-	signal_handler_t *handler = obs_source_get_signal_handler(sceneSource);
+-	signal_handler_disconnect(handler, "item_add", itemAdded, nullptr);
+-	signal_handler_disconnect(handler, "item_transform", itemTransformed, nullptr);
+-	signal_handler_connect(handler, "item_add", itemAdded, nullptr);
+-	signal_handler_connect(handler, "item_transform", itemTransformed, nullptr);
+-}
+-
+-void sourceCreated(void *, calldata_t *data)
+-{
+-	auto *source = static_cast<obs_source_t *>(calldata_ptr(data, "source"));
+-	if (source && obs_group_or_scene_from_source(source))
+-		attachScene(source);
+-}
+-
+-/* Items of every scene (and group) that show `source`. */
+-void forEachItemOf(obs_source_t *source, const std::function<void(obs_sceneitem_t *)> &fn)
+-{
+-	struct Context {
+-		obs_source_t *source;
+-		const std::function<void(obs_sceneitem_t *)> *fn;
+-	} context{source, &fn};
+-	obs_enum_scenes(
+-		[](void *param, obs_source_t *sceneSource) {
+-			if (obs_scene_t *scene = obs_group_or_scene_from_source(sceneSource))
+-				obs_scene_enum_items(
+-					scene,
+-					[](obs_scene_t *, obs_sceneitem_t *item, void *p) {
+-						auto *ctx = static_cast<Context *>(p);
+-						if (obs_sceneitem_get_source(item) == ctx->source)
+-							(*ctx->fn)(item);
+-						return true;
+-					},
+-					param);
+-			return true;
+-		},
+-		&context);
+-}
+-} // namespace
+-
+-void CaptionItemSync_PushSize(obs_source_t *source, int width, int height)
+-{
+-	OBSWeakSource weak = OBSGetWeakRef(source);
+-	onUi([weak, width, height] {
+-		OBSSourceAutoRelease strong = obs_weak_source_get_source(weak);
+-		if (!strong)
+-			return;
+-		forEachItemOf(strong, [width, height](obs_sceneitem_t *item) {
+-			if (obs_sceneitem_get_bounds_type(item) == OBS_BOUNDS_NONE)
+-				return; /* syncItem converts it on its next transform */
+-			vec2 bounds;
+-			obs_sceneitem_get_bounds(item, &bounds);
+-			if (std::lround(bounds.x) == width && std::lround(bounds.y) == height)
+-				return;
+-			vec2_set(&bounds, float(width), float(height));
+-			obs_sceneitem_set_bounds(item, &bounds);
+-		});
+-	});
+-}
+-
+-void CaptionItemSync_Place(obs_source_t *source)
+-{
+-	OBSWeakSource weak = OBSGetWeakRef(source);
+-	onUi([weak] {
+-		OBSSourceAutoRelease strong = obs_weak_source_get_source(weak);
+-		if (strong)
+-			forEachItemOf(strong, [](obs_sceneitem_t *item) { placeItem(item, true); });
+-	});
+-}
+-
+-void CaptionItemSync::Attach()
+-{
+-	signal_handler_connect(obs_get_signal_handler(), "source_create", sourceCreated, nullptr);
+-}
+-
+-void CaptionItemSync::AttachExisting()
+-{
+-	obs_enum_scenes(
+-		[](void *, obs_source_t *sceneSource) {
+-			attachScene(sceneSource);
+-			if (obs_scene_t *scene = obs_group_or_scene_from_source(sceneSource))
+-				obs_scene_enum_items(scene, [](obs_scene_t *, obs_sceneitem_t *item, void *) {
+-					if (isCaptionItem(item))
+-						syncItem(item);
+-					return true;
+-				}, nullptr);
+-			return true;
+-		},
+-		nullptr);
+-}
+-
+-void CaptionItemSync::Detach()
+-{
+-	signal_handler_disconnect(obs_get_signal_handler(), "source_create", sourceCreated, nullptr);
+-}
+-
+ /* ---- obs_source_info ---- */
+ 
+ namespace {
+@@ -583,36 +281,19 @@ void captionUpdate(void *data, obs_data_t *settings)
+ 	style.hAlign = static_cast<int>(obs_data_get_int(settings, "h_align"));
+ 	style.vAlign = static_cast<int>(obs_data_get_int(settings, "v_align"));
+ 	OBSDataAutoRelease font = obs_data_get_obj(settings, "font");
+-	const int size = font ? static_cast<int>(obs_data_get_int(font, "size")) : kDefaultFontSize;
+-	const long long flags = font ? obs_data_get_int(font, "flags") : 0;
+-	style.font = QFont(QString::fromUtf8(font ? obs_data_get_string(font, "face") : kDefaultFace));
+-	style.font.setPixelSize(size > 0 ? size : kDefaultFontSize);
+-	const QString fontStyle = QString::fromUtf8(font ? obs_data_get_string(font, "style") : "");
+-	if (!fontStyle.isEmpty())
+-		style.font.setStyleName(fontStyle);
+-	style.font.setBold(flags & OBS_FONT_BOLD);
+-	style.font.setItalic(flags & OBS_FONT_ITALIC);
+-	style.color = obsColor(obs_data_get_int(settings, "color"));
++	style.font = ObsFont(font, kDefaultFace, kDefaultFontSize);
++	style.color = ObsColor(obs_data_get_int(settings, "color"));
+ 	style.outline = obs_data_get_bool(settings, "outline");
+ 	style.outlineWidth = static_cast<int>(obs_data_get_int(settings, "outline_width"));
+-	style.outlineColor = obsColor(obs_data_get_int(settings, "outline_color"));
++	style.outlineColor = ObsColor(obs_data_get_int(settings, "outline_color"));
+ 	style.shadow = obs_data_get_bool(settings, "drop_shadow");
+ 	style.background = obs_data_get_bool(settings, "background");
+-	style.backgroundColor = obsColor(obs_data_get_int(settings, "background_color"));
++	style.backgroundColor = ObsColor(obs_data_get_int(settings, "background_color"));
+ 	style.padding = static_cast<int>(obs_data_get_int(settings, "padding"));
+ 
+-	const bool resized = overlay->width != style.width || overlay->height != style.height;
+ 	overlay->width = style.width;
+ 	overlay->height = style.height;
+-	if (resized && overlay->self)
+-		CaptionItemSync_PushSize(overlay->self, style.width, style.height);
+-	const int placement = static_cast<int>(obs_data_get_int(settings, "placement"));
+-	const int margin = static_cast<int>(obs_data_get_int(settings, "margin"));
+-	if ((placement != overlay->placement || margin != overlay->margin) && overlay->self) {
+-		overlay->placement = placement;
+-		overlay->margin = margin;
+-		CaptionItemSync_Place(overlay->self);
+-	}
++	overlay->box.update(overlay->self, settings);
+ 	if (CaptionOverlayHub *hub = CaptionOverlayHub::instance()) {
+ 		hub->remove(overlay);
+ 		overlay->style = style;
+@@ -636,11 +317,7 @@ void captionDestroy(void *data)
+ 	auto *overlay = static_cast<CaptionOverlay *>(data);
+ 	if (CaptionOverlayHub *hub = CaptionOverlayHub::instance())
+ 		hub->remove(overlay);
+-	if (overlay->texture) {
+-		obs_enter_graphics();
+-		gs_texture_destroy(overlay->texture);
+-		obs_leave_graphics();
+-	}
++	overlay->frame.release();
+ 	delete overlay;
+ }
+ 
+@@ -656,40 +333,7 @@ uint32_t captionHeight(void *data)
+ 
+ void captionRender(void *data, gs_effect_t *)
+ {
+-	auto *overlay = static_cast<CaptionOverlay *>(data);
+-	{
+-		std::lock_guard lock(overlay->frameMutex);
+-		if (overlay->hasPending) {
+-			overlay->hasPending = false;
+-			const QImage &image = overlay->pending;
+-			if (overlay->texture && (gs_texture_get_width(overlay->texture) != uint32_t(image.width()) ||
+-						 gs_texture_get_height(overlay->texture) != uint32_t(image.height()))) {
+-				gs_texture_destroy(overlay->texture);
+-				overlay->texture = nullptr;
+-			}
+-			if (!image.isNull()) {
+-				if (!overlay->texture) {
+-					const uint8_t *bits = image.constBits();
+-					overlay->texture = gs_texture_create(image.width(), image.height(), GS_BGRA, 1, &bits,
+-									     GS_DYNAMIC);
+-				} else {
+-					gs_texture_set_image(overlay->texture, image.constBits(),
+-							     static_cast<uint32_t>(image.bytesPerLine()), false);
+-				}
+-			}
+-		}
+-	}
+-	if (!overlay->texture)
+-		return;
+-	/* The image is premultiplied (QImage ARGB32_Premultiplied, BGRA in memory). */
+-	gs_blend_state_push();
+-	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+-	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_PREMULTIPLIED_ALPHA);
+-	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
+-	gs_effect_set_texture(image, overlay->texture);
+-	while (gs_effect_loop(effect, "Draw"))
+-		gs_draw_sprite(overlay->texture, 0, 0, 0);
+-	gs_blend_state_pop();
++	static_cast<CaptionOverlay *>(data)->frame.render();
+ }
+ 
+ void captionDefaults(obs_data_t *settings)
+@@ -700,8 +344,7 @@ void captionDefaults(obs_data_t *settings)
+ 	obs_data_set_default_int(font, "flags", 0);
+ 	obs_data_set_default_string(font, "style", "W6");
+ 	obs_data_set_default_obj(settings, "font", font);
+-	obs_data_set_default_int(settings, "width", kDefaultWidth);
+-	obs_data_set_default_int(settings, "height", kDefaultHeight);
++	CanvasBox::SetDefaults(settings, kDefaultWidth, kDefaultHeight, CanvasBox::BottomCenter);
+ 	obs_data_set_default_int(settings, "lines", kDefaultLines);
+ 	obs_data_set_default_int(settings, "linger", kDefaultLinger);
+ 	obs_data_set_default_int(settings, "h_align", AlignCenter);
+@@ -714,8 +357,6 @@ void captionDefaults(obs_data_t *settings)
+ 	obs_data_set_default_bool(settings, "background", false);
+ 	obs_data_set_default_int(settings, "background_color", 0x96000000);
+ 	obs_data_set_default_int(settings, "padding", 16);
+-	obs_data_set_default_int(settings, "placement", PlaceBottomCenter);
+-	obs_data_set_default_int(settings, "margin", kDefaultMargin);
+ }
+ 
+ obs_properties_t *captionProperties(void *)
+@@ -723,26 +364,7 @@ obs_properties_t *captionProperties(void *)
+ 	obs_properties_t *props = obs_properties_create();
+ 	auto t = [](const char *key) { return obs_module_text(key); };
+ 
+-	obs_property_t *place = obs_properties_add_list(props, "placement", t("LiveHime.Captions.Placement"),
+-							OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+-	for (const auto &[key, value] : {std::pair{"LiveHime.Captions.Place.BottomCenter", PlaceBottomCenter},
+-					 std::pair{"LiveHime.Captions.Place.TopCenter", PlaceTopCenter},
+-					 std::pair{"LiveHime.Captions.Place.Center", PlaceCenter},
+-					 std::pair{"LiveHime.Captions.Place.BottomLeft", PlaceBottomLeft},
+-					 std::pair{"LiveHime.Captions.Place.BottomRight", PlaceBottomRight},
+-					 std::pair{"LiveHime.Captions.Place.TopLeft", PlaceTopLeft},
+-					 std::pair{"LiveHime.Captions.Place.TopRight", PlaceTopRight},
+-					 std::pair{"LiveHime.Captions.Place.Free", PlaceFree}})
+-		obs_property_list_add_int(place, t(key), value);
+-	obs_property_set_long_description(place, t("LiveHime.Captions.PlacementHint"));
+-	obs_property_t *margin = obs_properties_add_int(props, "margin", t("LiveHime.Captions.Margin"), 0, 1000, 5);
+-	obs_property_int_set_suffix(margin, " px");
+-
+-	obs_property_t *width = obs_properties_add_int(props, "width", t("LiveHime.Captions.Width"), 16, 7680, 10);
+-	obs_property_int_set_suffix(width, " px");
+-	obs_property_t *height = obs_properties_add_int(props, "height", t("LiveHime.Captions.Height"), 16, 4320, 10);
+-	obs_property_int_set_suffix(height, " px");
+-	obs_property_set_long_description(height, t("LiveHime.Captions.SizeHint"));
++	CanvasBox::AddProperties(props);
+ 	obs_properties_add_int_slider(props, "lines", t("LiveHime.Overlay.Lines"), 1, 6, 1);
+ 
+ 	obs_property_t *h = obs_properties_add_list(props, "h_align", t("LiveHime.Captions.HAlign"), OBS_COMBO_TYPE_LIST,
+diff --git a/plugins/livehime/src/caption-overlay.hpp b/plugins/livehime/src/caption-overlay.hpp
+index 8c19e0247..8f9b7947a 100644
+--- a/plugins/livehime/src/caption-overlay.hpp
++++ b/plugins/livehime/src/caption-overlay.hpp
+@@ -46,14 +46,3 @@ private:
+ 
+ void RegisterCaptionOverlaySource();
+ 
+-/* Makes OBS's own transform controls size the caption box instead of
+- * scaling the text: scene items showing a captions source use a bounding
+- * box, and the source takes that box as its width and height (so the text
+- * re-wraps at its font size). Width and height set in the source's
+- * properties are pushed back to the items' bounding boxes. Call Attach at
+- * load (global source creation) and AttachExisting once scenes exist. */
+-namespace CaptionItemSync {
+-void Attach();
+-void AttachExisting();
+-void Detach();
+-} // namespace CaptionItemSync
+diff --git a/plugins/livehime/src/danmaku-overlay.cpp b/plugins/livehime/src/danmaku-overlay.cpp
+index 9730d6058..2db15b13e 100644
+--- a/plugins/livehime/src/danmaku-overlay.cpp
++++ b/plugins/livehime/src/danmaku-overlay.cpp
+@@ -1,55 +1,187 @@
+ #include "danmaku-overlay.hpp"
++#include "canvas-box.hpp"
++#include "overlay-frame.hpp"
+ 
+ #include <obs-module.h>
+ #include <obs.hpp>
+ 
+ #include <QDateTime>
+-#include <QStringList>
++#include <QFontMetricsF>
++#include <QPainter>
++#include <QTextLayout>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <deque>
++#include <vector>
+ 
+ namespace {
+-constexpr int kDefaultLines = 8;
++constexpr int kDefaultWidth = 640;
++constexpr int kDefaultHeight = 720;
+ constexpr int kDefaultLifetime = 30;
+-constexpr int kDefaultWidth = 700;
+-constexpr int kDefaultFontSize = 36;
+-/* FreeType finds fonts on disk; PingFang lives in a system asset store it
+- * cannot see, while Hiragino Sans GB ships in /System/Library/Fonts. */
++constexpr int kDefaultFontSize = 32;
++constexpr int kMaxMessages = 60;
++/* Found by Qt and matches the captions default. */
+ constexpr const char *kDefaultFace = "Hiragino Sans GB";
+ 
+ QString text(const char *key)
+ {
+ 	return QString::fromUtf8(obs_module_text(key));
+ }
++
++struct Style {
++	int width = kDefaultWidth;
++	int height = kDefaultHeight;
++	int lifetimeSeconds = kDefaultLifetime;
++	QFont font;
++	QColor color = Qt::white;
++	QColor nameColor = QColor(0xFB, 0x72, 0x99);
++	bool outline = true;
++	int outlineWidth = 3;
++	QColor outlineColor = Qt::black;
++	bool shadow = false;
++	bool background = true;
++	QColor backgroundColor = QColor(0, 0, 0, 110);
++	int padding = 16;
++	bool showGifts = true;
++	bool showSuperChats = true;
++	bool showGuards = true;
++};
++
++struct Message {
++	QString kind; /* chat | gift | superChat | guard */
++	QString name; /* coloured prefix ("user：") for chat, empty otherwise */
++	QString body;
++	qint64 postedMs = 0;
++};
+ } // namespace
+ 
+ struct DanmakuOverlay {
+ 	obs_source_t *self = nullptr;
+-	obs_source_t *label = nullptr; /* private text_ft2_source_v2 */
+-
++	CanvasBox::Tracker box;
+ 	std::atomic<int> width{kDefaultWidth};
+-	std::atomic<int> height{kDefaultLines * kDefaultFontSize * 4 / 3};
++	std::atomic<int> height{kDefaultHeight};
+ 
+-	/* Touched on the UI thread only (hub push/refresh). */
+-	int maxLines = kDefaultLines;
+-	int lifetimeSeconds = kDefaultLifetime;
+-	bool showGifts = true;
+-	bool showSuperChats = true;
+-	bool showGuards = true;
+-	struct Line {
+-		QString text;
+-		qint64 postedMs;
+-	};
+-	std::deque<Line> lines;
++	/* UI thread (hub push/refresh). */
++	Style style;
++	std::deque<Message> messages;
+ 	QString shown;
++	bool dirty = true;
++	OverlayFrame frame;
+ };
+ 
++namespace {
++QColor kindColor(const QString &kind, const Style &style)
++{
++	if (kind == "gift")
++		return QColor(0xFF, 0xC5, 0x3D);
++	if (kind == "guard")
++		return QColor(0xB1, 0x8C, 0xFF);
++	return style.color;
++}
++
++/* One message wrapped to the box: each entry is (start, length) in name+body. */
++std::vector<std::pair<int, int>> wrap(const QString &full, const QFont &font, double width)
++{
++	std::vector<std::pair<int, int>> lines;
++	QTextLayout layout(full, font);
++	QTextOption option;
++	option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
++	layout.setTextOption(option);
++	layout.beginLayout();
++	for (QTextLine line = layout.createLine(); line.isValid(); line = layout.createLine()) {
++		line.setLineWidth(width);
++		lines.emplace_back(line.textStart(), line.textLength());
++	}
++	layout.endLayout();
++	return lines;
++}
++
++/* Newest message at the bottom, older ones above until the box is full. */
++QImage render(const std::deque<Message> &messages, const Style &style, QString *shown)
++{
++	QImage image(style.width, style.height, QImage::Format_ARGB32_Premultiplied);
++	image.fill(Qt::transparent);
++	shown->clear();
++	if (messages.empty())
++		return image;
++
++	const QFontMetricsF metrics(style.font);
++	const double pad = style.padding;
++	const double lineHeight = metrics.height() * 1.18;
++	const double gap = lineHeight * 0.25;
++	const double textWidth = std::max(40.0, style.width - pad * 2 - (style.background ? pad : 0));
++	const double inset = style.background ? pad * 1.5 : pad;
++
++	struct Block {
++		const Message *message;
++		std::vector<std::pair<int, int>> lines;
++		double top;
++	};
++	std::vector<Block> blocks;
++	double bottom = style.height - pad;
++	for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
++		auto lines = wrap(it->name + it->body, style.font, textWidth);
++		const double blockHeight = lineHeight * lines.size();
++		const double top = bottom - blockHeight;
++		if (top < pad && !blocks.empty())
++			break;
++		blocks.push_back({&*it, std::move(lines), top});
++		bottom = top - gap;
++	}
++	std::reverse(blocks.begin(), blocks.end());
++
++	QPainter painter(&image);
++	painter.setRenderHint(QPainter::Antialiasing);
++	painter.setClipRect(QRectF(0, 0, style.width, style.height));
++	if (style.background) {
++		const double top = std::max(0.0, blocks.front().top - pad * 0.75);
++		painter.setPen(Qt::NoPen);
++		painter.setBrush(style.backgroundColor);
++		painter.drawRoundedRect(QRectF(pad / 2, top, style.width - pad, style.height - pad / 2 - top), 14, 14);
++	}
++
++	QStringList rows;
++	for (const Block &block : blocks) {
++		const Message &message = *block.message;
++		const QString full = message.name + message.body;
++		rows << full;
++		if (message.kind == "superChat") {
++			painter.setPen(Qt::NoPen);
++			painter.setBrush(QColor(0xE5, 0x48, 0x4D, 215));
++			painter.drawRoundedRect(QRectF(inset - pad * 0.4, block.top - lineHeight * 0.08, textWidth + pad * 0.8,
++						       lineHeight * block.lines.size() + lineHeight * 0.16),
++						8, 8);
++		}
++		const QColor bodyColor = message.kind == "superChat" ? QColor(Qt::white) : kindColor(message.kind, style);
++		for (size_t i = 0; i < block.lines.size(); i++) {
++			const auto [start, length] = block.lines[i];
++			const double baseline = block.top + lineHeight * i + (lineHeight - metrics.height()) / 2 + metrics.ascent();
++			double x = inset;
++			/* The part of this line inside the name gets the name colour. */
++			const int nameEnd = std::clamp(static_cast<int>(message.name.size()) - start, 0, length);
++			if (nameEnd > 0) {
++				const QString part = full.mid(start, nameEnd);
++				PaintText(painter, QPointF(x, baseline), style.font, part, style.nameColor, style.outline,
++					  style.outlineWidth, style.outlineColor, style.shadow);
++				x += metrics.horizontalAdvance(part);
++			}
++			const QString rest = full.mid(start + nameEnd, length - nameEnd);
++			if (!rest.isEmpty())
++				PaintText(painter, QPointF(x, baseline), style.font, rest, bodyColor, style.outline,
++					  style.outlineWidth, style.outlineColor, style.shadow);
++		}
++	}
++	*shown = rows.join(QChar('\n'));
++	return image;
++}
++} // namespace
++
+ DanmakuOverlayHub *DanmakuOverlayHub::instance_ = nullptr;
+ 
+ DanmakuOverlayHub::DanmakuOverlayHub()
+ {
+-	timer_.setInterval(500);
++	timer_.setInterval(250);
+ 	connect(&timer_, &QTimer::timeout, this, &DanmakuOverlayHub::refresh);
+ 	timer_.start();
+ }
+@@ -78,35 +210,51 @@ void DanmakuOverlayHub::remove(DanmakuOverlay *overlay)
+ 	overlays_.erase(overlay);
+ }
+ 
++QString DanmakuOverlayHub::shownText(const QString &name)
++{
++	std::lock_guard lock(mutex_);
++	for (DanmakuOverlay *overlay : overlays_) {
++		if (QString::fromUtf8(obs_source_get_name(overlay->self)) == name)
++			return overlay->shown;
++	}
++	return QString();
++}
++
+ void DanmakuOverlayHub::push(const QJsonObject &event)
+ {
+ 	if (event.value("event").toString() != "room")
+ 		return;
+ 	const QString kind = event.value("kind").toString();
+ 	const QString user = event.value("user").toString();
+-	QString line;
+-	if (kind == "chat")
+-		line = user + QStringLiteral("：") + event.value("text").toString();
+-	else if (kind == "gift")
+-		line = text("LiveHime.Feature.Gift").arg(user, event.value("name").toString()).arg(event.value("count").toInt());
+-	else if (kind == "superChat")
+-		line = text("LiveHime.Feature.SuperChat")
+-			       .arg(event.value("price").toInt())
+-			       .arg(user, event.value("text").toString());
+-	else if (kind == "guard")
+-		line = text("LiveHime.Feature.Guard").arg(user, event.value("name").toString());
+-	else
++	Message message;
++	message.kind = kind;
++	if (kind == "chat") {
++		message.name = user + QStringLiteral("：");
++		message.body = event.value("text").toString();
++	} else if (kind == "gift") {
++		message.body =
++			text("LiveHime.Feature.Gift").arg(user, event.value("name").toString()).arg(event.value("count").toInt());
++	} else if (kind == "superChat") {
++		message.body = text("LiveHime.Feature.SuperChat")
++				       .arg(event.value("price").toInt())
++				       .arg(user, event.value("text").toString());
++	} else if (kind == "guard") {
++		message.body = text("LiveHime.Feature.Guard").arg(user, event.value("name").toString());
++	} else {
+ 		return;
++	}
++	message.postedMs = QDateTime::currentMSecsSinceEpoch();
+ 
+-	const qint64 now = QDateTime::currentMSecsSinceEpoch();
+ 	std::lock_guard lock(mutex_);
+ 	for (DanmakuOverlay *overlay : overlays_) {
+-		if ((kind == "gift" && !overlay->showGifts) || (kind == "superChat" && !overlay->showSuperChats) ||
+-		    (kind == "guard" && !overlay->showGuards))
++		const Style &style = overlay->style;
++		if ((kind == "gift" && !style.showGifts) || (kind == "superChat" && !style.showSuperChats) ||
++		    (kind == "guard" && !style.showGuards))
+ 			continue;
+-		overlay->lines.push_back({line, now});
+-		while (static_cast<int>(overlay->lines.size()) > overlay->maxLines)
+-			overlay->lines.pop_front();
++		overlay->messages.push_back(message);
++		while (static_cast<int>(overlay->messages.size()) > kMaxMessages)
++			overlay->messages.pop_front();
++		overlay->dirty = true;
+ 	}
+ }
+ 
+@@ -115,21 +263,17 @@ void DanmakuOverlayHub::refresh()
+ 	const qint64 now = QDateTime::currentMSecsSinceEpoch();
+ 	std::lock_guard lock(mutex_);
+ 	for (DanmakuOverlay *overlay : overlays_) {
+-		if (overlay->lifetimeSeconds > 0) {
+-			while (!overlay->lines.empty() && now - overlay->lines.front().postedMs > overlay->lifetimeSeconds * 1000LL)
+-				overlay->lines.pop_front();
++		if (overlay->style.lifetimeSeconds > 0) {
++			while (!overlay->messages.empty() &&
++			       now - overlay->messages.front().postedMs > overlay->style.lifetimeSeconds * 1000LL) {
++				overlay->messages.pop_front();
++				overlay->dirty = true;
++			}
+ 		}
+-		QStringList rows;
+-		for (const auto &line : overlay->lines)
+-			rows << line.text;
+-		const QString joined = rows.join(QStringLiteral("\n"));
+-		if (joined == overlay->shown)
++		if (!overlay->dirty)
+ 			continue;
+-		overlay->shown = joined;
+-		OBSDataAutoRelease update = obs_data_create();
+-		/* An empty string would fall back to the text source's placeholder. */
+-		obs_data_set_string(update, "text", joined.isEmpty() ? " " : joined.toUtf8().constData());
+-		obs_source_update(overlay->label, update);
++		overlay->dirty = false;
++		overlay->frame.post(render(overlay->messages, overlay->style, &overlay->shown));
+ 	}
+ }
+ 
+@@ -144,56 +288,42 @@ const char *overlayName(void *)
+ void overlayUpdate(void *data, obs_data_t *settings)
+ {
+ 	auto *overlay = static_cast<DanmakuOverlay *>(data);
++	Style style;
++	style.width = std::max(16, static_cast<int>(obs_data_get_int(settings, "width")));
++	style.height = std::max(16, static_cast<int>(obs_data_get_int(settings, "height")));
++	style.lifetimeSeconds = static_cast<int>(obs_data_get_int(settings, "lifetime"));
+ 	OBSDataAutoRelease font = obs_data_get_obj(settings, "font");
+-	const int fontSize = font ? static_cast<int>(obs_data_get_int(font, "size")) : kDefaultFontSize;
+-	const int lines = static_cast<int>(obs_data_get_int(settings, "lines"));
+-	const int width = static_cast<int>(obs_data_get_int(settings, "width"));
+-	overlay->width = width;
+-	overlay->height = lines * (fontSize > 0 ? fontSize : kDefaultFontSize) * 4 / 3;
++	style.font = ObsFont(font, kDefaultFace, kDefaultFontSize);
++	style.color = ObsColor(obs_data_get_int(settings, "color"));
++	style.nameColor = ObsColor(obs_data_get_int(settings, "name_color"));
++	style.outline = obs_data_get_bool(settings, "outline");
++	style.outlineWidth = static_cast<int>(obs_data_get_int(settings, "outline_width"));
++	style.outlineColor = ObsColor(obs_data_get_int(settings, "outline_color"));
++	style.shadow = obs_data_get_bool(settings, "drop_shadow");
++	style.background = obs_data_get_bool(settings, "background");
++	style.backgroundColor = ObsColor(obs_data_get_int(settings, "background_color"));
++	style.padding = static_cast<int>(obs_data_get_int(settings, "padding"));
++	style.showGifts = obs_data_get_bool(settings, "show_gifts");
++	style.showSuperChats = obs_data_get_bool(settings, "show_super_chats");
++	style.showGuards = obs_data_get_bool(settings, "show_guards");
+ 
++	overlay->width = style.width;
++	overlay->height = style.height;
++	overlay->box.update(overlay->self, settings);
+ 	if (DanmakuOverlayHub *hub = DanmakuOverlayHub::instance()) {
+ 		hub->remove(overlay);
+-		overlay->maxLines = lines;
+-		overlay->lifetimeSeconds = static_cast<int>(obs_data_get_int(settings, "lifetime"));
+-		overlay->showGifts = obs_data_get_bool(settings, "show_gifts");
+-		overlay->showSuperChats = obs_data_get_bool(settings, "show_super_chats");
+-		overlay->showGuards = obs_data_get_bool(settings, "show_guards");
+-		while (static_cast<int>(overlay->lines.size()) > overlay->maxLines)
+-			overlay->lines.pop_front();
++		overlay->style = style;
++		overlay->dirty = true;
+ 		hub->add(overlay);
++	} else {
++		overlay->style = style;
+ 	}
+-
+-	OBSDataAutoRelease label = obs_data_create();
+-	/* Copy the font explicitly: settings merges keep only set values, so
+-	 * passing an object that holds defaults would reach the text source
+-	 * as an empty font. */
+-	OBSDataAutoRelease labelFont = obs_data_create();
+-	obs_data_set_string(labelFont, "face", font ? obs_data_get_string(font, "face") : kDefaultFace);
+-	obs_data_set_string(labelFont, "style", font ? obs_data_get_string(font, "style") : "");
+-	obs_data_set_int(labelFont, "size", fontSize > 0 ? fontSize : kDefaultFontSize);
+-	obs_data_set_int(labelFont, "flags", font ? obs_data_get_int(font, "flags") : 0);
+-	obs_data_set_obj(label, "font", labelFont);
+-	const long long color = obs_data_get_int(settings, "color");
+-	obs_data_set_int(label, "color1", color);
+-	obs_data_set_int(label, "color2", color);
+-	obs_data_set_bool(label, "outline", obs_data_get_bool(settings, "outline"));
+-	obs_data_set_bool(label, "drop_shadow", obs_data_get_bool(settings, "drop_shadow"));
+-	obs_data_set_bool(label, "word_wrap", true);
+-	obs_data_set_int(label, "custom_width", width);
+-	obs_source_update(overlay->label, label);
+ }
+ 
+ void *overlayCreate(obs_data_t *settings, obs_source_t *source)
+ {
+ 	auto *overlay = new DanmakuOverlay();
+ 	overlay->self = source;
+-	OBSDataAutoRelease label = obs_data_create();
+-	obs_data_set_string(label, "text", " ");
+-	overlay->label = obs_source_create_private("text_ft2_source_v2", "livehime-danmaku-text", label);
+-	if (!overlay->label) {
+-		delete overlay;
+-		return nullptr;
+-	}
+ 	overlayUpdate(overlay, settings);
+ 	return overlay;
+ }
+@@ -203,7 +333,7 @@ void overlayDestroy(void *data)
+ 	auto *overlay = static_cast<DanmakuOverlay *>(data);
+ 	if (DanmakuOverlayHub *hub = DanmakuOverlayHub::instance())
+ 		hub->remove(overlay);
+-	obs_source_release(overlay->label);
++	overlay->frame.release();
+ 	delete overlay;
+ }
+ 
+@@ -219,7 +349,7 @@ uint32_t overlayHeight(void *data)
+ 
+ void overlayRender(void *data, gs_effect_t *)
+ {
+-	obs_source_video_render(static_cast<DanmakuOverlay *>(data)->label);
++	static_cast<DanmakuOverlay *>(data)->frame.render();
+ }
+ 
+ void overlayDefaults(obs_data_t *settings)
+@@ -230,12 +360,17 @@ void overlayDefaults(obs_data_t *settings)
+ 	obs_data_set_default_int(font, "flags", 0);
+ 	obs_data_set_default_string(font, "style", "W3");
+ 	obs_data_set_default_obj(settings, "font", font);
+-	obs_data_set_default_int(settings, "lines", kDefaultLines);
++	CanvasBox::SetDefaults(settings, kDefaultWidth, kDefaultHeight, CanvasBox::BottomLeft);
+ 	obs_data_set_default_int(settings, "lifetime", kDefaultLifetime);
+-	obs_data_set_default_int(settings, "width", kDefaultWidth);
+ 	obs_data_set_default_int(settings, "color", 0xFFFFFFFF);
++	obs_data_set_default_int(settings, "name_color", 0xFF9972FB); /* #FB7299 */
+ 	obs_data_set_default_bool(settings, "outline", true);
++	obs_data_set_default_int(settings, "outline_width", 3);
++	obs_data_set_default_int(settings, "outline_color", 0xFF000000);
+ 	obs_data_set_default_bool(settings, "drop_shadow", false);
++	obs_data_set_default_bool(settings, "background", true);
++	obs_data_set_default_int(settings, "background_color", 0x6E000000);
++	obs_data_set_default_int(settings, "padding", 16);
+ 	obs_data_set_default_bool(settings, "show_gifts", true);
+ 	obs_data_set_default_bool(settings, "show_super_chats", true);
+ 	obs_data_set_default_bool(settings, "show_guards", true);
+@@ -244,20 +379,25 @@ void overlayDefaults(obs_data_t *settings)
+ obs_properties_t *overlayProperties(void *)
+ {
+ 	obs_properties_t *props = obs_properties_create();
+-	obs_properties_add_font(props, "font", obs_module_text("LiveHime.Overlay.Font"));
+-	obs_properties_add_color_alpha(props, "color", obs_module_text("LiveHime.Overlay.Color"));
+-	obs_properties_add_bool(props, "outline", obs_module_text("LiveHime.Overlay.Outline"));
+-	obs_properties_add_bool(props, "drop_shadow", obs_module_text("LiveHime.Overlay.Shadow"));
+-	obs_properties_add_int_slider(props, "lines", obs_module_text("LiveHime.Overlay.Lines"), 1, 30, 1);
+-	obs_property_t *lifetime =
+-		obs_properties_add_int(props, "lifetime", obs_module_text("LiveHime.Overlay.Lifetime"), 0, 3600, 5);
++	auto t = [](const char *key) { return obs_module_text(key); };
++	CanvasBox::AddProperties(props);
++	obs_properties_add_font(props, "font", t("LiveHime.Overlay.Font"));
++	obs_properties_add_color_alpha(props, "color", t("LiveHime.Overlay.Color"));
++	obs_properties_add_color_alpha(props, "name_color", t("LiveHime.Overlay.NameColor"));
++	obs_properties_add_bool(props, "outline", t("LiveHime.Overlay.Outline"));
++	obs_properties_add_int_slider(props, "outline_width", t("LiveHime.Captions.OutlineWidth"), 1, 12, 1);
++	obs_properties_add_color_alpha(props, "outline_color", t("LiveHime.Captions.OutlineColor"));
++	obs_properties_add_bool(props, "drop_shadow", t("LiveHime.Overlay.Shadow"));
++	obs_properties_add_bool(props, "background", t("LiveHime.Captions.Background"));
++	obs_properties_add_color_alpha(props, "background_color", t("LiveHime.Captions.BackgroundColor"));
++	obs_property_t *padding = obs_properties_add_int(props, "padding", t("LiveHime.Captions.Padding"), 0, 200, 2);
++	obs_property_int_set_suffix(padding, " px");
++	obs_property_t *lifetime = obs_properties_add_int(props, "lifetime", t("LiveHime.Overlay.Lifetime"), 0, 3600, 5);
+ 	obs_property_int_set_suffix(lifetime, " s");
+-	obs_property_set_long_description(lifetime, obs_module_text("LiveHime.Overlay.LifetimeHint"));
+-	obs_property_t *width = obs_properties_add_int(props, "width", obs_module_text("LiveHime.Overlay.Width"), 100, 3840, 10);
+-	obs_property_int_set_suffix(width, " px");
+-	obs_properties_add_bool(props, "show_gifts", obs_module_text("LiveHime.Overlay.ShowGifts"));
+-	obs_properties_add_bool(props, "show_super_chats", obs_module_text("LiveHime.Overlay.ShowSuperChats"));
+-	obs_properties_add_bool(props, "show_guards", obs_module_text("LiveHime.Overlay.ShowGuards"));
++	obs_property_set_long_description(lifetime, t("LiveHime.Overlay.LifetimeHint"));
++	obs_properties_add_bool(props, "show_gifts", t("LiveHime.Overlay.ShowGifts"));
++	obs_properties_add_bool(props, "show_super_chats", t("LiveHime.Overlay.ShowSuperChats"));
++	obs_properties_add_bool(props, "show_guards", t("LiveHime.Overlay.ShowGuards"));
+ 	return props;
+ }
+ } // namespace
+diff --git a/plugins/livehime/src/danmaku-overlay.hpp b/plugins/livehime/src/danmaku-overlay.hpp
+index 152f4898c..7388b3ad2 100644
+--- a/plugins/livehime/src/danmaku-overlay.hpp
++++ b/plugins/livehime/src/danmaku-overlay.hpp
+@@ -9,11 +9,11 @@
+ 
+ struct DanmakuOverlay;
+ 
+-/* "LiveHime danmaku" OBS source: shows the latest room messages (chat,
+- * gifts, Super Chats, guards) on the canvas. Each source wraps a private
+- * FreeType text source that does the drawing; this hub receives room events
+- * on the UI thread and refreshes every overlay twice a second, dropping
+- * messages older than the source's lifetime. */
++/* "LiveHime danmaku" OBS source: a chat list of the latest room messages
++ * (chat, gifts, Super Chats, guards), newest at the bottom, drawn with Qt
++ * in a box sized and placed like the captions (CanvasBox). This hub
++ * receives room events on the UI thread and redraws an overlay only when a
++ * message arrives or expires. */
+ class DanmakuOverlayHub : public QObject {
+ 	Q_OBJECT
+ 
+@@ -24,6 +24,8 @@ public:
+ 
+ 	void add(DanmakuOverlay *overlay);
+ 	void remove(DanmakuOverlay *overlay);
++	/* What the overlay source `name` currently shows (tests). */
++	QString shownText(const QString &name);
+ 
+ public slots:
+ 	void push(const QJsonObject &event);
+diff --git a/plugins/livehime/src/overlay-frame.cpp b/plugins/livehime/src/overlay-frame.cpp
+new file mode 100644
+index 000000000..842b30df4
+--- /dev/null
++++ b/plugins/livehime/src/overlay-frame.cpp
+@@ -0,0 +1,98 @@
++#include "overlay-frame.hpp"
++
++#include <obs-module.h>
++
++#include <QPainter>
++#include <QPainterPath>
++
++void OverlayFrame::post(QImage image)
++{
++	std::lock_guard lock(mutex_);
++	pending_ = std::move(image);
++	hasPending_ = true;
++}
++
++void OverlayFrame::render()
++{
++	{
++		std::lock_guard lock(mutex_);
++		if (hasPending_) {
++			hasPending_ = false;
++			if (texture_ && (gs_texture_get_width(texture_) != uint32_t(pending_.width()) ||
++					 gs_texture_get_height(texture_) != uint32_t(pending_.height()))) {
++				gs_texture_destroy(texture_);
++				texture_ = nullptr;
++			}
++			if (!pending_.isNull()) {
++				if (!texture_) {
++					const uint8_t *bits = pending_.constBits();
++					texture_ = gs_texture_create(pending_.width(), pending_.height(), GS_BGRA, 1, &bits,
++								     GS_DYNAMIC);
++				} else {
++					gs_texture_set_image(texture_, pending_.constBits(),
++							     static_cast<uint32_t>(pending_.bytesPerLine()), false);
++				}
++			}
++		}
++	}
++	if (!texture_)
++		return;
++	/* QImage ARGB32_Premultiplied is BGRA in memory, premultiplied. */
++	gs_blend_state_push();
++	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
++	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_PREMULTIPLIED_ALPHA);
++	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), texture_);
++	while (gs_effect_loop(effect, "Draw"))
++		gs_draw_sprite(texture_, 0, 0, 0);
++	gs_blend_state_pop();
++}
++
++void OverlayFrame::release()
++{
++	if (!texture_)
++		return;
++	obs_enter_graphics();
++	gs_texture_destroy(texture_);
++	obs_leave_graphics();
++	texture_ = nullptr;
++}
++
++QColor ObsColor(long long value)
++{
++	const auto v = static_cast<uint32_t>(value);
++	return QColor(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF);
++}
++
++QFont ObsFont(obs_data_t *font, const char *defaultFace, int defaultSize)
++{
++	const int size = font ? static_cast<int>(obs_data_get_int(font, "size")) : defaultSize;
++	const long long flags = font ? obs_data_get_int(font, "flags") : 0;
++	QFont result(QString::fromUtf8(font ? obs_data_get_string(font, "face") : defaultFace));
++	result.setPixelSize(size > 0 ? size : defaultSize);
++	const QString style = QString::fromUtf8(font ? obs_data_get_string(font, "style") : "");
++	if (!style.isEmpty())
++		result.setStyleName(style);
++	result.setBold(flags & OBS_FONT_BOLD);
++	result.setItalic(flags & OBS_FONT_ITALIC);
++	return result;
++}
++
++void PaintText(QPainter &painter, const QPointF &baseline, const QFont &font, const QString &text, const QColor &fill,
++	       bool outline, int outlineWidth, const QColor &outlineColor, bool shadow)
++{
++	QPainterPath path;
++	path.addText(baseline, font, text);
++	if (shadow) {
++		painter.setPen(Qt::NoPen);
++		painter.setBrush(QColor(0, 0, 0, 140));
++		painter.drawPath(path.translated(2.5, 3));
++	}
++	if (outline && outlineWidth > 0) {
++		painter.setPen(QPen(outlineColor, outlineWidth * 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
++		painter.setBrush(Qt::NoBrush);
++		painter.drawPath(path);
++	}
++	painter.setPen(Qt::NoPen);
++	painter.setBrush(fill);
++	painter.drawPath(path);
++}
+diff --git a/plugins/livehime/src/overlay-frame.hpp b/plugins/livehime/src/overlay-frame.hpp
+new file mode 100644
+index 000000000..eee989970
+--- /dev/null
++++ b/plugins/livehime/src/overlay-frame.hpp
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <obs.hpp>
++
++#include <QColor>
++#include <QFont>
++#include <QImage>
++
++#include <mutex>
++
++class QPainter;
++class QPointF;
++
++/* A frame drawn with Qt on the UI thread and shown by a source's
++ * video_render on the graphics thread (premultiplied BGRA texture). */
++class OverlayFrame {
++public:
++	void post(QImage image);
++	void render();
++	void release();
++
++private:
++	std::mutex mutex_;
++	QImage pending_;
++	bool hasPending_ = false;
++	gs_texture_t *texture_ = nullptr;
++};
++
++/* OBS colours are 0xAABBGGRR. */
++QColor ObsColor(long long value);
++/* An OBS font property as a QFont sized in pixels. */
++QFont ObsFont(obs_data_t *font, const char *defaultFace, int defaultSize);
++/* Text with an optional soft shadow and outline under the fill. */
++void PaintText(QPainter &painter, const QPointF &baseline, const QFont &font, const QString &text, const QColor &fill,
++	       bool outline, int outlineWidth, const QColor &outlineColor, bool shadow);
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index 32a18c243..340a55d79 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -5,6 +5,7 @@
+ #include "floating-chat.hpp"
+ #include "plugin-settings.hpp"
+ #include "window-native.hpp"
++#include "canvas-box.hpp"
+ #include "caption-overlay.hpp"
+ #include "livehime-dock.hpp"
+ 
+@@ -112,7 +113,7 @@ void saveFloatingHotkey()
+ void onFrontendEvent(enum obs_frontend_event event, void *)
+ {
+ 	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING || event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED)
+-		CaptionItemSync::AttachExisting();
++		CanvasBox::AttachExisting();
+ 	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+ 		placeDockOnFirstRun();
+ 		hideUpstreamMenuItems();
+@@ -134,7 +135,7 @@ bool obs_module_load(void)
+ 	RegisterDanmakuOverlaySource();
+ 	CaptionOverlayHub::create();
+ 	RegisterCaptionOverlaySource();
+-	CaptionItemSync::Attach();
++	CanvasBox::Attach();
+ 	RegisterCaptureExceptionProcedure();
+ 
+ 	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+@@ -166,6 +167,6 @@ void obs_module_unload(void)
+ 		obs_hotkey_unregister(floatingHotkey);
+ 	obs_frontend_remove_event_callback(onFrontendEvent, nullptr);
+ 	DanmakuOverlayHub::destroy();
+-	CaptionItemSync::Detach();
++	CanvasBox::Detach();
+ 	CaptionOverlayHub::destroy();
+ }

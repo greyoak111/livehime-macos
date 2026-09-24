@@ -1,0 +1,53 @@
+From 8b64c41b9edfdd6b3303661dff999d6becee91bc Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:08:32 +0800
+Subject: [PATCH 31/39] Keep the LiveHime dock open like the main docks
+
+Scenes, Sources and the other main docks cannot be closed; the LiveHime
+control dock is part of that layout, so drop its close button too while
+keeping move and float.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ frontend/widgets/OBSBasic_Docks.cpp | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/frontend/widgets/OBSBasic_Docks.cpp b/frontend/widgets/OBSBasic_Docks.cpp
+index db487ffbc..5747705f8 100644
+--- a/frontend/widgets/OBSBasic_Docks.cpp
++++ b/frontend/widgets/OBSBasic_Docks.cpp
+@@ -101,6 +101,16 @@ void OBSBasic::on_resetDocks_triggered(bool force)
+ 	activateWindow();
+ }
+ 
++/* The LiveHime control dock is part of the main layout, like Scenes or
++ * Sources: it can move and float but not be closed. */
++static QDockWidget::DockWidgetFeatures ExtraDockFeatures(const QDockWidget *dock,
++							 QDockWidget::DockWidgetFeatures features)
++{
++	if (dock->objectName() == QStringLiteral("livehime-control"))
++		features &= ~QDockWidget::DockWidgetClosable;
++	return features;
++}
++
+ void OBSBasic::on_lockDocks_toggled(bool lock)
+ {
+ 	QDockWidget::DockWidgetFeatures features =
+@@ -119,7 +129,7 @@ void OBSBasic::on_lockDocks_toggled(bool lock)
+ 	statsDock->setFeatures(features);
+ 
+ 	for (int i = extraDocks.size() - 1; i >= 0; i--) {
+-		extraDocks[i]->setFeatures(features);
++		extraDocks[i]->setFeatures(ExtraDockFeatures(extraDocks[i].get(), features));
+ 	}
+ 
+ 	for (int i = extraCustomDocks.size() - 1; i >= 0; i--) {
+@@ -153,7 +163,7 @@ void OBSBasic::AddDockWidget(QDockWidget *dock, Qt::DockWidgetArea area, bool ex
+ 			QDockWidget::DockWidgetFloatable);
+ 
+ 	setupDockAction(dock);
+-	dock->setFeatures(features);
++	dock->setFeatures(ExtraDockFeatures(dock, features));
+ 	addDockWidget(area, dock);
+ 
+ #ifdef BROWSER_AVAILABLE

@@ -1,7 +1,7 @@
 From 41237e6e806d4cadf28f72b0fc5f39f49a43ffb0 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 00:20:35 +0800
-Subject: [PATCH 13/30] Close a room this app opened when LiveHime quits
+Subject: [PATCH 13/39] Close a room this app opened when LiveHime quits
 
 On OBS's scripting-shutdown event (the frontend API is still alive), the
 account panel closes the live room if Go live opened it and End live has

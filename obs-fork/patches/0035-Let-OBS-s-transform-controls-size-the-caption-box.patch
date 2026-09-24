@@ -1,0 +1,310 @@
+From 678d52d890bc9e4bd17f00cf87f413f7ed0bf606 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 17:01:43 +0800
+Subject: [PATCH 35/39] Let OBS's transform controls size the caption box
+
+Scene items showing a captions source now use a bounding box (max size
+only), and the source takes that box as its width and height, so
+dragging the frame or typing a size in Edit Transform resizes the
+caption box and re-wraps the text at its font size instead of scaling
+it. Items scaled before (or reset) become a box of the same visible
+size; width and height changed in the source's properties move the
+items' boxes. Move, rotate, snap, crop and alignment stay OBS's own.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/e2e-captions.mjs |  20 +++
+ plugins/livehime/src/caption-overlay.cpp  | 173 ++++++++++++++++++++++
+ plugins/livehime/src/caption-overlay.hpp  |  12 ++
+ plugins/livehime/src/plugin-main.cpp      |   4 +
+ 4 files changed, 209 insertions(+)
+
+diff --git a/build-aux/livehime/tests/e2e-captions.mjs b/build-aux/livehime/tests/e2e-captions.mjs
+index 20a7af5fc..0665be376 100644
+--- a/build-aux/livehime/tests/e2e-captions.mjs
++++ b/build-aux/livehime/tests/e2e-captions.mjs
+@@ -84,6 +84,26 @@ ws.onmessage = async (ev) => {
+     check('recognized the speech', /欢迎来到我的直播间/.test(st?.caption || ''), st?.caption);
+     check('homophone fixed (直播姬)', /直播姬/.test(st?.caption || ''), st?.caption);
+     check('captions source shows the latest words, bottom-aligned', (st?.overlay || '').replace(/\n/g, '').length > 0 && (st.caption || '').endsWith((st.overlay || '').replace(/^\n+/, '').slice(-6)), JSON.stringify(st?.overlay));
++    // OBS's own transform controls size the caption box (bounding box),
++    // never stretch the text.
++    const itemId = (await req('GetSceneItemId', { sceneName: scene, sourceName: CAPTIONS })).responseData.sceneItemId;
++    const transform = async () => (await req('GetSceneItemTransform', { sceneName: scene, sceneItemId: itemId })).responseData.sceneItemTransform;
++    const size = async () => { const x = (await req('GetInputSettings', { inputName: CAPTIONS })).responseData.inputSettings; return [x.width, x.height]; };
++    let tf = await transform();
++    check('added item uses a bounding box', tf.boundsType === 'OBS_BOUNDS_MAX_ONLY' && tf.scaleX === 1, `${tf.boundsType} ${tf.boundsWidth}x${tf.boundsHeight} scale ${tf.scaleX}`);
++    await req('SetSceneItemTransform', { sceneName: scene, sceneItemId: itemId, sceneItemTransform: { boundsWidth: 900, boundsHeight: 240 } });
++    await sleep(500);
++    tf = await transform();
++    check('resizing the box resizes the captions, text not scaled', JSON.stringify(await size()) === '[900,240]' && tf.scaleX === 1 && tf.width === 900, `${JSON.stringify(await size())} scale ${tf.scaleX} shown ${tf.width}x${tf.height}`);
++    await req('SetSceneItemTransform', { sceneName: scene, sceneItemId: itemId, sceneItemTransform: { boundsType: 'OBS_BOUNDS_NONE', scaleX: 1.5, scaleY: 1.5 } });
++    await sleep(500);
++    tf = await transform();
++    check('a scaled item becomes a box of the same visible size', tf.boundsType === 'OBS_BOUNDS_MAX_ONLY' && tf.scaleX === 1 && JSON.stringify(await size()) === '[1350,360]', `${tf.boundsType} scale ${tf.scaleX} size ${JSON.stringify(await size())}`);
++    await req('SetInputSettings', { inputName: CAPTIONS, inputSettings: { width: 1000, height: 200 } });
++    await sleep(500);
++    tf = await transform();
++    check('width and height in properties move the box', tf.boundsWidth === 1000 && tf.boundsHeight === 200, `bounds ${tf.boundsWidth}x${tf.boundsHeight}`);
++
+     // Layout: one long line, bottom centre, in a 1920 x 160 box.
+     await req('SetInputSettings', { inputName: CAPTIONS, inputSettings: { width: 1920, height: 160, lines: 1, h_align: 1, v_align: 2, padding: 16, linger: 30 } });
+     await sleep(600);
+diff --git a/plugins/livehime/src/caption-overlay.cpp b/plugins/livehime/src/caption-overlay.cpp
+index b0b8c72ee..0540aaadf 100644
+--- a/plugins/livehime/src/caption-overlay.cpp
++++ b/plugins/livehime/src/caption-overlay.cpp
+@@ -3,7 +3,9 @@
+ #include <obs-module.h>
+ #include <obs.hpp>
+ 
++#include <QCoreApplication>
+ #include <QDateTime>
++#include <QMetaObject>
+ #include <QFont>
+ #include <QImage>
+ #include <QPainter>
+@@ -13,8 +15,12 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cmath>
++#include <cstring>
++#include <functional>
+ #include <vector>
+ 
++void CaptionItemSync_PushSize(obs_source_t *source, int width, int height);
++
+ namespace {
+ constexpr int kDefaultWidth = 1920;
+ constexpr int kDefaultHeight = 160;
+@@ -280,6 +286,170 @@ void CaptionOverlayHub::refresh()
+ 	}
+ }
+ 
++/* ---- scene item sync ---- */
++
++namespace {
++constexpr const char *kSourceId = "livehime_captions";
++
++bool isCaptionItem(obs_sceneitem_t *item)
++{
++	obs_source_t *source = obs_sceneitem_get_source(item);
++	return source && strcmp(obs_source_get_unversioned_id(source), kSourceId) == 0;
++}
++
++/* Runs on the UI thread: item_transform arrives from the video thread. */
++template<typename Fn> void onUi(Fn &&fn)
++{
++	if (QCoreApplication *app = QCoreApplication::instance())
++		QMetaObject::invokeMethod(app, std::forward<Fn>(fn), Qt::QueuedConnection);
++}
++
++void setSourceSize(obs_source_t *source, int width, int height)
++{
++	OBSDataAutoRelease settings = obs_source_get_settings(source);
++	if (obs_data_get_int(settings, "width") == width && obs_data_get_int(settings, "height") == height)
++		return;
++	OBSDataAutoRelease changes = obs_data_create();
++	obs_data_set_int(changes, "width", width);
++	obs_data_set_int(changes, "height", height);
++	obs_source_update(source, changes);
++}
++
++/* The item's box is the caption box: take it as the source size, or turn a
++ * plain (scaled) item into a bounding-box item of the same visible size. */
++void syncItem(obs_sceneitem_t *item)
++{
++	if (!isCaptionItem(item))
++		return;
++	obs_source_t *source = obs_sceneitem_get_source(item);
++	const int width = static_cast<int>(obs_source_get_width(source));
++	const int height = static_cast<int>(obs_source_get_height(source));
++	if (obs_sceneitem_get_bounds_type(item) == OBS_BOUNDS_NONE) {
++		vec2 scale;
++		obs_sceneitem_get_scale(item, &scale);
++		const int boxWidth = std::max(16, static_cast<int>(std::lround(width * std::fabs(scale.x))));
++		const int boxHeight = std::max(16, static_cast<int>(std::lround(height * std::fabs(scale.y))));
++		vec2 bounds;
++		vec2_set(&bounds, float(boxWidth), float(boxHeight));
++		vec2 one;
++		vec2_set(&one, scale.x < 0 ? -1.0f : 1.0f, scale.y < 0 ? -1.0f : 1.0f);
++		obs_sceneitem_defer_update_begin(item);
++		obs_sceneitem_set_scale(item, &one);
++		obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_MAX_ONLY);
++		obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_CENTER);
++		obs_sceneitem_set_bounds(item, &bounds);
++		obs_sceneitem_defer_update_end(item);
++		setSourceSize(source, boxWidth, boxHeight);
++		return;
++	}
++	vec2 bounds;
++	obs_sceneitem_get_bounds(item, &bounds);
++	const int boxWidth = std::max(16, static_cast<int>(std::lround(bounds.x)));
++	const int boxHeight = std::max(16, static_cast<int>(std::lround(bounds.y)));
++	if (boxWidth != width || boxHeight != height)
++		setSourceSize(source, boxWidth, boxHeight);
++}
++
++void itemTransformed(void *, calldata_t *data)
++{
++	OBSSceneItem item = static_cast<obs_sceneitem_t *>(calldata_ptr(data, "item"));
++	if (!item || !isCaptionItem(item))
++		return;
++	onUi([item] { syncItem(item); });
++}
++
++void itemAdded(void *, calldata_t *data)
++{
++	itemTransformed(nullptr, data);
++}
++
++void attachScene(obs_source_t *sceneSource)
++{
++	signal_handler_t *handler = obs_source_get_signal_handler(sceneSource);
++	signal_handler_disconnect(handler, "item_add", itemAdded, nullptr);
++	signal_handler_disconnect(handler, "item_transform", itemTransformed, nullptr);
++	signal_handler_connect(handler, "item_add", itemAdded, nullptr);
++	signal_handler_connect(handler, "item_transform", itemTransformed, nullptr);
++}
++
++void sourceCreated(void *, calldata_t *data)
++{
++	auto *source = static_cast<obs_source_t *>(calldata_ptr(data, "source"));
++	if (source && obs_group_or_scene_from_source(source))
++		attachScene(source);
++}
++
++/* Items of every scene (and group) that show `source`. */
++void forEachItemOf(obs_source_t *source, const std::function<void(obs_sceneitem_t *)> &fn)
++{
++	struct Context {
++		obs_source_t *source;
++		const std::function<void(obs_sceneitem_t *)> *fn;
++	} context{source, &fn};
++	obs_enum_scenes(
++		[](void *param, obs_source_t *sceneSource) {
++			if (obs_scene_t *scene = obs_group_or_scene_from_source(sceneSource))
++				obs_scene_enum_items(
++					scene,
++					[](obs_scene_t *, obs_sceneitem_t *item, void *p) {
++						auto *ctx = static_cast<Context *>(p);
++						if (obs_sceneitem_get_source(item) == ctx->source)
++							(*ctx->fn)(item);
++						return true;
++					},
++					param);
++			return true;
++		},
++		&context);
++}
++} // namespace
++
++void CaptionItemSync_PushSize(obs_source_t *source, int width, int height)
++{
++	OBSWeakSource weak = OBSGetWeakRef(source);
++	onUi([weak, width, height] {
++		OBSSourceAutoRelease strong = obs_weak_source_get_source(weak);
++		if (!strong)
++			return;
++		forEachItemOf(strong, [width, height](obs_sceneitem_t *item) {
++			if (obs_sceneitem_get_bounds_type(item) == OBS_BOUNDS_NONE)
++				return; /* syncItem converts it on its next transform */
++			vec2 bounds;
++			obs_sceneitem_get_bounds(item, &bounds);
++			if (std::lround(bounds.x) == width && std::lround(bounds.y) == height)
++				return;
++			vec2_set(&bounds, float(width), float(height));
++			obs_sceneitem_set_bounds(item, &bounds);
++		});
++	});
++}
++
++void CaptionItemSync::Attach()
++{
++	signal_handler_connect(obs_get_signal_handler(), "source_create", sourceCreated, nullptr);
++}
++
++void CaptionItemSync::AttachExisting()
++{
++	obs_enum_scenes(
++		[](void *, obs_source_t *sceneSource) {
++			attachScene(sceneSource);
++			if (obs_scene_t *scene = obs_group_or_scene_from_source(sceneSource))
++				obs_scene_enum_items(scene, [](obs_scene_t *, obs_sceneitem_t *item, void *) {
++					if (isCaptionItem(item))
++						syncItem(item);
++					return true;
++				}, nullptr);
++			return true;
++		},
++		nullptr);
++}
++
++void CaptionItemSync::Detach()
++{
++	signal_handler_disconnect(obs_get_signal_handler(), "source_create", sourceCreated, nullptr);
++}
++
+ /* ---- obs_source_info ---- */
+ 
+ namespace {
+@@ -317,8 +487,11 @@ void captionUpdate(void *data, obs_data_t *settings)
+ 	style.backgroundColor = obsColor(obs_data_get_int(settings, "background_color"));
+ 	style.padding = static_cast<int>(obs_data_get_int(settings, "padding"));
+ 
++	const bool resized = overlay->width != style.width || overlay->height != style.height;
+ 	overlay->width = style.width;
+ 	overlay->height = style.height;
++	if (resized && overlay->self)
++		CaptionItemSync_PushSize(overlay->self, style.width, style.height);
+ 	if (CaptionOverlayHub *hub = CaptionOverlayHub::instance()) {
+ 		hub->remove(overlay);
+ 		overlay->style = style;
+diff --git a/plugins/livehime/src/caption-overlay.hpp b/plugins/livehime/src/caption-overlay.hpp
+index 291d1bf24..8c19e0247 100644
+--- a/plugins/livehime/src/caption-overlay.hpp
++++ b/plugins/livehime/src/caption-overlay.hpp
+@@ -45,3 +45,15 @@ private:
+ };
+ 
+ void RegisterCaptionOverlaySource();
++
++/* Makes OBS's own transform controls size the caption box instead of
++ * scaling the text: scene items showing a captions source use a bounding
++ * box, and the source takes that box as its width and height (so the text
++ * re-wraps at its font size). Width and height set in the source's
++ * properties are pushed back to the items' bounding boxes. Call Attach at
++ * load (global source creation) and AttachExisting once scenes exist. */
++namespace CaptionItemSync {
++void Attach();
++void AttachExisting();
++void Detach();
++} // namespace CaptionItemSync
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index c7bc971a0..32a18c243 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -111,6 +111,8 @@ void saveFloatingHotkey()
+ 
+ void onFrontendEvent(enum obs_frontend_event event, void *)
+ {
++	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING || event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED)
++		CaptionItemSync::AttachExisting();
+ 	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+ 		placeDockOnFirstRun();
+ 		hideUpstreamMenuItems();
+@@ -132,6 +134,7 @@ bool obs_module_load(void)
+ 	RegisterDanmakuOverlaySource();
+ 	CaptionOverlayHub::create();
+ 	RegisterCaptionOverlaySource();
++	CaptionItemSync::Attach();
+ 	RegisterCaptureExceptionProcedure();
+ 
+ 	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+@@ -163,5 +166,6 @@ void obs_module_unload(void)
+ 		obs_hotkey_unregister(floatingHotkey);
+ 	obs_frontend_remove_event_callback(onFrontendEvent, nullptr);
+ 	DanmakuOverlayHub::destroy();
++	CaptionItemSync::Detach();
+ 	CaptionOverlayHub::destroy();
+ }

@@ -1,0 +1,761 @@
+From 08053d3ed258b6c6394672a6b6bce13e502dacb4 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:50:26 +0800
+Subject: [PATCH 34/39] Draw captions ourselves: box size, alignment, outline,
+ plate
+
+The captions source wrapped OBS's FreeType text source, which only lays
+text out left-aligned from the top, and its size followed width x lines,
+so a long single line at the bottom centre was impossible and resizing
+meant scaling.
+
+It now renders with Qt into a texture: the user sets the box width and
+height, left/centre/right and top/middle/bottom alignment (bottom centre
+by default), lines (1-6), font, colour, outline width and colour,
+shadow, and an optional rounded background plate with padding. Long
+sentences keep the newest words, measured with the real font.
+
+The E2E check screenshots the source and verifies a 1920x160 box, one
+centred line on the bottom padding, and left alignment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/e2e-captions.mjs |  73 +++-
+ plugins/livehime/data/locale/en-US.ini    |  16 +
+ plugins/livehime/data/locale/zh-CN.ini    |  16 +
+ plugins/livehime/src/automation.cpp       |   7 +-
+ plugins/livehime/src/caption-overlay.cpp  | 397 ++++++++++++++++------
+ plugins/livehime/src/caption-overlay.hpp  |  14 +-
+ 6 files changed, 412 insertions(+), 111 deletions(-)
+
+diff --git a/build-aux/livehime/tests/e2e-captions.mjs b/build-aux/livehime/tests/e2e-captions.mjs
+index 94e9b66dc..20a7af5fc 100644
+--- a/build-aux/livehime/tests/e2e-captions.mjs
++++ b/build-aux/livehime/tests/e2e-captions.mjs
+@@ -4,16 +4,50 @@
+ // Adds a media source and a captions source to the program scene and
+ // removes both afterwards; restores the captions settings it changed.
+ import { createHash } from 'node:crypto';
++import zlib from 'node:zlib';
++import { writeFileSync } from 'node:fs';
+ const [password, audioFile] = process.argv.slice(2);
+ const sha = (s) => createHash('sha256').update(s).digest('base64');
+ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+ const ws = new WebSocket('ws://127.0.0.1:4466');
+ let id = 1; const pend = new Map();
+ const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++const MEDIA_NAME = 'livehime-e2e-speech';
+ const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: t, requestData: d })).responseData?.responseData;
+ let fails = 0;
+ const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
+-const MEDIA = 'livehime-e2e-speech', CAPTIONS = 'livehime-e2e-captions';
++const MEDIA = MEDIA_NAME, CAPTIONS = 'livehime-e2e-captions';
++const captionsState = (extra = {}) => vendor('Captions', { overlay_source: CAPTIONS, ...extra });
++
++// RGBA PNG decoder (OBS screenshots are 8-bit RGBA, non-interlaced).
++function decode(png) {
++  let o = 8, w = 0, h = 0; const idat = [];
++  while (o < png.length) {
++    const len = png.readUInt32BE(o), type = png.toString('ascii', o + 4, o + 8), data = png.subarray(o + 8, o + 8 + len);
++    if (type === 'IHDR') { w = data.readUInt32BE(0); h = data.readUInt32BE(4); }
++    if (type === 'IDAT') idat.push(data);
++    o += 12 + len;
++  }
++  const raw = zlib.inflateSync(Buffer.concat(idat)), stride = w * 4, out = Buffer.alloc(w * h * 4); let prev = Buffer.alloc(stride);
++  for (let y = 0; y < h; y++) {
++    const f = raw[y * (stride + 1)], line = Buffer.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
++    for (let x = 0; x < stride; x++) {
++      const a = x >= 4 ? line[x - 4] : 0, b = prev[x], c = x >= 4 ? prev[x - 4] : 0;
++      const p = f === 1 ? a : f === 2 ? b : f === 3 ? (a + b) >> 1 : f === 4 ? (() => { const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c); return pa <= pb && pa <= pc ? a : pb <= pc ? b : c; })() : 0;
++      line[x] = (line[x] + p) & 255;
++    }
++    line.copy(out, y * stride); prev = line;
++  }
++  return { w, h, px: out };
++}
++// Bounding box of visible (opaque enough) pixels.
++function inkBox(img) {
++  let x0 = img.w, y0 = img.h, x1 = -1, y1 = -1;
++  for (let y = 0; y < img.h; y++) for (let x = 0; x < img.w; x++) {
++    if (img.px[(y * img.w + x) * 4 + 3] > 128) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
++  }
++  return x1 < 0 ? null : { x0, y0, x1, y1 };
++}
+ 
+ ws.onmessage = async (ev) => {
+   const m = JSON.parse(ev.data);
+@@ -32,14 +66,14 @@ ws.onmessage = async (ev) => {
+     check('captions source created', cap.requestStatus.result, cap.requestStatus.comment);
+     await req('TriggerMediaInputAction', { inputName: MEDIA, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP' });
+ 
+-    let st = await vendor('Captions', { enabled: true, source: MEDIA, locale: 'zh-CN' });
+-    for (let i = 0; i < 40 && !/识别|Listening/.test(st?.status); i++) { await sleep(250); st = await vendor('Captions'); }
++    let st = await captionsState({ enabled: true, source: MEDIA, locale: 'zh-CN' });
++    for (let i = 0; i < 40 && !/识别|Listening/.test(st?.status); i++) { await sleep(250); st = await captionsState(); }
+     check('captions listening', /识别|Listening/.test(st?.status), st?.status);
+ 
+     await req('TriggerMediaInputAction', { inputName: MEDIA, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART' });
+     const t0 = Date.now(); let first = 0, seen = new Set();
+     for (let i = 0; i < 70; i++) {
+-      await sleep(250); st = await vendor('Captions');
++      await sleep(250); st = await captionsState();
+       if (st?.caption && !first) first = Date.now() - t0;
+       if (st?.caption) seen.add(st.caption);
+     }
+@@ -50,17 +84,42 @@ ws.onmessage = async (ev) => {
+     check('recognized the speech', /欢迎来到我的直播间/.test(st?.caption || ''), st?.caption);
+     check('homophone fixed (直播姬)', /直播姬/.test(st?.caption || ''), st?.caption);
+     check('captions source shows the latest words, bottom-aligned', (st?.overlay || '').replace(/\n/g, '').length > 0 && (st.caption || '').endsWith((st.overlay || '').replace(/^\n+/, '').slice(-6)), JSON.stringify(st?.overlay));
++    // Layout: one long line, bottom centre, in a 1920 x 160 box.
++    await req('SetInputSettings', { inputName: CAPTIONS, inputSettings: { width: 1920, height: 160, lines: 1, h_align: 1, v_align: 2, padding: 16, linger: 30 } });
++    await sleep(600);
++    st = await captionsState();
++    check('one line shown for lines = 1', st?.overlay && !st.overlay.includes('\n'), JSON.stringify(st?.overlay));
++    check('the newest words are kept', (st?.caption || '').endsWith(st?.overlay || '-'), JSON.stringify(st?.overlay));
++    const shot = await req('GetSourceScreenshot', { sourceName: CAPTIONS, imageFormat: 'png' });
++    if (shot.requestStatus.result) {
++      const png = Buffer.from(shot.responseData.imageData.split(',')[1], 'base64');
++      if (process.env.SHOT_DIR) writeFileSync(process.env.SHOT_DIR + '/captions-bottom-center.png', png);
++      const img = decode(png), box = inkBox(img);
++      const cx = box ? (box.x0 + box.x1) / 2 : -1;
++      console.log('screenshot', img.w + 'x' + img.h, 'ink', JSON.stringify(box));
++      check('screenshot is the box size (1920 x 160)', img.w === 1920 && img.h === 160, `${img.w}x${img.h}`);
++      check('text is horizontally centred', box && Math.abs(cx - 960) < 40, `centre x ${cx}`);
++      check('text sits at the bottom', box && box.y1 > 160 - 16 - 14 && box.y1 <= 160 - 16 + 8, `bottom ${box?.y1}`);
++      check('text spans most of the width (one long line)', box && box.x1 - box.x0 > 1400, `width ${box ? box.x1 - box.x0 : 0}`);
++      // Left alignment moves the ink to the left edge.
++      await req('SetInputSettings', { inputName: CAPTIONS, inputSettings: { h_align: 0 } });
++      await sleep(600);
++      const left = decode(Buffer.from((await req('GetSourceScreenshot', { sourceName: CAPTIONS, imageFormat: 'png' })).responseData.imageData.split(',')[1], 'base64'));
++      const lbox = inkBox(left);
++      check('left alignment starts at the padding', lbox && lbox.x0 < 16 + 12, `left x ${lbox?.x0}`);
++    } else check('captions screenshot', false, shot.requestStatus.comment);
++
+     // A muted source sends silence; the tab says so.
+     await req('SetInputMute', { inputName: MEDIA, inputMuted: true });
+     await req('TriggerMediaInputAction', { inputName: MEDIA, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART' });
+     await sleep(1500);
+-    st = await vendor('Captions');
++    st = await captionsState();
+     check('muted source is shown in the status', /静音|muted/.test(st?.status), st?.status);
+     await req('SetInputMute', { inputName: MEDIA, inputMuted: false });
+     // Choosing the same settings again keeps the recognizer running.
+-    st = await vendor('Captions', { enabled: true, source: MEDIA, locale: 'zh-CN' });
++    st = await captionsState({ enabled: true, source: MEDIA, locale: 'zh-CN' });
+     await sleep(600);
+-    st = await vendor('Captions');
++    st = await captionsState();
+     check('re-applying the same settings keeps listening', /正在识别|Listening/.test(st?.status), st?.status);
+   } catch (e) { check('run', false, e.stack); }
+   finally {
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 95796adca..f9e8a9409 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -153,3 +153,19 @@ LiveHime.Captions.Linger="Linger"
+ LiveHime.Captions.LingerHint="Seconds a caption stays after speech stops; 0 keeps it."
+ LiveHime.Captions.SourceHint="Turn on live captions and choose the audio source in the LiveHime dock's Captions tab."
+ LiveHime.Captions.Status.muted="Listening (the audio source is muted, so no captions)"
++LiveHime.Captions.Width="Width"
++LiveHime.Captions.Height="Height"
++LiveHime.Captions.SizeHint="Size of the caption box. Resize here; dragging the frame on the canvas scales the text."
++LiveHime.Captions.HAlign="Horizontal alignment"
++LiveHime.Captions.VAlign="Vertical alignment"
++LiveHime.Captions.Align.Left="Left"
++LiveHime.Captions.Align.Center="Center"
++LiveHime.Captions.Align.Right="Right"
++LiveHime.Captions.Align.Top="Top"
++LiveHime.Captions.Align.Middle="Middle"
++LiveHime.Captions.Align.Bottom="Bottom"
++LiveHime.Captions.OutlineWidth="Outline width"
++LiveHime.Captions.OutlineColor="Outline color"
++LiveHime.Captions.Background="Background plate"
++LiveHime.Captions.BackgroundColor="Plate color"
++LiveHime.Captions.Padding="Padding"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index a71dbe362..a6baba244 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -153,3 +153,19 @@ LiveHime.Captions.Linger="停留时间"
+ LiveHime.Captions.LingerHint="说完之后字幕保留的秒数；设为 0 时一直保留。"
+ LiveHime.Captions.SourceHint="在直播姬面板的「字幕」页开启语音字幕并选择音频来源。"
+ LiveHime.Captions.Status.muted="正在识别（音频来源已静音，暂时没有字幕）"
++LiveHime.Captions.Width="宽度"
++LiveHime.Captions.Height="高度"
++LiveHime.Captions.SizeHint="字幕框的大小。改大小请在这里设置；在画面里拖动边框会缩放文字。"
++LiveHime.Captions.HAlign="水平对齐"
++LiveHime.Captions.VAlign="垂直对齐"
++LiveHime.Captions.Align.Left="左"
++LiveHime.Captions.Align.Center="居中"
++LiveHime.Captions.Align.Right="右"
++LiveHime.Captions.Align.Top="顶部"
++LiveHime.Captions.Align.Middle="居中"
++LiveHime.Captions.Align.Bottom="底部"
++LiveHime.Captions.OutlineWidth="描边粗细"
++LiveHime.Captions.OutlineColor="描边颜色"
++LiveHime.Captions.Background="背景底板"
++LiveHime.Captions.BackgroundColor="底板颜色"
++LiveHime.Captions.Padding="边距"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 179b30476..4ae107054 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -174,7 +174,7 @@ void floatingChat(obs_data_t *request, obs_data_t *response, void *)
+ 
+ /* Live captions for tests: optional {"enabled","source" (name),"locale"}
+  * applies like the Captions tab; replies with the state, the current
+- * caption and what the first "LiveHime captions" source shows. */
++ * caption and what the captions source "overlay_source" shows. */
+ void captions(obs_data_t *request, obs_data_t *response, void *)
+ {
+ 	onUiThread([&] {
+@@ -187,7 +187,10 @@ void captions(obs_data_t *request, obs_data_t *response, void *)
+ 		obs_data_set_bool(response, "enabled", page->controller()->enabled());
+ 		obs_data_set_string(response, "status", page->statusText().toUtf8().constData());
+ 		obs_data_set_string(response, "caption", page->currentCaption().toUtf8().constData());
+-		const QString shown = CaptionOverlayHub::instance() ? CaptionOverlayHub::instance()->shownText() : QString();
++		const QString overlay = QString::fromUtf8(obs_data_get_string(request, "overlay_source"));
++		const QString shown = CaptionOverlayHub::instance() && !overlay.isEmpty()
++					      ? CaptionOverlayHub::instance()->shownText(overlay)
++					      : QString();
+ 		obs_data_set_string(response, "overlay", shown.toUtf8().constData());
+ 	});
+ }
+diff --git a/plugins/livehime/src/caption-overlay.cpp b/plugins/livehime/src/caption-overlay.cpp
+index 458ebaadd..b0b8c72ee 100644
+--- a/plugins/livehime/src/caption-overlay.cpp
++++ b/plugins/livehime/src/caption-overlay.cpp
+@@ -4,42 +4,194 @@
+ #include <obs.hpp>
+ 
+ #include <QDateTime>
++#include <QFont>
++#include <QImage>
++#include <QPainter>
++#include <QPainterPath>
++#include <QTextLayout>
+ 
+ #include <algorithm>
+ #include <atomic>
+ #include <cmath>
++#include <vector>
+ 
+ namespace {
++constexpr int kDefaultWidth = 1920;
++constexpr int kDefaultHeight = 160;
+ constexpr int kDefaultLines = 2;
+ constexpr int kDefaultLinger = 4;
+-constexpr int kDefaultWidth = 1200;
+ constexpr int kDefaultFontSize = 48;
+-constexpr const char *kDefaultFace = "Hiragino Sans GB"; /* see danmaku-overlay.cpp */
++constexpr const char *kDefaultFace = "Hiragino Sans GB";
+ 
+-/* Rough width of a character in ems: CJK glyphs are square, Latin about half. */
+-double charWidth(QChar c)
++enum HAlign { AlignLeft = 0, AlignCenter = 1, AlignRight = 2 };
++enum VAlign { AlignTop = 0, AlignMiddle = 1, AlignBottom = 2 };
++
++/* OBS colors are 0xAABBGGRR. */
++QColor obsColor(long long value)
+ {
+-	return c.unicode() >= 0x2E80 ? 1.0 : 0.55;
++	const auto v = static_cast<uint32_t>(value);
++	return QColor(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF);
+ }
+-} // namespace
+-
+-struct CaptionOverlay {
+-	obs_source_t *label = nullptr; /* private text_ft2_source_v2 */
+-	std::atomic<int> width{kDefaultWidth};
+-	std::atomic<int> height{kDefaultLines * kDefaultFontSize * 4 / 3};
+ 
+-	/* Touched on the UI thread only (hub). */
++struct Style {
++	int width = kDefaultWidth;
++	int height = kDefaultHeight;
+ 	int maxLines = kDefaultLines;
+ 	int lingerSeconds = kDefaultLinger;
+-	int fontSize = kDefaultFontSize;
++	int hAlign = AlignCenter;
++	int vAlign = AlignBottom;
++	QFont font;
++	QColor color = Qt::white;
++	bool outline = true;
++	int outlineWidth = 4;
++	QColor outlineColor = Qt::black;
++	bool shadow = true;
++	bool background = false;
++	QColor backgroundColor = QColor(0, 0, 0, 150);
++	int padding = 16;
++};
++} // namespace
++
++struct CaptionOverlay {
++	obs_source_t *self = nullptr;
++	/* Style and layout: UI thread (update + hub). */
++	Style style;
+ 	QString shown;
++	bool dirty = true;
++
++	/* Rendered frame, handed to the graphics thread. */
++	std::mutex frameMutex;
++	QImage pending;
++	bool hasPending = false;
++	gs_texture_t *texture = nullptr;
++	std::atomic<int> width{kDefaultWidth};
++	std::atomic<int> height{kDefaultHeight};
+ };
+ 
++namespace {
++/* Lays `text` out in the box; returns the lines that fit, keeping the end
++ * of the text (the newest words) when it is too long. */
++std::vector<QString> layoutLines(const QString &text, const Style &style, double wrapWidth)
++{
++	std::vector<QString> lines;
++	if (text.isEmpty())
++		return lines;
++	QTextLayout layout(text, style.font);
++	QTextOption option;
++	option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
++	layout.setTextOption(option);
++	layout.beginLayout();
++	for (QTextLine line = layout.createLine(); line.isValid(); line = layout.createLine()) {
++		line.setLineWidth(wrapWidth);
++		lines.push_back(text.mid(line.textStart(), line.textLength()).trimmed());
++	}
++	layout.endLayout();
++	if (static_cast<int>(lines.size()) > style.maxLines)
++		lines.erase(lines.begin(), lines.end() - style.maxLines);
++	return lines;
++}
++
++/* Keeps the newest part of a sentence: when it does not fit, start again
++ * from a later character so the last line is full width, not a stub. */
++std::vector<QString> fitTail(const QString &text, const Style &style, double wrapWidth)
++{
++	QTextLayout probe(text, style.font);
++	QTextOption option;
++	option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
++	probe.setTextOption(option);
++	probe.beginLayout();
++	std::vector<int> starts;
++	for (QTextLine line = probe.createLine(); line.isValid(); line = probe.createLine()) {
++		line.setLineWidth(wrapWidth);
++		starts.push_back(line.textStart());
++	}
++	probe.endLayout();
++	if (static_cast<int>(starts.size()) <= style.maxLines)
++		return layoutLines(text, style, wrapWidth);
++	/* Lay out backwards: find the earliest start whose tail fits. */
++	const QFontMetricsF metrics(style.font);
++	const double capacity = wrapWidth * style.maxLines;
++	int start = text.size();
++	double used = 0;
++	while (start > 0) {
++		const double w = metrics.horizontalAdvance(text[start - 1]);
++		if (used + w > capacity * 0.97)
++			break;
++		used += w;
++		start--;
++	}
++	return layoutLines(text.mid(start), style, wrapWidth);
++}
++
++QImage render(const std::vector<QString> &lines, const Style &style)
++{
++	QImage image(style.width, style.height, QImage::Format_ARGB32_Premultiplied);
++	image.fill(Qt::transparent);
++	if (lines.empty())
++		return image;
++
++	QPainter painter(&image);
++	painter.setRenderHint(QPainter::Antialiasing);
++	painter.setRenderHint(QPainter::TextAntialiasing);
++	const QFontMetricsF metrics(style.font);
++	const double lineHeight = metrics.height() * 1.15;
++	const double blockHeight = lineHeight * lines.size();
++	double widest = 0;
++	for (const QString &line : lines)
++		widest = std::max(widest, metrics.horizontalAdvance(line));
++
++	const double pad = style.padding;
++	double top = pad;
++	if (style.vAlign == AlignMiddle)
++		top = (style.height - blockHeight) / 2;
++	else if (style.vAlign == AlignBottom)
++		top = style.height - pad - blockHeight;
++
++	auto lineX = [&](double width) {
++		if (style.hAlign == AlignCenter)
++			return (style.width - width) / 2;
++		if (style.hAlign == AlignRight)
++			return style.width - pad - width;
++		return pad;
++	};
++
++	if (style.background) {
++		const double plateWidth = widest + pad * 2;
++		QRectF plate(lineX(widest) - pad, top - pad / 2, plateWidth, blockHeight + pad);
++		painter.setPen(Qt::NoPen);
++		painter.setBrush(style.backgroundColor);
++		painter.drawRoundedRect(plate, 10, 10);
++	}
++
++	for (size_t i = 0; i < lines.size(); i++) {
++		const double width = metrics.horizontalAdvance(lines[i]);
++		const QPointF origin(lineX(width), top + lineHeight * i + (lineHeight - metrics.height()) / 2 + metrics.ascent());
++		QPainterPath path;
++		path.addText(origin, style.font, lines[i]);
++		if (style.shadow) {
++			painter.setPen(Qt::NoPen);
++			painter.setBrush(QColor(0, 0, 0, 140));
++			painter.drawPath(path.translated(2.5, 3));
++		}
++		if (style.outline && style.outlineWidth > 0) {
++			QPen pen(style.outlineColor, style.outlineWidth * 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
++			painter.setPen(pen);
++			painter.setBrush(Qt::NoBrush);
++			painter.drawPath(path);
++		}
++		painter.setPen(Qt::NoPen);
++		painter.setBrush(style.color);
++		painter.drawPath(path);
++	}
++	return image;
++}
++} // namespace
++
+ CaptionOverlayHub *CaptionOverlayHub::instance_ = nullptr;
+ 
+ CaptionOverlayHub::CaptionOverlayHub()
+ {
+-	timer_.setInterval(150);
++	timer_.setInterval(100);
+ 	connect(&timer_, &QTimer::timeout, this, &CaptionOverlayHub::refresh);
+ 	timer_.start();
+ }
+@@ -68,10 +220,14 @@ void CaptionOverlayHub::remove(CaptionOverlay *overlay)
+ 	overlays_.erase(overlay);
+ }
+ 
+-QString CaptionOverlayHub::shownText()
++QString CaptionOverlayHub::shownText(const QString &name)
+ {
+ 	std::lock_guard lock(mutex_);
+-	return overlays_.empty() ? QString() : (*overlays_.begin())->shown;
++	for (CaptionOverlay *overlay : overlays_) {
++		if (QString::fromUtf8(obs_source_get_name(overlay->self)) == name)
++			return overlay->shown;
++	}
++	return QString();
+ }
+ 
+ void CaptionOverlayHub::push(const QJsonObject &event)
+@@ -89,7 +245,7 @@ void CaptionOverlayHub::push(const QJsonObject &event)
+ 		return;
+ 	const QString text = event.value("text").toString();
+ 	if (event.value("final").toBool()) {
+-		/* Keep only a little finished text: the box shows the tail. */
++		/* A little finished text stays so a short new sentence has context. */
+ 		finished_ = (finished_ + text).right(200);
+ 		partial_.clear();
+ 	} else {
+@@ -103,39 +259,24 @@ void CaptionOverlayHub::refresh()
+ 	const qint64 now = QDateTime::currentMSecsSinceEpoch();
+ 	std::lock_guard lock(mutex_);
+ 	for (CaptionOverlay *overlay : overlays_) {
++		const Style &style = overlay->style;
+ 		QString text = finished_ + partial_;
+-		if (overlay->lingerSeconds > 0 && now - updatedMs_ > overlay->lingerSeconds * 1000LL)
++		if (style.lingerSeconds > 0 && now - updatedMs_ > style.lingerSeconds * 1000LL)
+ 			text.clear();
+-
+-		/* Keep the words that fit in maxLines rows, cutting from the front
+-		 * (at punctuation when one is close), and pad from the top so the
+-		 * text sits on the bottom row like a subtitle. */
+-		const double perRow = std::max(4.0, overlay->width.load() / double(std::max(overlay->fontSize, 1)));
+-		const double capacity = perRow * overlay->maxLines;
+-		double used = 0;
+-		int start = text.size();
+-		while (start > 0 && used + charWidth(text[start - 1]) <= capacity) {
+-			used += charWidth(text[start - 1]);
+-			start--;
+-		}
+-		if (start > 0) {
+-			for (int i = start; i < std::min<int>(text.size(), start + 8); i++) {
+-				if (QStringLiteral("，。！？、；：,.!? ").contains(text[i])) {
+-					start = i + 1;
+-					break;
+-				}
+-			}
+-			text = text.mid(start);
+-		}
+-		const int rows = std::max(1, static_cast<int>(std::ceil(used / perRow)));
+-		const QString display = text.isEmpty() ? QString()
+-						       : QString(std::max(0, overlay->maxLines - rows), QChar('\n')) + text;
+-		if (display == overlay->shown)
++		const double wrapWidth = std::max(40, style.width - style.padding * 2 - (style.background ? style.padding * 2 : 0));
++		const std::vector<QString> lines = fitTail(text, style, wrapWidth);
++		QStringList joined;
++		for (const QString &line : lines)
++			joined << line;
++		const QString shown = joined.join(QChar('\n'));
++		if (shown == overlay->shown && !overlay->dirty)
+ 			continue;
+-		overlay->shown = display;
+-		OBSDataAutoRelease update = obs_data_create();
+-		obs_data_set_string(update, "text", display.isEmpty() ? " " : display.toUtf8().constData());
+-		obs_source_update(overlay->label, update);
++		overlay->shown = shown;
++		overlay->dirty = false;
++		QImage image = render(lines, style);
++		std::lock_guard frame(overlay->frameMutex);
++		overlay->pending = std::move(image);
++		overlay->hasPending = true;
+ 	}
+ }
+ 
+@@ -150,51 +291,48 @@ const char *captionName(void *)
+ void captionUpdate(void *data, obs_data_t *settings)
+ {
+ 	auto *overlay = static_cast<CaptionOverlay *>(data);
++	Style style;
++	style.width = std::max(16, static_cast<int>(obs_data_get_int(settings, "width")));
++	style.height = std::max(16, static_cast<int>(obs_data_get_int(settings, "height")));
++	style.maxLines = std::max(1, static_cast<int>(obs_data_get_int(settings, "lines")));
++	style.lingerSeconds = static_cast<int>(obs_data_get_int(settings, "linger"));
++	style.hAlign = static_cast<int>(obs_data_get_int(settings, "h_align"));
++	style.vAlign = static_cast<int>(obs_data_get_int(settings, "v_align"));
+ 	OBSDataAutoRelease font = obs_data_get_obj(settings, "font");
+-	int fontSize = font ? static_cast<int>(obs_data_get_int(font, "size")) : kDefaultFontSize;
+-	if (fontSize <= 0)
+-		fontSize = kDefaultFontSize;
+-	const int lines = static_cast<int>(obs_data_get_int(settings, "lines"));
+-	const int width = static_cast<int>(obs_data_get_int(settings, "width"));
+-	overlay->width = width;
+-	overlay->height = lines * fontSize * 4 / 3;
++	const int size = font ? static_cast<int>(obs_data_get_int(font, "size")) : kDefaultFontSize;
++	const long long flags = font ? obs_data_get_int(font, "flags") : 0;
++	style.font = QFont(QString::fromUtf8(font ? obs_data_get_string(font, "face") : kDefaultFace));
++	style.font.setPixelSize(size > 0 ? size : kDefaultFontSize);
++	const QString fontStyle = QString::fromUtf8(font ? obs_data_get_string(font, "style") : "");
++	if (!fontStyle.isEmpty())
++		style.font.setStyleName(fontStyle);
++	style.font.setBold(flags & OBS_FONT_BOLD);
++	style.font.setItalic(flags & OBS_FONT_ITALIC);
++	style.color = obsColor(obs_data_get_int(settings, "color"));
++	style.outline = obs_data_get_bool(settings, "outline");
++	style.outlineWidth = static_cast<int>(obs_data_get_int(settings, "outline_width"));
++	style.outlineColor = obsColor(obs_data_get_int(settings, "outline_color"));
++	style.shadow = obs_data_get_bool(settings, "drop_shadow");
++	style.background = obs_data_get_bool(settings, "background");
++	style.backgroundColor = obsColor(obs_data_get_int(settings, "background_color"));
++	style.padding = static_cast<int>(obs_data_get_int(settings, "padding"));
+ 
++	overlay->width = style.width;
++	overlay->height = style.height;
+ 	if (CaptionOverlayHub *hub = CaptionOverlayHub::instance()) {
+ 		hub->remove(overlay);
+-		overlay->maxLines = lines;
+-		overlay->lingerSeconds = static_cast<int>(obs_data_get_int(settings, "linger"));
+-		overlay->fontSize = fontSize;
+-		overlay->shown = QStringLiteral("\x01"); /* redraw with the new layout */
++		overlay->style = style;
++		overlay->dirty = true;
+ 		hub->add(overlay);
++	} else {
++		overlay->style = style;
+ 	}
+-
+-	OBSDataAutoRelease label = obs_data_create();
+-	OBSDataAutoRelease labelFont = obs_data_create();
+-	obs_data_set_string(labelFont, "face", font ? obs_data_get_string(font, "face") : kDefaultFace);
+-	obs_data_set_string(labelFont, "style", font ? obs_data_get_string(font, "style") : "");
+-	obs_data_set_int(labelFont, "size", fontSize);
+-	obs_data_set_int(labelFont, "flags", font ? obs_data_get_int(font, "flags") : 0);
+-	obs_data_set_obj(label, "font", labelFont);
+-	const long long color = obs_data_get_int(settings, "color");
+-	obs_data_set_int(label, "color1", color);
+-	obs_data_set_int(label, "color2", color);
+-	obs_data_set_bool(label, "outline", obs_data_get_bool(settings, "outline"));
+-	obs_data_set_bool(label, "drop_shadow", obs_data_get_bool(settings, "drop_shadow"));
+-	obs_data_set_bool(label, "word_wrap", true);
+-	obs_data_set_int(label, "custom_width", width);
+-	obs_source_update(overlay->label, label);
+ }
+ 
+-void *captionCreate(obs_data_t *settings, obs_source_t *)
++void *captionCreate(obs_data_t *settings, obs_source_t *source)
+ {
+ 	auto *overlay = new CaptionOverlay();
+-	OBSDataAutoRelease label = obs_data_create();
+-	obs_data_set_string(label, "text", " ");
+-	overlay->label = obs_source_create_private("text_ft2_source_v2", "livehime-caption-text", label);
+-	if (!overlay->label) {
+-		delete overlay;
+-		return nullptr;
+-	}
++	overlay->self = source;
+ 	captionUpdate(overlay, settings);
+ 	return overlay;
+ }
+@@ -204,7 +342,11 @@ void captionDestroy(void *data)
+ 	auto *overlay = static_cast<CaptionOverlay *>(data);
+ 	if (CaptionOverlayHub *hub = CaptionOverlayHub::instance())
+ 		hub->remove(overlay);
+-	obs_source_release(overlay->label);
++	if (overlay->texture) {
++		obs_enter_graphics();
++		gs_texture_destroy(overlay->texture);
++		obs_leave_graphics();
++	}
+ 	delete overlay;
+ }
+ 
+@@ -220,7 +362,40 @@ uint32_t captionHeight(void *data)
+ 
+ void captionRender(void *data, gs_effect_t *)
+ {
+-	obs_source_video_render(static_cast<CaptionOverlay *>(data)->label);
++	auto *overlay = static_cast<CaptionOverlay *>(data);
++	{
++		std::lock_guard lock(overlay->frameMutex);
++		if (overlay->hasPending) {
++			overlay->hasPending = false;
++			const QImage &image = overlay->pending;
++			if (overlay->texture && (gs_texture_get_width(overlay->texture) != uint32_t(image.width()) ||
++						 gs_texture_get_height(overlay->texture) != uint32_t(image.height()))) {
++				gs_texture_destroy(overlay->texture);
++				overlay->texture = nullptr;
++			}
++			if (!image.isNull()) {
++				if (!overlay->texture) {
++					const uint8_t *bits = image.constBits();
++					overlay->texture = gs_texture_create(image.width(), image.height(), GS_BGRA, 1, &bits,
++									     GS_DYNAMIC);
++				} else {
++					gs_texture_set_image(overlay->texture, image.constBits(),
++							     static_cast<uint32_t>(image.bytesPerLine()), false);
++				}
++			}
++		}
++	}
++	if (!overlay->texture)
++		return;
++	/* The image is premultiplied (QImage ARGB32_Premultiplied, BGRA in memory). */
++	gs_blend_state_push();
++	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
++	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_PREMULTIPLIED_ALPHA);
++	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
++	gs_effect_set_texture(image, overlay->texture);
++	while (gs_effect_loop(effect, "Draw"))
++		gs_draw_sprite(overlay->texture, 0, 0, 0);
++	gs_blend_state_pop();
+ }
+ 
+ void captionDefaults(obs_data_t *settings)
+@@ -231,30 +406,60 @@ void captionDefaults(obs_data_t *settings)
+ 	obs_data_set_default_int(font, "flags", 0);
+ 	obs_data_set_default_string(font, "style", "W6");
+ 	obs_data_set_default_obj(settings, "font", font);
++	obs_data_set_default_int(settings, "width", kDefaultWidth);
++	obs_data_set_default_int(settings, "height", kDefaultHeight);
+ 	obs_data_set_default_int(settings, "lines", kDefaultLines);
+ 	obs_data_set_default_int(settings, "linger", kDefaultLinger);
+-	obs_data_set_default_int(settings, "width", kDefaultWidth);
++	obs_data_set_default_int(settings, "h_align", AlignCenter);
++	obs_data_set_default_int(settings, "v_align", AlignBottom);
+ 	obs_data_set_default_int(settings, "color", 0xFFFFFFFF);
+ 	obs_data_set_default_bool(settings, "outline", true);
++	obs_data_set_default_int(settings, "outline_width", 4);
++	obs_data_set_default_int(settings, "outline_color", 0xFF000000);
+ 	obs_data_set_default_bool(settings, "drop_shadow", true);
++	obs_data_set_default_bool(settings, "background", false);
++	obs_data_set_default_int(settings, "background_color", 0x96000000);
++	obs_data_set_default_int(settings, "padding", 16);
+ }
+ 
+ obs_properties_t *captionProperties(void *)
+ {
+ 	obs_properties_t *props = obs_properties_create();
+-	obs_properties_add_font(props, "font", obs_module_text("LiveHime.Overlay.Font"));
+-	obs_properties_add_color_alpha(props, "color", obs_module_text("LiveHime.Overlay.Color"));
+-	obs_properties_add_bool(props, "outline", obs_module_text("LiveHime.Overlay.Outline"));
+-	obs_properties_add_bool(props, "drop_shadow", obs_module_text("LiveHime.Overlay.Shadow"));
+-	obs_properties_add_int_slider(props, "lines", obs_module_text("LiveHime.Overlay.Lines"), 1, 6, 1);
+-	obs_property_t *width =
+-		obs_properties_add_int(props, "width", obs_module_text("LiveHime.Overlay.Width"), 200, 3840, 10);
++	auto t = [](const char *key) { return obs_module_text(key); };
++
++	obs_property_t *width = obs_properties_add_int(props, "width", t("LiveHime.Captions.Width"), 16, 7680, 10);
+ 	obs_property_int_set_suffix(width, " px");
+-	obs_property_t *linger =
+-		obs_properties_add_int(props, "linger", obs_module_text("LiveHime.Captions.Linger"), 0, 60, 1);
++	obs_property_t *height = obs_properties_add_int(props, "height", t("LiveHime.Captions.Height"), 16, 4320, 10);
++	obs_property_int_set_suffix(height, " px");
++	obs_property_set_long_description(height, t("LiveHime.Captions.SizeHint"));
++	obs_properties_add_int_slider(props, "lines", t("LiveHime.Overlay.Lines"), 1, 6, 1);
++
++	obs_property_t *h = obs_properties_add_list(props, "h_align", t("LiveHime.Captions.HAlign"), OBS_COMBO_TYPE_LIST,
++						    OBS_COMBO_FORMAT_INT);
++	obs_property_list_add_int(h, t("LiveHime.Captions.Align.Left"), AlignLeft);
++	obs_property_list_add_int(h, t("LiveHime.Captions.Align.Center"), AlignCenter);
++	obs_property_list_add_int(h, t("LiveHime.Captions.Align.Right"), AlignRight);
++	obs_property_t *v = obs_properties_add_list(props, "v_align", t("LiveHime.Captions.VAlign"), OBS_COMBO_TYPE_LIST,
++						    OBS_COMBO_FORMAT_INT);
++	obs_property_list_add_int(v, t("LiveHime.Captions.Align.Top"), AlignTop);
++	obs_property_list_add_int(v, t("LiveHime.Captions.Align.Middle"), AlignMiddle);
++	obs_property_list_add_int(v, t("LiveHime.Captions.Align.Bottom"), AlignBottom);
++
++	obs_properties_add_font(props, "font", t("LiveHime.Overlay.Font"));
++	obs_properties_add_color_alpha(props, "color", t("LiveHime.Overlay.Color"));
++	obs_properties_add_bool(props, "outline", t("LiveHime.Overlay.Outline"));
++	obs_properties_add_int_slider(props, "outline_width", t("LiveHime.Captions.OutlineWidth"), 1, 12, 1);
++	obs_properties_add_color_alpha(props, "outline_color", t("LiveHime.Captions.OutlineColor"));
++	obs_properties_add_bool(props, "drop_shadow", t("LiveHime.Overlay.Shadow"));
++	obs_properties_add_bool(props, "background", t("LiveHime.Captions.Background"));
++	obs_properties_add_color_alpha(props, "background_color", t("LiveHime.Captions.BackgroundColor"));
++	obs_property_t *padding = obs_properties_add_int(props, "padding", t("LiveHime.Captions.Padding"), 0, 200, 2);
++	obs_property_int_set_suffix(padding, " px");
++
++	obs_property_t *linger = obs_properties_add_int(props, "linger", t("LiveHime.Captions.Linger"), 0, 60, 1);
+ 	obs_property_int_set_suffix(linger, " s");
+-	obs_property_set_long_description(linger, obs_module_text("LiveHime.Captions.LingerHint"));
+-	obs_properties_add_text(props, "hint", obs_module_text("LiveHime.Captions.SourceHint"), OBS_TEXT_INFO);
++	obs_property_set_long_description(linger, t("LiveHime.Captions.LingerHint"));
++	obs_properties_add_text(props, "hint", t("LiveHime.Captions.SourceHint"), OBS_TEXT_INFO);
+ 	return props;
+ }
+ } // namespace
+diff --git a/plugins/livehime/src/caption-overlay.hpp b/plugins/livehime/src/caption-overlay.hpp
+index 5cff72915..291d1bf24 100644
+--- a/plugins/livehime/src/caption-overlay.hpp
++++ b/plugins/livehime/src/caption-overlay.hpp
+@@ -9,10 +9,12 @@
+ 
+ struct CaptionOverlay;
+ 
+-/* "LiveHime captions" OBS source: shows the live caption on the canvas,
+- * bottom-aligned, keeping the most recent words when the sentence is longer
+- * than the box. Like the danmaku overlay it wraps a private FreeType text
+- * source; this hub receives caption events on the UI thread. */
++/* "LiveHime captions" OBS source: draws the live caption itself (Qt text
++ * into a texture) in a box of the size the user sets, aligned left, centre
++ * or right and top, middle or bottom, with outline, shadow and an optional
++ * background plate. When a sentence is longer than the lines allowed, the
++ * newest words are kept, measured with the real font. This hub receives
++ * caption events and lays out every caption source on the UI thread. */
+ class CaptionOverlayHub : public QObject {
+ 	Q_OBJECT
+ 
+@@ -23,8 +25,8 @@ public:
+ 
+ 	void add(CaptionOverlay *overlay);
+ 	void remove(CaptionOverlay *overlay);
+-	/* What the first overlay currently shows (tests). */
+-	QString shownText();
++	/* What the caption source `name` currently shows (tests). */
++	QString shownText(const QString &name);
+ 
+ public slots:
+ 	void push(const QJsonObject &event);

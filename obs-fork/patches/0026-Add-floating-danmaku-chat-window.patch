@@ -1,7 +1,7 @@
 From dca0e48dce7db0e577bb36b252e18b726fa8fd41 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 04:28:10 +0800
-Subject: [PATCH 26/30] Add floating danmaku chat window
+Subject: [PATCH 26/39] Add floating danmaku chat window
 
 A frameless window with the live feed and send box, opened from the
 dock or a hotkey. It can stay on top, be pinned in place, run at

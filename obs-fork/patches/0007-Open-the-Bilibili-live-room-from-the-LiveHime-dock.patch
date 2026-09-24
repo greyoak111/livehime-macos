@@ -1,7 +1,7 @@
 From 5187d1e7694b79e2f09a031f15e5ce33112076bd Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 23:23:24 +0800
-Subject: [PATCH 07/30] Open the Bilibili live room from the LiveHime dock
+Subject: [PATCH 07/39] Open the Bilibili live room from the LiveHime dock
 
 The ready account view gains an area picker and Go live / End live.
 Go live asks the core to open the room (startLive, v0.1.2's signing) and

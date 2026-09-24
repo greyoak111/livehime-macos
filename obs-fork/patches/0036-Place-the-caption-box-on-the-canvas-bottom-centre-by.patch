@@ -1,0 +1,300 @@
+From 31882967e4de4516bb1118c8be15796a15e33898 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 17:10:22 +0800
+Subject: [PATCH 36/39] Place the caption box on the canvas, bottom centre by
+ default
+
+A "Position on canvas" setting puts the caption box at the bottom
+centre (default), top centre, centre, a corner, or leaves it free, at a
+set distance from the edge. Resizing keeps the box anchored; moving it by
+hand switches the source to free placement so it is never pulled back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/e2e-captions.mjs |  24 ++++
+ plugins/livehime/data/locale/en-US.ini    |  11 ++
+ plugins/livehime/data/locale/zh-CN.ini    |  11 ++
+ plugins/livehime/src/caption-overlay.cpp  | 138 ++++++++++++++++++++++
+ 4 files changed, 184 insertions(+)
+
+diff --git a/build-aux/livehime/tests/e2e-captions.mjs b/build-aux/livehime/tests/e2e-captions.mjs
+index 0665be376..84a21bca8 100644
+--- a/build-aux/livehime/tests/e2e-captions.mjs
++++ b/build-aux/livehime/tests/e2e-captions.mjs
+@@ -104,6 +104,30 @@ ws.onmessage = async (ev) => {
+     tf = await transform();
+     check('width and height in properties move the box', tf.boundsWidth === 1000 && tf.boundsHeight === 200, `bounds ${tf.boundsWidth}x${tf.boundsHeight}`);
+ 
++    // Placement on the canvas: bottom centre by default, kept on resize.
++    const video = (await req('GetVideoSettings')).responseData;
++    const W = video.baseWidth, H = video.baseHeight, M = 40;
++    const at = (t) => `pos ${t.positionX},${t.positionY} box ${t.width}x${t.height} canvas ${W}x${H}`;
++    const near = (a, b) => Math.abs(a - b) <= 1;
++    tf = await transform();
++    check('box sits at the bottom centre of the canvas', near(tf.positionX + tf.width / 2, W / 2) && near(tf.positionY + tf.height, H - M), at(tf));
++    await req('SetSceneItemTransform', { sceneName: scene, sceneItemId: itemId, sceneItemTransform: { boundsWidth: 1400, boundsHeight: 180 } });
++    await sleep(500);
++    tf = await transform();
++    check('resizing keeps it centred on the bottom', tf.width === 1400 && near(tf.positionX + tf.width / 2, W / 2) && near(tf.positionY + tf.height, H - M), at(tf));
++    await req('SetInputSettings', { inputName: CAPTIONS, inputSettings: { placement: 4 } });
++    await sleep(500);
++    tf = await transform();
++    check('bottom-right placement', near(tf.positionX + tf.width, W - M) && near(tf.positionY + tf.height, H - M), at(tf));
++    await req('SetInputSettings', { inputName: CAPTIONS, inputSettings: { placement: 0 } });
++    await sleep(500);
++    tf = await transform();
++    await req('SetSceneItemTransform', { sceneName: scene, sceneItemId: itemId, sceneItemTransform: { positionX: tf.positionX - 150, positionY: tf.positionY - 90 } });
++    await sleep(500);
++    const placement = (await req('GetInputSettings', { inputName: CAPTIONS })).responseData.inputSettings.placement;
++    const moved = await transform();
++    check('moving it by hand switches to free placement and stays', placement === 7 && near(moved.positionX, tf.positionX - 150), `placement ${placement} ${at(moved)}`);
++
+     // Layout: one long line, bottom centre, in a 1920 x 160 box.
+     await req('SetInputSettings', { inputName: CAPTIONS, inputSettings: { width: 1920, height: 160, lines: 1, h_align: 1, v_align: 2, padding: 16, linger: 30 } });
+     await sleep(600);
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index f9e8a9409..1752fe34f 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -169,3 +169,14 @@ LiveHime.Captions.OutlineColor="Outline color"
+ LiveHime.Captions.Background="Background plate"
+ LiveHime.Captions.BackgroundColor="Plate color"
+ LiveHime.Captions.Padding="Padding"
++LiveHime.Captions.Placement="Position on canvas"
++LiveHime.Captions.PlacementHint="Where the caption box sits on the stream. Moving it by hand on the canvas switches to Free."
++LiveHime.Captions.Margin="Distance from edge"
++LiveHime.Captions.Place.BottomCenter="Bottom center"
++LiveHime.Captions.Place.TopCenter="Top center"
++LiveHime.Captions.Place.Center="Center"
++LiveHime.Captions.Place.BottomLeft="Bottom left"
++LiveHime.Captions.Place.BottomRight="Bottom right"
++LiveHime.Captions.Place.TopLeft="Top left"
++LiveHime.Captions.Place.TopRight="Top right"
++LiveHime.Captions.Place.Free="Free"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index a6baba244..677136570 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -169,3 +169,14 @@ LiveHime.Captions.OutlineColor="描边颜色"
+ LiveHime.Captions.Background="背景底板"
+ LiveHime.Captions.BackgroundColor="底板颜色"
+ LiveHime.Captions.Padding="边距"
++LiveHime.Captions.Placement="画面位置"
++LiveHime.Captions.PlacementHint="字幕框在直播画面上的位置。在画面里手动拖动字幕框后会自动改为“自由摆放”。"
++LiveHime.Captions.Margin="离画面边缘"
++LiveHime.Captions.Place.BottomCenter="底部居中"
++LiveHime.Captions.Place.TopCenter="顶部居中"
++LiveHime.Captions.Place.Center="画面中央"
++LiveHime.Captions.Place.BottomLeft="左下"
++LiveHime.Captions.Place.BottomRight="右下"
++LiveHime.Captions.Place.TopLeft="左上"
++LiveHime.Captions.Place.TopRight="右上"
++LiveHime.Captions.Place.Free="自由摆放"
+diff --git a/plugins/livehime/src/caption-overlay.cpp b/plugins/livehime/src/caption-overlay.cpp
+index 0540aaadf..01ddb4591 100644
+--- a/plugins/livehime/src/caption-overlay.cpp
++++ b/plugins/livehime/src/caption-overlay.cpp
+@@ -17,9 +17,11 @@
+ #include <cmath>
+ #include <cstring>
+ #include <functional>
++#include <map>
+ #include <vector>
+ 
+ void CaptionItemSync_PushSize(obs_source_t *source, int width, int height);
++void CaptionItemSync_Place(obs_source_t *source);
+ 
+ namespace {
+ constexpr int kDefaultWidth = 1920;
+@@ -30,6 +32,18 @@ constexpr int kDefaultFontSize = 48;
+ constexpr const char *kDefaultFace = "Hiragino Sans GB";
+ 
+ enum HAlign { AlignLeft = 0, AlignCenter = 1, AlignRight = 2 };
++/* Where the caption box sits on the canvas. */
++enum Placement {
++	PlaceBottomCenter = 0,
++	PlaceTopCenter,
++	PlaceCenter,
++	PlaceBottomLeft,
++	PlaceBottomRight,
++	PlaceTopLeft,
++	PlaceTopRight,
++	PlaceFree,
++};
++constexpr int kDefaultMargin = 40;
+ enum VAlign { AlignTop = 0, AlignMiddle = 1, AlignBottom = 2 };
+ 
+ /* OBS colors are 0xAABBGGRR. */
+@@ -60,6 +74,8 @@ struct Style {
+ 
+ struct CaptionOverlay {
+ 	obs_source_t *self = nullptr;
++	int placement = -1; /* last applied, to notice changes */
++	int margin = -1;
+ 	/* Style and layout: UI thread (update + hub). */
+ 	Style style;
+ 	QString shown;
+@@ -315,6 +331,93 @@ void setSourceSize(obs_source_t *source, int width, int height)
+ 	obs_source_update(source, changes);
+ }
+ 
++/* Last position and box we gave each item (UI thread), to tell a resize
++ * (keep the anchor) from the user moving the box (stop anchoring). */
++struct Placed {
++	vec2 pos;
++	vec2 bounds;
++};
++std::map<QString, Placed> placedItems;
++
++QString itemKey(obs_sceneitem_t *item)
++{
++	obs_source_t *scene = obs_scene_get_source(obs_sceneitem_get_scene(item));
++	return QString::fromUtf8(obs_source_get_uuid(scene)) + QChar(':') + QString::number(obs_sceneitem_get_id(item));
++}
++
++bool near(float a, float b)
++{
++	return std::fabs(a - b) < 0.5f;
++}
++
++/* Puts the box where the source's "placement" says (bottom centre by
++ * default). Moving the box by hand switches the source to free placement;
++ * resizing keeps it anchored. `force` re-applies after a settings change. */
++void placeItem(obs_sceneitem_t *item, bool force)
++{
++	obs_source_t *source = obs_sceneitem_get_source(item);
++	OBSDataAutoRelease settings = obs_source_get_settings(source);
++	const int placement = static_cast<int>(obs_data_get_int(settings, "placement"));
++	const QString key = itemKey(item);
++	if (placement == PlaceFree || obs_sceneitem_get_rot(item) != 0.0f) {
++		placedItems.erase(key);
++		return;
++	}
++	vec2 bounds, pos;
++	obs_sceneitem_get_bounds(item, &bounds);
++	obs_sceneitem_get_pos(item, &pos);
++	auto previous = placedItems.find(key);
++	if (!force && previous != placedItems.end() && near(bounds.x, previous->second.bounds.x) &&
++	    near(bounds.y, previous->second.bounds.y) &&
++	    (!near(pos.x, previous->second.pos.x) || !near(pos.y, previous->second.pos.y))) {
++		/* Same size, new place: the user moved it. */
++		placedItems.erase(previous);
++		OBSDataAutoRelease changes = obs_data_create();
++		obs_data_set_int(changes, "placement", PlaceFree);
++		obs_source_update(source, changes);
++		return;
++	}
++
++	obs_video_info video;
++	if (!obs_get_video_info(&video))
++		return;
++	const float canvasWidth = float(video.base_width), canvasHeight = float(video.base_height);
++	const float margin = float(obs_data_get_int(settings, "margin"));
++	float left = (canvasWidth - bounds.x) / 2, top = canvasHeight - margin - bounds.y;
++	switch (placement) {
++	case PlaceTopCenter:
++		top = margin;
++		break;
++	case PlaceCenter:
++		top = (canvasHeight - bounds.y) / 2;
++		break;
++	case PlaceBottomLeft:
++		left = margin;
++		break;
++	case PlaceBottomRight:
++		left = canvasWidth - margin - bounds.x;
++		break;
++	case PlaceTopLeft:
++		left = margin;
++		top = margin;
++		break;
++	case PlaceTopRight:
++		left = canvasWidth - margin - bounds.x;
++		top = margin;
++		break;
++	default:
++		break;
++	}
++	/* The item's position is its alignment point, not always the corner. */
++	const uint32_t align = obs_sceneitem_get_alignment(item);
++	vec2 target;
++	target.x = left + ((align & OBS_ALIGN_LEFT) ? 0 : (align & OBS_ALIGN_RIGHT) ? bounds.x : bounds.x / 2);
++	target.y = top + ((align & OBS_ALIGN_TOP) ? 0 : (align & OBS_ALIGN_BOTTOM) ? bounds.y : bounds.y / 2);
++	placedItems[key] = {target, bounds};
++	if (!near(pos.x, target.x) || !near(pos.y, target.y))
++		obs_sceneitem_set_pos(item, &target);
++}
++
+ /* The item's box is the caption box: take it as the source size, or turn a
+  * plain (scaled) item into a bounding-box item of the same visible size. */
+ void syncItem(obs_sceneitem_t *item)
+@@ -348,6 +451,7 @@ void syncItem(obs_sceneitem_t *item)
+ 	const int boxHeight = std::max(16, static_cast<int>(std::lround(bounds.y)));
+ 	if (boxWidth != width || boxHeight != height)
+ 		setSourceSize(source, boxWidth, boxHeight);
++	placeItem(item, false);
+ }
+ 
+ void itemTransformed(void *, calldata_t *data)
+@@ -424,6 +528,16 @@ void CaptionItemSync_PushSize(obs_source_t *source, int width, int height)
+ 	});
+ }
+ 
++void CaptionItemSync_Place(obs_source_t *source)
++{
++	OBSWeakSource weak = OBSGetWeakRef(source);
++	onUi([weak] {
++		OBSSourceAutoRelease strong = obs_weak_source_get_source(weak);
++		if (strong)
++			forEachItemOf(strong, [](obs_sceneitem_t *item) { placeItem(item, true); });
++	});
++}
++
+ void CaptionItemSync::Attach()
+ {
+ 	signal_handler_connect(obs_get_signal_handler(), "source_create", sourceCreated, nullptr);
+@@ -492,6 +606,13 @@ void captionUpdate(void *data, obs_data_t *settings)
+ 	overlay->height = style.height;
+ 	if (resized && overlay->self)
+ 		CaptionItemSync_PushSize(overlay->self, style.width, style.height);
++	const int placement = static_cast<int>(obs_data_get_int(settings, "placement"));
++	const int margin = static_cast<int>(obs_data_get_int(settings, "margin"));
++	if ((placement != overlay->placement || margin != overlay->margin) && overlay->self) {
++		overlay->placement = placement;
++		overlay->margin = margin;
++		CaptionItemSync_Place(overlay->self);
++	}
+ 	if (CaptionOverlayHub *hub = CaptionOverlayHub::instance()) {
+ 		hub->remove(overlay);
+ 		overlay->style = style;
+@@ -593,6 +714,8 @@ void captionDefaults(obs_data_t *settings)
+ 	obs_data_set_default_bool(settings, "background", false);
+ 	obs_data_set_default_int(settings, "background_color", 0x96000000);
+ 	obs_data_set_default_int(settings, "padding", 16);
++	obs_data_set_default_int(settings, "placement", PlaceBottomCenter);
++	obs_data_set_default_int(settings, "margin", kDefaultMargin);
+ }
+ 
+ obs_properties_t *captionProperties(void *)
+@@ -600,6 +723,21 @@ obs_properties_t *captionProperties(void *)
+ 	obs_properties_t *props = obs_properties_create();
+ 	auto t = [](const char *key) { return obs_module_text(key); };
+ 
++	obs_property_t *place = obs_properties_add_list(props, "placement", t("LiveHime.Captions.Placement"),
++							OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
++	for (const auto &[key, value] : {std::pair{"LiveHime.Captions.Place.BottomCenter", PlaceBottomCenter},
++					 std::pair{"LiveHime.Captions.Place.TopCenter", PlaceTopCenter},
++					 std::pair{"LiveHime.Captions.Place.Center", PlaceCenter},
++					 std::pair{"LiveHime.Captions.Place.BottomLeft", PlaceBottomLeft},
++					 std::pair{"LiveHime.Captions.Place.BottomRight", PlaceBottomRight},
++					 std::pair{"LiveHime.Captions.Place.TopLeft", PlaceTopLeft},
++					 std::pair{"LiveHime.Captions.Place.TopRight", PlaceTopRight},
++					 std::pair{"LiveHime.Captions.Place.Free", PlaceFree}})
++		obs_property_list_add_int(place, t(key), value);
++	obs_property_set_long_description(place, t("LiveHime.Captions.PlacementHint"));
++	obs_property_t *margin = obs_properties_add_int(props, "margin", t("LiveHime.Captions.Margin"), 0, 1000, 5);
++	obs_property_int_set_suffix(margin, " px");
++
+ 	obs_property_t *width = obs_properties_add_int(props, "width", t("LiveHime.Captions.Width"), 16, 7680, 10);
+ 	obs_property_int_set_suffix(width, " px");
+ 	obs_property_t *height = obs_properties_add_int(props, "height", t("LiveHime.Captions.Height"), 16, 4320, 10);

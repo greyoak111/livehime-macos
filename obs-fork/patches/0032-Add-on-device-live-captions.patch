@@ -1,0 +1,1548 @@
+From 3573f8a6a49870956a4a9541325fe866c125cabf Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:20:06 +0800
+Subject: [PATCH 32/39] Add on-device live captions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A Captions tab in the dock turns on live captions for one OBS audio
+source (the microphone by default) in Mandarin, Taiwanese Mandarin,
+Cantonese or English. Speech is recognized on the Mac with Apple's
+SpeechAnalyzer (macOS 26+); nothing is uploaded. A new "LiveHime
+captions" source shows the words on stream, bottom-aligned, keeping the
+latest words that fit and clearing a few seconds after speech stops.
+
+The recognizer's spacing around Chinese is removed and homophones such
+as 直播机 are corrected to 直播姬. When audio stops arriving, silence is
+fed so the last sentence still finishes. Works without signing in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  13 +
+ build-aux/livehime/tests/e2e-captions.mjs     |  63 ++++
+ plugins/livehime/CMakeLists.txt               |   7 +
+ .../Sources/LiveHimeCore/LiveCaptions.swift   | 280 ++++++++++++++++++
+ .../LiveHimeCoreTests/CaptionTextTests.swift  |  20 ++
+ plugins/livehime/core/include/livehime-core.h |  10 +
+ plugins/livehime/data/locale/en-US.ini        |  19 ++
+ plugins/livehime/data/locale/zh-CN.ini        |  19 ++
+ plugins/livehime/src/account-panel.cpp        |   5 +
+ plugins/livehime/src/automation.cpp           |  25 ++
+ plugins/livehime/src/caption-controller.cpp   | 161 ++++++++++
+ plugins/livehime/src/caption-controller.hpp   |  51 ++++
+ plugins/livehime/src/caption-overlay.cpp      | 279 +++++++++++++++++
+ plugins/livehime/src/caption-overlay.hpp      |  45 +++
+ plugins/livehime/src/captions-page.cpp        | 194 ++++++++++++
+ plugins/livehime/src/captions-page.hpp        |  44 +++
+ plugins/livehime/src/feature-panel.cpp        |  14 +-
+ plugins/livehime/src/feature-panel.hpp        |   5 +
+ plugins/livehime/src/plugin-main.cpp          |   6 +
+ 19 files changed, 1259 insertions(+), 1 deletion(-)
+ create mode 100644 build-aux/livehime/tests/e2e-captions.mjs
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/CaptionTextTests.swift
+ create mode 100644 plugins/livehime/src/caption-controller.cpp
+ create mode 100644 plugins/livehime/src/caption-controller.hpp
+ create mode 100644 plugins/livehime/src/caption-overlay.cpp
+ create mode 100644 plugins/livehime/src/caption-overlay.hpp
+ create mode 100644 plugins/livehime/src/captions-page.cpp
+ create mode 100644 plugins/livehime/src/captions-page.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 5bff92c4e..39d55379c 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -70,3 +70,16 @@ owner's consent:
+ open --env LIVEHIME_E2E_PICK_FILE=/path/to/image.jpg build_macos/frontend/RelWithDebInfo/LiveHime.app
+ node e2e-cover.mjs <websocket password> image.jpg [--submit]
+ ```
++
++## Live captions check
++
++`e2e-captions.mjs` plays a speech file through a temporary media source,
++points live captions at it and checks the Captions tab and a temporary
++"LiveHime captions" source (macOS 26+). Both sources are removed
++afterwards. It changes the captions settings in `features.json`; back the
++file up and restore it around the run. A Chinese sample:
++`say -v Tingting -o speech.aiff "大家晚上好，欢迎来到我的直播间……"`.
++
++```bash
++node e2e-captions.mjs <websocket password> /path/to/speech.aiff
++```
+diff --git a/build-aux/livehime/tests/e2e-captions.mjs b/build-aux/livehime/tests/e2e-captions.mjs
+new file mode 100644
+index 000000000..a8d19acd0
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-captions.mjs
+@@ -0,0 +1,63 @@
++// Live captions end to end: a media source plays Chinese speech, captions
++// listen to it, and the "LiveHime captions" source shows the words.
++// Usage: node e2e-captions.mjs <ws password> <speech audio file>
++// Adds a media source and a captions source to the program scene and
++// removes both afterwards; restores the captions settings it changed.
++import { createHash } from 'node:crypto';
++const [password, audioFile] = process.argv.slice(2);
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const ws = new WebSocket('ws://127.0.0.1:4466');
++let id = 1; const pend = new Map();
++const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: t, requestData: d })).responseData?.responseData;
++let fails = 0;
++const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
++const MEDIA = 'livehime-e2e-speech', CAPTIONS = 'livehime-e2e-captions';
++
++ws.onmessage = async (ev) => {
++  const m = JSON.parse(ev.data);
++  if (m.op === 0) { const { challenge, salt } = m.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + salt) + challenge), eventSubscriptions: 0 } })); return; }
++  if (m.op === 7) { pend.get(m.d.requestId)?.(m.d); return; }
++  if (m.op !== 2) return;
++  for (let i = 0; i < 40 && !(await req('GetVersion')).requestStatus.result; i++) await sleep(500);
++  const before = await vendor('Captions');
++  check('captions supported on this Mac', before?.supported, JSON.stringify(before));
++  const scene = (await req('GetCurrentProgramScene')).responseData.currentProgramSceneName;
++  try {
++    const media = await req('CreateInput', { sceneName: scene, inputName: MEDIA, inputKind: 'ffmpeg_source',
++      inputSettings: { local_file: audioFile, is_local_file: true, looping: false, restart_on_activate: false, close_when_inactive: false } });
++    check('speech media source created', media.requestStatus.result, media.requestStatus.comment);
++    const cap = await req('CreateInput', { sceneName: scene, inputName: CAPTIONS, inputKind: 'livehime_captions', inputSettings: { lines: 2, width: 1200, linger: 30 } });
++    check('captions source created', cap.requestStatus.result, cap.requestStatus.comment);
++    await req('TriggerMediaInputAction', { inputName: MEDIA, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP' });
++
++    let st = await vendor('Captions', { enabled: true, source: MEDIA, locale: 'zh-CN' });
++    for (let i = 0; i < 40 && !/识别|Listening/.test(st?.status); i++) { await sleep(250); st = await vendor('Captions'); }
++    check('captions listening', /识别|Listening/.test(st?.status), st?.status);
++
++    await req('TriggerMediaInputAction', { inputName: MEDIA, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART' });
++    const t0 = Date.now(); let first = 0, seen = new Set();
++    for (let i = 0; i < 70; i++) {
++      await sleep(250); st = await vendor('Captions');
++      if (st?.caption && !first) first = Date.now() - t0;
++      if (st?.caption) seen.add(st.caption);
++    }
++    console.log('first caption after', first, 'ms;', seen.size, 'distinct updates');
++    console.log('caption:', st?.caption);
++    console.log('overlay:', JSON.stringify(st?.overlay));
++    check('captions appear while the speech plays', first > 0 && first < 4000, `${first} ms`);
++    check('recognized the speech', /欢迎来到我的直播间/.test(st?.caption || ''), st?.caption);
++    check('homophone fixed (直播姬)', /直播姬/.test(st?.caption || ''), st?.caption);
++    check('captions source shows the latest words, bottom-aligned', (st?.overlay || '').replace(/\n/g, '').length > 0 && (st.caption || '').endsWith((st.overlay || '').replace(/^\n+/, '').slice(-6)), JSON.stringify(st?.overlay));
++  } catch (e) { check('run', false, e.stack); }
++  finally {
++    await vendor('Captions', { enabled: before?.enabled ?? false, source: '', locale: '' });
++    await req('RemoveInput', { inputName: CAPTIONS });
++    await req('RemoveInput', { inputName: MEDIA });
++    await sleep(800);
++    const left = (await req('GetInputList')).responseData.inputs.map((i) => i.inputName);
++    check('temporary sources removed', !left.includes(MEDIA) && !left.includes(CAPTIONS), left.join(','));
++  }
++  console.log(fails ? `${fails} failed` : 'all passed'); process.exit(fails ? 1 : 0);
++};
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index d07ae3c70..1378420ee 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -19,6 +19,7 @@ target_sources(
+     core/Sources/LiveHimeCore/DanmakuClient.swift
+     core/Sources/LiveHimeCore/DanmakuProtocol.swift
+     core/Sources/LiveHimeCore/Diagnostics.swift
++    core/Sources/LiveHimeCore/LiveCaptions.swift
+     core/Sources/LiveHimeCore/LiveRoomActions.swift
+     core/Sources/LiveHimeCore/PlatformSupport.swift
+     core/Sources/LiveHimeCore/QRLogin.swift
+@@ -29,6 +30,12 @@ target_sources(
+     src/account-panel.hpp
+     src/automation.cpp
+     src/automation.hpp
++    src/caption-controller.cpp
++    src/caption-controller.hpp
++    src/caption-overlay.cpp
++    src/caption-overlay.hpp
++    src/captions-page.cpp
++    src/captions-page.hpp
+     src/danmaku-feed.cpp
+     src/danmaku-feed.hpp
+     src/danmaku-overlay.cpp
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift b/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
+new file mode 100644
+index 000000000..995ba2d23
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
+@@ -0,0 +1,280 @@
++import AVFoundation
++import Foundation
++import Speech
++
++/// Caption text as shown to viewers: the recognizer's spacing around
++/// Chinese text removed and known mis-hearings fixed.
++public enum CaptionText {
++    /// Words the recognizer cannot tell from a homophone, as a streamer on
++    /// Bilibili means them.
++    public static let replacements: [(String, String)] = [("直播机", "直播姬"), ("b站", "B站"), ("哔哩哔哩直播机", "哔哩哔哩直播姬")]
++
++    public static func clean(_ raw: String) -> String {
++        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
++        // "晚上好 ，欢迎" -> "晚上好，欢迎"; keep spaces between Latin words.
++        let cjk = "\\p{Han}，。！？、；：“”‘’（）《》…"
++        text = text.replacingOccurrences(of: "\\s+(?=[\(cjk)])", with: "", options: .regularExpression)
++        text = text.replacingOccurrences(of: "(?<=[\(cjk)])\\s+", with: "", options: .regularExpression)
++        for (heard, meant) in replacements {
++            text = text.replacingOccurrences(of: heard, with: meant)
++        }
++        // A result that is only punctuation carries nothing to show.
++        if text.unicodeScalars.allSatisfy({ CharacterSet.punctuationCharacters.contains($0) || CharacterSet.whitespaces.contains($0) }) {
++            return ""
++        }
++        return text
++    }
++}
++
++/// On-device live captions with Apple's SpeechAnalyzer (macOS 26+).
++/// Audio arrives from one thread at a time as mono float samples; results
++/// are the in-progress text of the current sentence and finished sentences.
++@available(macOS 26, *)
++final class LiveCaptioner: @unchecked Sendable {
++    enum Event: Sendable {
++        case preparing          // downloading / loading the language model
++        case listening
++        case partial(String)    // in-progress text, replaced by later updates
++        case final(String)      // a finished sentence
++        case failed(String)
++    }
++
++    /// Terms a Bilibili streamer says often; they bias recognition.
++    static let vocabulary = ["直播姬", "哔哩哔哩", "B站", "弹幕", "上舰", "舰长", "提督", "总督", "醒目留言",
++                             "一键三连", "UP主", "粉丝牌", "开播", "下播", "直播间", "打赏"]
++
++    private let locale: Locale
++    private let onEvent: @Sendable (Event) -> Void
++    private let lock = NSLock()
++    private var continuation: AsyncStream<AnalyzerInput>.Continuation?
++    private var analyzerFormat: AVAudioFormat?
++    private var converter: AVAudioConverter?
++    private var converterInputRate: Double = 0
++    private var analyzer: SpeechAnalyzer?
++    private var resultsTask: Task<Void, Never>?
++    private var stopped = false
++    /// When audio stops arriving (a media file ends, a device drops out),
++    /// the last sentence would never finish; feed silence instead.
++    private var lastPush = Date.distantFuture
++    private var lastRate: Double = 48000
++    private var silenceTimer: DispatchSourceTimer?
++
++    init(localeIdentifier: String, onEvent: @escaping @Sendable (Event) -> Void) {
++        locale = Locale(identifier: localeIdentifier)
++        self.onEvent = onEvent
++    }
++
++    func start() async {
++        do {
++            guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale) else {
++                onEvent(.failed("unsupportedLocale"))
++                return
++            }
++            let transcriber = SpeechTranscriber(locale: supported, transcriptionOptions: [],
++                                                reportingOptions: [.volatileResults, .fastResults], attributeOptions: [])
++            if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
++                onEvent(.preparing)
++                try await request.downloadAndInstall()
++            }
++            guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
++                onEvent(.failed("noAudioFormat"))
++                return
++            }
++            let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .bufferingNewest(500))
++            let analyzer = SpeechAnalyzer(modules: [transcriber])
++            let context = AnalysisContext()
++            context.contextualStrings[.general] = Self.vocabulary
++            try await analyzer.setContext(context)
++            try await analyzer.prepareToAnalyze(in: format)
++            let cancelled = lock.withLock { () -> Bool in
++                guard !stopped else { return true }
++                self.analyzerFormat = format
++                self.continuation = continuation
++                self.analyzer = analyzer
++                return false
++            }
++            if cancelled {
++                continuation.finish()
++                return
++            }
++            let onEvent = self.onEvent
++            resultsTask = Task {
++                do {
++                    for try await result in transcriber.results {
++                        let text = CaptionText.clean(String(result.text.characters))
++                        guard !text.isEmpty else { continue }
++                        onEvent(result.isFinal ? .final(text) : .partial(text))
++                    }
++                } catch is CancellationError {
++                } catch {
++                    onEvent(.failed(error.localizedDescription))
++                }
++            }
++            try await analyzer.start(inputSequence: stream)
++            startSilenceWatch()
++            onEvent(.listening)
++        } catch {
++            onEvent(.failed(error.localizedDescription))
++        }
++    }
++
++    private func startSilenceWatch() {
++        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
++        timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
++        timer.setEventHandler { [weak self] in
++            guard let self else { return }
++            let (idle, rate) = self.lock.withLock { (Date().timeIntervalSince(self.lastPush), self.lastRate) }
++            guard idle > 0.6 else { return }
++            let count = Int(rate / 10)
++            let zeros = [Float](repeating: 0, count: count)
++            zeros.withUnsafeBufferPointer { self.feed($0.baseAddress!, count: count, sampleRate: rate, silence: true) }
++        }
++        lock.withLock { silenceTimer = timer }
++        timer.resume()
++    }
++
++    /// Mono float samples at `sampleRate`, dropped until the analyzer is
++    /// ready. Called from the audio thread.
++    func push(_ samples: UnsafePointer<Float>, count: Int, sampleRate: Double) {
++        feed(samples, count: count, sampleRate: sampleRate, silence: false)
++    }
++
++    private func feed(_ samples: UnsafePointer<Float>, count: Int, sampleRate: Double, silence: Bool) {
++        lock.lock()
++        defer { lock.unlock() }
++        if !silence {
++            lastPush = Date()
++            lastRate = sampleRate
++        }
++        guard count > 0, let continuation, let target = analyzerFormat,
++              let source = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false),
++              let input = AVAudioPCMBuffer(pcmFormat: source, frameCapacity: AVAudioFrameCount(count)) else { return }
++        input.frameLength = AVAudioFrameCount(count)
++        input.floatChannelData![0].update(from: samples, count: count)
++        if converter == nil || converterInputRate != sampleRate {
++            converter = AVAudioConverter(from: source, to: target)
++            converterInputRate = sampleRate
++        }
++        guard let converter,
++              let output = AVAudioPCMBuffer(pcmFormat: target,
++                                            frameCapacity: AVAudioFrameCount(Double(count) * target.sampleRate / sampleRate) + 32)
++        else { return }
++        var supplied = false
++        var error: NSError?
++        converter.convert(to: output, error: &error) { _, status in
++            if supplied {
++                status.pointee = .noDataNow
++                return nil
++            }
++            supplied = true
++            status.pointee = .haveData
++            return input
++        }
++        if error == nil, output.frameLength > 0 {
++            continuation.yield(AnalyzerInput(buffer: output))
++        }
++    }
++
++    func stop() async {
++        let (continuation, analyzer) = lock.withLock { () -> (AsyncStream<AnalyzerInput>.Continuation?, SpeechAnalyzer?) in
++            stopped = true
++            silenceTimer?.cancel()
++            silenceTimer = nil
++            defer {
++                self.continuation = nil
++                self.analyzer = nil
++                self.analyzerFormat = nil
++                self.converter = nil
++            }
++            return (self.continuation, self.analyzer)
++        }
++        continuation?.finish()
++        try? await analyzer?.finalizeAndFinishThroughEndOfInput()
++        await resultsTask?.value
++        resultsTask = nil
++    }
++}
++
++/// The running captioner, shared between the main thread (start / stop)
++/// and the audio thread (push).
++final class CaptionSession: @unchecked Sendable {
++    static let shared = CaptionSession()
++    private let lock = NSLock()
++    private var captioner: AnyObject?
++    private var generation = 0
++
++    func start(locale: String) {
++        guard #available(macOS 26, *) else {
++            Self.emit(["event": "captions", "status": "unsupported"])
++            return
++        }
++        stop()
++        let id = lock.withLock { () -> Int in
++            generation += 1
++            return generation
++        }
++        let captioner = LiveCaptioner(localeIdentifier: locale) { [weak self] event in
++            guard let self, self.lock.withLock({ self.generation == id }) else { return }
++            switch event {
++            case .preparing: Self.emit(["event": "captions", "status": "preparing"])
++            case .listening: Self.emit(["event": "captions", "status": "listening"])
++            case .partial(let text): Self.emit(["event": "caption", "text": text, "final": false])
++            case .final(let text): Self.emit(["event": "caption", "text": text, "final": true])
++            case .failed(let message): Self.emit(["event": "captions", "status": "failed", "message": message])
++            }
++        }
++        lock.withLock { self.captioner = captioner }
++        Task { await captioner.start() }
++    }
++
++    func push(_ samples: UnsafePointer<Float>, count: Int, sampleRate: Double) {
++        guard #available(macOS 26, *) else { return }
++        let captioner = lock.withLock { self.captioner as? LiveCaptioner }
++        captioner?.push(samples, count: count, sampleRate: sampleRate)
++    }
++
++    func stop() {
++        guard #available(macOS 26, *) else { return }
++        let (captioner, id) = lock.withLock { () -> (LiveCaptioner?, Int) in
++            defer { self.captioner = nil }
++            generation += 1
++            return (self.captioner as? LiveCaptioner, generation)
++        }
++        guard let captioner else { return }
++        Task {
++            await captioner.stop()
++            // Unless a new session started meanwhile.
++            if lock.withLock({ generation == id }) { Self.emit(["event": "captions", "status": "stopped"]) }
++        }
++    }
++
++    private static func emit(_ object: [String: Any]) {
++        let payload = object as NSDictionary
++        DispatchQueue.main.async {
++            MainActor.assumeIsolated { CoreBridge.shared?.emit(payload as! [String: Any]) }
++        }
++    }
++}
++
++/// 1 when live captions can run here (macOS 26 or later).
++@_cdecl("livehime_core_captions_supported")
++public func livehime_core_captions_supported() -> Int32 {
++    if #available(macOS 26, *) { return SpeechTranscriber.isAvailable ? 1 : 0 }
++    return 0
++}
++
++@_cdecl("livehime_core_captions_start")
++public func livehime_core_captions_start(_ locale: UnsafePointer<CChar>?) {
++    CaptionSession.shared.start(locale: locale.map { String(cString: $0) } ?? "zh-CN")
++}
++
++@_cdecl("livehime_core_captions_push")
++public func livehime_core_captions_push(_ samples: UnsafePointer<Float>?, _ count: Int32, _ sampleRate: Double) {
++    guard let samples, count > 0 else { return }
++    CaptionSession.shared.push(samples, count: Int(count), sampleRate: sampleRate)
++}
++
++@_cdecl("livehime_core_captions_stop")
++public func livehime_core_captions_stop() {
++    CaptionSession.shared.stop()
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/CaptionTextTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/CaptionTextTests.swift
+new file mode 100644
+index 000000000..f652fce47
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/CaptionTextTests.swift
+@@ -0,0 +1,20 @@
++import XCTest
++@testable import LiveHimeCore
++
++final class CaptionTextTests: XCTestCase {
++    func testRemovesRecognizerSpacingAroundChinese() {
++        XCTAssertEqual(CaptionText.clean("大家晚上好 ，欢迎来到 我的直播间"), "大家晚上好，欢迎来到我的直播间")
++    }
++
++    func testKeepsSpacesBetweenLatinWords() {
++        XCTAssertEqual(CaptionText.clean("hello world 你好"), "hello world你好")
++    }
++
++    func testFixesHomophones() {
++        XCTAssertEqual(CaptionText.clean("怎么用直播机开播"), "怎么用直播姬开播")
++    }
++
++    func testDropsPunctuationOnlyResults() {
++        XCTAssertEqual(CaptionText.clean(" 。"), "")
++    }
++}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 387c55779..92d94feb2 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -48,6 +48,16 @@ void livehime_core_open_face_auth_qr(const char *url);
+  * the ready account; emits {"event":"coverWindowClosed"} when it closes. */
+ void livehime_core_open_cover_page(void);
+ 
++/* Live captions (on-device speech recognition, macOS 26+). start/stop on
++ * the main thread; push mono float samples from the audio thread. Emits
++ *   {"event":"captions","status":"preparing|listening|stopped|failed|unsupported"[,"message"]}
++ *   {"event":"caption","text","final":true|false}  (in-progress text is
++ *   replaced by later updates until a final sentence arrives) */
++int livehime_core_captions_supported(void);
++void livehime_core_captions_start(const char *locale);
++void livehime_core_captions_push(const float *samples, int count, double sample_rate);
++void livehime_core_captions_stop(void);
++
+ /* Test hooks for the hosted pages above (automation only). Call on the
+  * main thread. page_eval runs `script` as an async function body in the
+  * open page `key` ("cover", "faceAuth") and calls `done` on the main thread
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index c9c17479d..21aff3f9b 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -133,3 +133,22 @@ LiveHime.Floating.Opacity="Opacity"
+ LiveHime.Floating.Capturable="Allow screen capture"
+ LiveHime.Floating.CapturableTip="When off, screen capture (and your stream) does not show this window."
+ LiveHime.Floating.Hotkey="LiveHime: toggle floating chat"
++LiveHime.Captions.Tab="Captions"
++LiveHime.Captions.Enable="Live captions"
++LiveHime.Captions.Source="Audio source"
++LiveHime.Captions.Language="Language"
++LiveHime.Captions.Lang.zhCN="Mandarin (Simplified)"
++LiveHime.Captions.Lang.zhTW="Mandarin (Traditional)"
++LiveHime.Captions.Lang.yue="Cantonese"
++LiveHime.Captions.Lang.en="English"
++LiveHime.Captions.Status.off="Off"
++LiveHime.Captions.Status.preparing="Preparing the speech model…"
++LiveHime.Captions.Status.listening="Listening"
++LiveHime.Captions.Status.failed="Live captions stopped with an error"
++LiveHime.Captions.Status.unsupported="Live captions need macOS 26 or later."
++LiveHime.Captions.Status.noSource="The selected audio source is gone. Choose another."
++LiveHime.Captions.Hint="Add \"LiveHime captions\" in Sources to show captions on stream. Speech is recognized on this Mac and never uploaded."
++LiveHime.Captions.SourceName="LiveHime captions"
++LiveHime.Captions.Linger="Linger"
++LiveHime.Captions.LingerHint="Seconds a caption stays after speech stops; 0 keeps it."
++LiveHime.Captions.SourceHint="Turn on live captions and choose the audio source in the LiveHime dock's Captions tab."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 4788063a6..4c5a49a20 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -133,3 +133,22 @@ LiveHime.Floating.Opacity="不透明度"
+ LiveHime.Floating.Capturable="允许被屏幕采集"
+ LiveHime.Floating.CapturableTip="关闭时，屏幕采集（以及你的直播画面）中看不到这个窗口。"
+ LiveHime.Floating.Hotkey="直播姬：打开/关闭悬浮聊天"
++LiveHime.Captions.Tab="字幕"
++LiveHime.Captions.Enable="开启语音字幕"
++LiveHime.Captions.Source="音频来源"
++LiveHime.Captions.Language="语言"
++LiveHime.Captions.Lang.zhCN="普通话（简体）"
++LiveHime.Captions.Lang.zhTW="国语（繁体）"
++LiveHime.Captions.Lang.yue="粤语"
++LiveHime.Captions.Lang.en="English"
++LiveHime.Captions.Status.off="未开启"
++LiveHime.Captions.Status.preparing="正在准备语音模型…"
++LiveHime.Captions.Status.listening="正在识别"
++LiveHime.Captions.Status.failed="语音字幕出错"
++LiveHime.Captions.Status.unsupported="语音字幕需要 macOS 26 或更高版本。"
++LiveHime.Captions.Status.noSource="找不到所选的音频来源，请重新选择。"
++LiveHime.Captions.Hint="在「来源」里添加「直播姬字幕」，字幕就会出现在直播画面上。语音只在这台 Mac 上识别，不会上传。"
++LiveHime.Captions.SourceName="直播姬字幕"
++LiveHime.Captions.Linger="停留时间"
++LiveHime.Captions.LingerHint="说完之后字幕保留的秒数；设为 0 时一直保留。"
++LiveHime.Captions.SourceHint="在直播姬面板的「字幕」页开启语音字幕并选择音频来源。"
+diff --git a/plugins/livehime/src/account-panel.cpp b/plugins/livehime/src/account-panel.cpp
+index 4eb026f3a..c6ec7c251 100644
+--- a/plugins/livehime/src/account-panel.cpp
++++ b/plugins/livehime/src/account-panel.cpp
+@@ -194,6 +194,11 @@ void AccountPanel::applyEvent(const QJsonObject &event)
+ 		     event.value("message").toString().toUtf8().constData());
+ 		return;
+ 	}
++	if (name == "caption") {
++		/* Several per second while someone speaks: forward, don't log. */
++		emit eventReceived(event);
++		return;
++	}
+ 	blog(LOG_INFO, "[livehime] live event -> %s", name.toUtf8().constData());
+ 
+ 	if (name == "sessionMaintenance") {
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 3c98d85e7..179b30476 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -1,5 +1,8 @@
+ #include "automation.hpp"
+ #include "account-panel.hpp"
++#include "caption-controller.hpp"
++#include "caption-overlay.hpp"
++#include "captions-page.hpp"
+ #include "danmaku-overlay.hpp"
+ #include "feature-panel.hpp"
+ #include "floating-chat.hpp"
+@@ -169,6 +172,26 @@ void floatingChat(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
++/* Live captions for tests: optional {"enabled","source" (name),"locale"}
++ * applies like the Captions tab; replies with the state, the current
++ * caption and what the first "LiveHime captions" source shows. */
++void captions(obs_data_t *request, obs_data_t *response, void *)
++{
++	onUiThread([&] {
++		CaptionsPage *page = target->features()->captions();
++		if (obs_data_has_user_value(request, "enabled"))
++			page->setSelection(obs_data_get_bool(request, "enabled"),
++					   QString::fromUtf8(obs_data_get_string(request, "source")),
++					   QString::fromUtf8(obs_data_get_string(request, "locale")));
++		obs_data_set_bool(response, "supported", CaptionController::supported());
++		obs_data_set_bool(response, "enabled", page->controller()->enabled());
++		obs_data_set_string(response, "status", page->statusText().toUtf8().constData());
++		obs_data_set_string(response, "caption", page->currentCaption().toUtf8().constData());
++		const QString shown = CaptionOverlayHub::instance() ? CaptionOverlayHub::instance()->shownText() : QString();
++		obs_data_set_string(response, "overlay", shown.toUtf8().constData());
++	});
++}
++
+ /* Hosted Bilibili pages for tests: {"open":"cover"} opens the cover
+  * manager; {"page","script"} evaluates an async function body there and
+  * returns its JSON as "result"; {"page","click":{"x","y"}} clicks at page
+@@ -249,6 +272,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "StartQRLogin", startQRLogin, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "CancelQRLogin", cancelQRLogin, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "HostedPage", hostedPage, nullptr);
++	obs_websocket_vendor_register_request(vendor, "Captions", captions, nullptr);
+ }
+ 
+ void UnregisterAutomation()
+@@ -264,6 +288,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "StartQRLogin");
+ 		obs_websocket_vendor_unregister_request(vendor, "CancelQRLogin");
+ 		obs_websocket_vendor_unregister_request(vendor, "HostedPage");
++		obs_websocket_vendor_unregister_request(vendor, "Captions");
+ 		vendor = nullptr;
+ 	}
+ 	target.clear();
+diff --git a/plugins/livehime/src/caption-controller.cpp b/plugins/livehime/src/caption-controller.cpp
+new file mode 100644
+index 000000000..a00b9d94e
+--- /dev/null
++++ b/plugins/livehime/src/caption-controller.cpp
+@@ -0,0 +1,161 @@
++#include "caption-controller.hpp"
++#include "plugin-settings.hpp"
++
++#include <livehime-core.h>
++#include <obs-frontend-api.h>
++#include <obs-module.h>
++
++#include <QMetaObject>
++
++CaptionController::CaptionController(QObject *parent) : QObject(parent)
++{
++	signal_handler_connect(obs_get_signal_handler(), "source_remove", &CaptionController::sourceRemoved, this);
++	obs_frontend_add_event_callback(&CaptionController::frontendEvent, this);
++	load();
++}
++
++CaptionController::~CaptionController()
++{
++	obs_frontend_remove_event_callback(&CaptionController::frontendEvent, this);
++	signal_handler_disconnect(obs_get_signal_handler(), "source_remove", &CaptionController::sourceRemoved, this);
++	stop();
++}
++
++/* Sources exist only once the scene collection has loaded; a collection
++ * switch replaces them. */
++void CaptionController::frontendEvent(enum obs_frontend_event event, void *param)
++{
++	auto *self = static_cast<CaptionController *>(param);
++	switch (event) {
++	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
++	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
++		self->stop();
++		if (self->enabled_)
++			self->start();
++		break;
++	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
++	case OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN:
++		self->stop();
++		break;
++	default:
++		break;
++	}
++}
++
++bool CaptionController::supported()
++{
++	return livehime_core_captions_supported() != 0;
++}
++
++void CaptionController::configure(bool enabled, const QString &sourceUuid, const QString &locale)
++{
++	const bool restart = enabled != enabled_ || sourceUuid != sourceUuid_ || locale != locale_;
++	enabled_ = enabled;
++	sourceUuid_ = sourceUuid;
++	locale_ = locale.isEmpty() ? QStringLiteral("zh-CN") : locale;
++	save();
++	if (!restart)
++		return;
++	stop();
++	if (enabled_)
++		start();
++}
++
++void CaptionController::start()
++{
++	if (!supported()) {
++		livehime_core_captions_start(locale_.toUtf8().constData()); /* reports "unsupported" */
++		return;
++	}
++	OBSSourceAutoRelease source = obs_get_source_by_uuid(sourceUuid_.toUtf8().constData());
++	if (!source) {
++		blog(LOG_INFO, "[livehime] captions: audio source not found");
++		emit sourceLost();
++		return;
++	}
++	source_ = source.Get();
++	livehime_core_captions_start(locale_.toUtf8().constData());
++	obs_source_add_audio_capture_callback(source_, &CaptionController::audioCallback, this);
++	blog(LOG_INFO, "[livehime] captions: listening to '%s' (%s)", obs_source_get_name(source_),
++	     locale_.toUtf8().constData());
++}
++
++void CaptionController::stop()
++{
++	if (source_) {
++		obs_source_remove_audio_capture_callback(source_, &CaptionController::audioCallback, this);
++		source_ = nullptr;
++		livehime_core_captions_stop();
++		blog(LOG_INFO, "[livehime] captions: stopped");
++	}
++}
++
++void CaptionController::audioCallback(void *param, obs_source_t *, const struct audio_data *audio, bool muted)
++{
++	auto *self = static_cast<CaptionController *>(param);
++	const audio_t *output = obs_get_audio();
++	const size_t channels = audio_output_get_channels(output);
++	const double rate = audio_output_get_sample_rate(output);
++	const uint32_t frames = audio->frames;
++	if (!frames || !channels)
++		return;
++
++	std::lock_guard lock(self->mixMutex_);
++	self->mono_.assign(frames, 0.0f);
++	if (!muted) {
++		size_t used = 0;
++		for (size_t channel = 0; channel < channels && channel < MAX_AV_PLANES; channel++) {
++			const auto *plane = reinterpret_cast<const float *>(audio->data[channel]);
++			if (!plane)
++				continue;
++			for (uint32_t i = 0; i < frames; i++)
++				self->mono_[i] += plane[i];
++			used++;
++		}
++		if (used > 1) {
++			for (float &sample : self->mono_)
++				sample /= static_cast<float>(used);
++		}
++	}
++	livehime_core_captions_push(self->mono_.data(), static_cast<int>(frames), rate);
++}
++
++void CaptionController::sourceRemoved(void *param, calldata_t *data)
++{
++	auto *self = static_cast<CaptionController *>(param);
++	obs_source_t *removed = static_cast<obs_source_t *>(calldata_ptr(data, "source"));
++	const QString uuid = QString::fromUtf8(obs_source_get_uuid(removed));
++	QMetaObject::invokeMethod(
++		self,
++		[self, uuid] {
++			if (uuid != self->sourceUuid_ || !self->source_)
++				return;
++			self->stop();
++			emit self->sourceLost();
++		},
++		Qt::QueuedConnection);
++}
++
++void CaptionController::load()
++{
++	OBSDataAutoRelease settings = LoadPluginSettings();
++	OBSDataAutoRelease captions = obs_data_get_obj(settings, "captions");
++	if (!captions)
++		return;
++	enabled_ = obs_data_get_bool(captions, "enabled");
++	sourceUuid_ = QString::fromUtf8(obs_data_get_string(captions, "source_uuid"));
++	const QString locale = QString::fromUtf8(obs_data_get_string(captions, "locale"));
++	if (!locale.isEmpty())
++		locale_ = locale;
++}
++
++void CaptionController::save() const
++{
++	OBSDataAutoRelease captions = obs_data_create();
++	obs_data_set_bool(captions, "enabled", enabled_);
++	obs_data_set_string(captions, "source_uuid", sourceUuid_.toUtf8().constData());
++	obs_data_set_string(captions, "locale", locale_.toUtf8().constData());
++	OBSDataAutoRelease changes = obs_data_create();
++	obs_data_set_obj(changes, "captions", captions);
++	SavePluginSettings(changes);
++}
+diff --git a/plugins/livehime/src/caption-controller.hpp b/plugins/livehime/src/caption-controller.hpp
+new file mode 100644
+index 000000000..45f622bae
+--- /dev/null
++++ b/plugins/livehime/src/caption-controller.hpp
+@@ -0,0 +1,51 @@
++#pragma once
++
++#include <obs-frontend-api.h>
++#include <obs.hpp>
++
++#include <QObject>
++#include <QString>
++
++#include <mutex>
++#include <vector>
++
++/* Feeds one OBS audio source (usually the microphone) to the core's live
++ * captioner. The source's audio is taken after its filters, mixed down to
++ * mono; while the source is muted, silence is sent so sentences still end.
++ * Settings live in features.json under "captions". */
++class CaptionController : public QObject {
++	Q_OBJECT
++
++public:
++	explicit CaptionController(QObject *parent = nullptr);
++	~CaptionController() override;
++
++	static bool supported();
++
++	bool enabled() const { return enabled_; }
++	QString sourceUuid() const { return sourceUuid_; }
++	QString locale() const { return locale_; }
++
++	/* Applies and saves; restarts recognition as needed. */
++	void configure(bool enabled, const QString &sourceUuid, const QString &locale);
++
++signals:
++	/* The selected source was removed from OBS; captions stopped. */
++	void sourceLost();
++
++private:
++	void start();
++	void stop();
++	void load();
++	void save() const;
++	static void audioCallback(void *param, obs_source_t *source, const struct audio_data *audio, bool muted);
++	static void sourceRemoved(void *param, calldata_t *data);
++	static void frontendEvent(enum obs_frontend_event event, void *param);
++
++	bool enabled_ = false;
++	QString sourceUuid_;
++	QString locale_ = QStringLiteral("zh-CN");
++	OBSSource source_;
++	std::mutex mixMutex_;
++	std::vector<float> mono_;
++};
+diff --git a/plugins/livehime/src/caption-overlay.cpp b/plugins/livehime/src/caption-overlay.cpp
+new file mode 100644
+index 000000000..458ebaadd
+--- /dev/null
++++ b/plugins/livehime/src/caption-overlay.cpp
+@@ -0,0 +1,279 @@
++#include "caption-overlay.hpp"
++
++#include <obs-module.h>
++#include <obs.hpp>
++
++#include <QDateTime>
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++
++namespace {
++constexpr int kDefaultLines = 2;
++constexpr int kDefaultLinger = 4;
++constexpr int kDefaultWidth = 1200;
++constexpr int kDefaultFontSize = 48;
++constexpr const char *kDefaultFace = "Hiragino Sans GB"; /* see danmaku-overlay.cpp */
++
++/* Rough width of a character in ems: CJK glyphs are square, Latin about half. */
++double charWidth(QChar c)
++{
++	return c.unicode() >= 0x2E80 ? 1.0 : 0.55;
++}
++} // namespace
++
++struct CaptionOverlay {
++	obs_source_t *label = nullptr; /* private text_ft2_source_v2 */
++	std::atomic<int> width{kDefaultWidth};
++	std::atomic<int> height{kDefaultLines * kDefaultFontSize * 4 / 3};
++
++	/* Touched on the UI thread only (hub). */
++	int maxLines = kDefaultLines;
++	int lingerSeconds = kDefaultLinger;
++	int fontSize = kDefaultFontSize;
++	QString shown;
++};
++
++CaptionOverlayHub *CaptionOverlayHub::instance_ = nullptr;
++
++CaptionOverlayHub::CaptionOverlayHub()
++{
++	timer_.setInterval(150);
++	connect(&timer_, &QTimer::timeout, this, &CaptionOverlayHub::refresh);
++	timer_.start();
++}
++
++void CaptionOverlayHub::create()
++{
++	if (!instance_)
++		instance_ = new CaptionOverlayHub();
++}
++
++void CaptionOverlayHub::destroy()
++{
++	delete instance_;
++	instance_ = nullptr;
++}
++
++void CaptionOverlayHub::add(CaptionOverlay *overlay)
++{
++	std::lock_guard lock(mutex_);
++	overlays_.insert(overlay);
++}
++
++void CaptionOverlayHub::remove(CaptionOverlay *overlay)
++{
++	std::lock_guard lock(mutex_);
++	overlays_.erase(overlay);
++}
++
++QString CaptionOverlayHub::shownText()
++{
++	std::lock_guard lock(mutex_);
++	return overlays_.empty() ? QString() : (*overlays_.begin())->shown;
++}
++
++void CaptionOverlayHub::push(const QJsonObject &event)
++{
++	const QString name = event.value("event").toString();
++	if (name == "captions") {
++		const QString status = event.value("status").toString();
++		if (status == "stopped" || status == "failed") {
++			finished_.clear();
++			partial_.clear();
++		}
++		return;
++	}
++	if (name != "caption")
++		return;
++	const QString text = event.value("text").toString();
++	if (event.value("final").toBool()) {
++		/* Keep only a little finished text: the box shows the tail. */
++		finished_ = (finished_ + text).right(200);
++		partial_.clear();
++	} else {
++		partial_ = text;
++	}
++	updatedMs_ = QDateTime::currentMSecsSinceEpoch();
++}
++
++void CaptionOverlayHub::refresh()
++{
++	const qint64 now = QDateTime::currentMSecsSinceEpoch();
++	std::lock_guard lock(mutex_);
++	for (CaptionOverlay *overlay : overlays_) {
++		QString text = finished_ + partial_;
++		if (overlay->lingerSeconds > 0 && now - updatedMs_ > overlay->lingerSeconds * 1000LL)
++			text.clear();
++
++		/* Keep the words that fit in maxLines rows, cutting from the front
++		 * (at punctuation when one is close), and pad from the top so the
++		 * text sits on the bottom row like a subtitle. */
++		const double perRow = std::max(4.0, overlay->width.load() / double(std::max(overlay->fontSize, 1)));
++		const double capacity = perRow * overlay->maxLines;
++		double used = 0;
++		int start = text.size();
++		while (start > 0 && used + charWidth(text[start - 1]) <= capacity) {
++			used += charWidth(text[start - 1]);
++			start--;
++		}
++		if (start > 0) {
++			for (int i = start; i < std::min<int>(text.size(), start + 8); i++) {
++				if (QStringLiteral("，。！？、；：,.!? ").contains(text[i])) {
++					start = i + 1;
++					break;
++				}
++			}
++			text = text.mid(start);
++		}
++		const int rows = std::max(1, static_cast<int>(std::ceil(used / perRow)));
++		const QString display = text.isEmpty() ? QString()
++						       : QString(std::max(0, overlay->maxLines - rows), QChar('\n')) + text;
++		if (display == overlay->shown)
++			continue;
++		overlay->shown = display;
++		OBSDataAutoRelease update = obs_data_create();
++		obs_data_set_string(update, "text", display.isEmpty() ? " " : display.toUtf8().constData());
++		obs_source_update(overlay->label, update);
++	}
++}
++
++/* ---- obs_source_info ---- */
++
++namespace {
++const char *captionName(void *)
++{
++	return obs_module_text("LiveHime.Captions.SourceName");
++}
++
++void captionUpdate(void *data, obs_data_t *settings)
++{
++	auto *overlay = static_cast<CaptionOverlay *>(data);
++	OBSDataAutoRelease font = obs_data_get_obj(settings, "font");
++	int fontSize = font ? static_cast<int>(obs_data_get_int(font, "size")) : kDefaultFontSize;
++	if (fontSize <= 0)
++		fontSize = kDefaultFontSize;
++	const int lines = static_cast<int>(obs_data_get_int(settings, "lines"));
++	const int width = static_cast<int>(obs_data_get_int(settings, "width"));
++	overlay->width = width;
++	overlay->height = lines * fontSize * 4 / 3;
++
++	if (CaptionOverlayHub *hub = CaptionOverlayHub::instance()) {
++		hub->remove(overlay);
++		overlay->maxLines = lines;
++		overlay->lingerSeconds = static_cast<int>(obs_data_get_int(settings, "linger"));
++		overlay->fontSize = fontSize;
++		overlay->shown = QStringLiteral("\x01"); /* redraw with the new layout */
++		hub->add(overlay);
++	}
++
++	OBSDataAutoRelease label = obs_data_create();
++	OBSDataAutoRelease labelFont = obs_data_create();
++	obs_data_set_string(labelFont, "face", font ? obs_data_get_string(font, "face") : kDefaultFace);
++	obs_data_set_string(labelFont, "style", font ? obs_data_get_string(font, "style") : "");
++	obs_data_set_int(labelFont, "size", fontSize);
++	obs_data_set_int(labelFont, "flags", font ? obs_data_get_int(font, "flags") : 0);
++	obs_data_set_obj(label, "font", labelFont);
++	const long long color = obs_data_get_int(settings, "color");
++	obs_data_set_int(label, "color1", color);
++	obs_data_set_int(label, "color2", color);
++	obs_data_set_bool(label, "outline", obs_data_get_bool(settings, "outline"));
++	obs_data_set_bool(label, "drop_shadow", obs_data_get_bool(settings, "drop_shadow"));
++	obs_data_set_bool(label, "word_wrap", true);
++	obs_data_set_int(label, "custom_width", width);
++	obs_source_update(overlay->label, label);
++}
++
++void *captionCreate(obs_data_t *settings, obs_source_t *)
++{
++	auto *overlay = new CaptionOverlay();
++	OBSDataAutoRelease label = obs_data_create();
++	obs_data_set_string(label, "text", " ");
++	overlay->label = obs_source_create_private("text_ft2_source_v2", "livehime-caption-text", label);
++	if (!overlay->label) {
++		delete overlay;
++		return nullptr;
++	}
++	captionUpdate(overlay, settings);
++	return overlay;
++}
++
++void captionDestroy(void *data)
++{
++	auto *overlay = static_cast<CaptionOverlay *>(data);
++	if (CaptionOverlayHub *hub = CaptionOverlayHub::instance())
++		hub->remove(overlay);
++	obs_source_release(overlay->label);
++	delete overlay;
++}
++
++uint32_t captionWidth(void *data)
++{
++	return static_cast<uint32_t>(static_cast<CaptionOverlay *>(data)->width.load());
++}
++
++uint32_t captionHeight(void *data)
++{
++	return static_cast<uint32_t>(static_cast<CaptionOverlay *>(data)->height.load());
++}
++
++void captionRender(void *data, gs_effect_t *)
++{
++	obs_source_video_render(static_cast<CaptionOverlay *>(data)->label);
++}
++
++void captionDefaults(obs_data_t *settings)
++{
++	OBSDataAutoRelease font = obs_data_create();
++	obs_data_set_default_string(font, "face", kDefaultFace);
++	obs_data_set_default_int(font, "size", kDefaultFontSize);
++	obs_data_set_default_int(font, "flags", 0);
++	obs_data_set_default_string(font, "style", "W6");
++	obs_data_set_default_obj(settings, "font", font);
++	obs_data_set_default_int(settings, "lines", kDefaultLines);
++	obs_data_set_default_int(settings, "linger", kDefaultLinger);
++	obs_data_set_default_int(settings, "width", kDefaultWidth);
++	obs_data_set_default_int(settings, "color", 0xFFFFFFFF);
++	obs_data_set_default_bool(settings, "outline", true);
++	obs_data_set_default_bool(settings, "drop_shadow", true);
++}
++
++obs_properties_t *captionProperties(void *)
++{
++	obs_properties_t *props = obs_properties_create();
++	obs_properties_add_font(props, "font", obs_module_text("LiveHime.Overlay.Font"));
++	obs_properties_add_color_alpha(props, "color", obs_module_text("LiveHime.Overlay.Color"));
++	obs_properties_add_bool(props, "outline", obs_module_text("LiveHime.Overlay.Outline"));
++	obs_properties_add_bool(props, "drop_shadow", obs_module_text("LiveHime.Overlay.Shadow"));
++	obs_properties_add_int_slider(props, "lines", obs_module_text("LiveHime.Overlay.Lines"), 1, 6, 1);
++	obs_property_t *width =
++		obs_properties_add_int(props, "width", obs_module_text("LiveHime.Overlay.Width"), 200, 3840, 10);
++	obs_property_int_set_suffix(width, " px");
++	obs_property_t *linger =
++		obs_properties_add_int(props, "linger", obs_module_text("LiveHime.Captions.Linger"), 0, 60, 1);
++	obs_property_int_set_suffix(linger, " s");
++	obs_property_set_long_description(linger, obs_module_text("LiveHime.Captions.LingerHint"));
++	obs_properties_add_text(props, "hint", obs_module_text("LiveHime.Captions.SourceHint"), OBS_TEXT_INFO);
++	return props;
++}
++} // namespace
++
++void RegisterCaptionOverlaySource()
++{
++	obs_source_info info = {};
++	info.id = "livehime_captions";
++	info.type = OBS_SOURCE_TYPE_INPUT;
++	info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW;
++	info.icon_type = OBS_ICON_TYPE_TEXT;
++	info.get_name = captionName;
++	info.create = captionCreate;
++	info.destroy = captionDestroy;
++	info.update = captionUpdate;
++	info.get_width = captionWidth;
++	info.get_height = captionHeight;
++	info.video_render = captionRender;
++	info.get_defaults = captionDefaults;
++	info.get_properties = captionProperties;
++	obs_register_source(&info);
++}
+diff --git a/plugins/livehime/src/caption-overlay.hpp b/plugins/livehime/src/caption-overlay.hpp
+new file mode 100644
+index 000000000..5cff72915
+--- /dev/null
++++ b/plugins/livehime/src/caption-overlay.hpp
+@@ -0,0 +1,45 @@
++#pragma once
++
++#include <QJsonObject>
++#include <QObject>
++#include <QTimer>
++
++#include <mutex>
++#include <set>
++
++struct CaptionOverlay;
++
++/* "LiveHime captions" OBS source: shows the live caption on the canvas,
++ * bottom-aligned, keeping the most recent words when the sentence is longer
++ * than the box. Like the danmaku overlay it wraps a private FreeType text
++ * source; this hub receives caption events on the UI thread. */
++class CaptionOverlayHub : public QObject {
++	Q_OBJECT
++
++public:
++	static void create();
++	static void destroy();
++	static CaptionOverlayHub *instance() { return instance_; }
++
++	void add(CaptionOverlay *overlay);
++	void remove(CaptionOverlay *overlay);
++	/* What the first overlay currently shows (tests). */
++	QString shownText();
++
++public slots:
++	void push(const QJsonObject &event);
++
++private:
++	CaptionOverlayHub();
++	void refresh();
++
++	static CaptionOverlayHub *instance_;
++	std::mutex mutex_;
++	std::set<CaptionOverlay *> overlays_;
++	QTimer timer_;
++	QString finished_; /* recent finished sentences */
++	QString partial_;  /* the sentence being spoken */
++	qint64 updatedMs_ = 0;
++};
++
++void RegisterCaptionOverlaySource();
+diff --git a/plugins/livehime/src/captions-page.cpp b/plugins/livehime/src/captions-page.cpp
+new file mode 100644
+index 000000000..62e7bddaa
+--- /dev/null
++++ b/plugins/livehime/src/captions-page.cpp
+@@ -0,0 +1,194 @@
++#include "captions-page.hpp"
++#include "caption-controller.hpp"
++
++#include <obs-module.h>
++#include <obs.hpp>
++
++#include <QCheckBox>
++#include <QComboBox>
++#include <QFormLayout>
++#include <QLabel>
++#include <QSignalBlocker>
++#include <QVBoxLayout>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++} // namespace
++
++CaptionsPage::CaptionsPage(QWidget *parent) : QWidget(parent)
++{
++	controller_ = new CaptionController(this);
++
++	enabled_ = new QCheckBox(text("LiveHime.Captions.Enable"), this);
++	source_ = new QComboBox(this);
++	source_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
++	locale_ = new QComboBox(this);
++	for (const auto &[label, code] : {std::pair{"LiveHime.Captions.Lang.zhCN", "zh-CN"},
++					  std::pair{"LiveHime.Captions.Lang.zhTW", "zh-TW"},
++					  std::pair{"LiveHime.Captions.Lang.yue", "yue-CN"},
++					  std::pair{"LiveHime.Captions.Lang.en", "en-US"}})
++		locale_->addItem(text(label), QString::fromLatin1(code));
++	status_ = new QLabel(this);
++	status_->setWordWrap(true);
++	preview_ = new QLabel(this);
++	preview_->setWordWrap(true);
++	preview_->setMinimumHeight(64);
++	preview_->setAlignment(Qt::AlignLeft | Qt::AlignBottom);
++	preview_->setStyleSheet(QStringLiteral(
++		"QLabel { background: #1d2025; border: 1px solid #3a3f48; border-radius: 6px; padding: 8px; font-size: 15px; }"));
++	auto *hint = new QLabel(text("LiveHime.Captions.Hint"), this);
++	hint->setWordWrap(true);
++	hint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++
++	auto *form = new QFormLayout;
++	form->addRow(text("LiveHime.Captions.Source"), source_);
++	form->addRow(text("LiveHime.Captions.Language"), locale_);
++	auto *layout = new QVBoxLayout(this);
++	layout->setContentsMargins(0, 6, 0, 0);
++	layout->addWidget(enabled_);
++	layout->addLayout(form);
++	layout->addWidget(status_);
++	layout->addWidget(preview_);
++	layout->addWidget(hint);
++	layout->addStretch(1);
++
++	refreshSources();
++	{
++		QSignalBlocker blockEnabled(enabled_);
++		QSignalBlocker blockLocale(locale_);
++		enabled_->setChecked(controller_->enabled());
++		const int localeIndex = locale_->findData(controller_->locale());
++		locale_->setCurrentIndex(localeIndex >= 0 ? localeIndex : 0);
++	}
++	if (!CaptionController::supported()) {
++		enabled_->setEnabled(false);
++		source_->setEnabled(false);
++		locale_->setEnabled(false);
++		setStatus("LiveHime.Captions.Status.unsupported", true);
++	} else {
++		setStatus(controller_->enabled() ? "LiveHime.Captions.Status.preparing" : "LiveHime.Captions.Status.off");
++	}
++
++	connect(enabled_, &QCheckBox::toggled, this, &CaptionsPage::apply);
++	connect(source_, &QComboBox::activated, this, &CaptionsPage::apply);
++	connect(locale_, &QComboBox::activated, this, &CaptionsPage::apply);
++	connect(controller_, &CaptionController::sourceLost, this,
++		[this] { setStatus("LiveHime.Captions.Status.noSource", true); });
++}
++
++void CaptionsPage::showEvent(QShowEvent *event)
++{
++	QWidget::showEvent(event);
++	refreshSources();
++}
++
++void CaptionsPage::refreshSources()
++{
++	const QString selected = controller_->sourceUuid();
++	QSignalBlocker block(source_);
++	source_->clear();
++	struct Found {
++		QList<std::pair<QString, QString>> items;
++	} found;
++	obs_enum_sources(
++		[](void *param, obs_source_t *source) {
++			if (obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO) {
++				static_cast<Found *>(param)->items.append({QString::fromUtf8(obs_source_get_name(source)),
++									   QString::fromUtf8(obs_source_get_uuid(source))});
++			}
++			return true;
++		},
++		&found);
++	int current = -1, microphone = -1;
++	for (const auto &[name, uuid] : found.items) {
++		source_->addItem(name, uuid);
++		if (uuid == selected)
++			current = source_->count() - 1;
++		OBSSourceAutoRelease source = obs_get_source_by_uuid(uuid.toUtf8().constData());
++		if (microphone < 0 && source && QString::fromUtf8(obs_source_get_id(source)).contains("input_capture"))
++			microphone = source_->count() - 1;
++	}
++	/* Default to the microphone. */
++	source_->setCurrentIndex(current >= 0 ? current : (microphone >= 0 ? microphone : 0));
++}
++
++void CaptionsPage::apply()
++{
++	finished_.clear();
++	partial_.clear();
++	preview_->clear();
++	const QString uuid = source_->currentData().toString();
++	if (enabled_->isChecked() && uuid.isEmpty()) {
++		setStatus("LiveHime.Captions.Status.noSource", true);
++		return;
++	}
++	if (enabled_->isChecked())
++		setStatus("LiveHime.Captions.Status.preparing");
++	controller_->configure(enabled_->isChecked(), uuid, locale_->currentData().toString());
++	if (!enabled_->isChecked())
++		setStatus("LiveHime.Captions.Status.off");
++}
++
++void CaptionsPage::handleEvent(const QJsonObject &event)
++{
++	const QString name = event.value("event").toString();
++	if (name == "captions") {
++		const QString status = event.value("status").toString();
++		if (status == "stopped") {
++			if (!controller_->enabled())
++				setStatus("LiveHime.Captions.Status.off");
++			return;
++		}
++		const QByteArray key = "LiveHime.Captions.Status." + status.toUtf8();
++		setStatus(key.constData(), status == "failed" || status == "unsupported");
++		if (status == "failed" && !event.value("message").toString().isEmpty())
++			status_->setText(status_->text() + QStringLiteral("\n") + event.value("message").toString());
++		return;
++	}
++	if (name != "caption")
++		return;
++	if (event.value("final").toBool()) {
++		finished_ = (finished_ + event.value("text").toString()).right(120);
++		partial_.clear();
++	} else {
++		partial_ = event.value("text").toString();
++	}
++	preview_->setText(currentCaption().right(80));
++}
++
++QString CaptionsPage::statusText() const
++{
++	return status_->text();
++}
++
++void CaptionsPage::setSelection(bool enabled, const QString &sourceName, const QString &locale)
++{
++	refreshSources();
++	if (!sourceName.isEmpty()) {
++		const int index = source_->findText(sourceName);
++		if (index >= 0)
++			source_->setCurrentIndex(index);
++	}
++	if (!locale.isEmpty()) {
++		const int index = locale_->findData(locale);
++		if (index >= 0)
++			locale_->setCurrentIndex(index);
++	}
++	QSignalBlocker block(enabled_);
++	enabled_->setChecked(enabled);
++	apply();
++}
++
++QString CaptionsPage::currentCaption() const
++{
++	return finished_ + partial_;
++}
++
++void CaptionsPage::setStatus(const QString &key, bool error)
++{
++	status_->setText(text(key.toUtf8().constData()));
++	status_->setStyleSheet(error ? QStringLiteral("color: #e06c75;") : QStringLiteral("color: #9aa0ab;"));
++}
+diff --git a/plugins/livehime/src/captions-page.hpp b/plugins/livehime/src/captions-page.hpp
+new file mode 100644
+index 000000000..39cedbc62
+--- /dev/null
++++ b/plugins/livehime/src/captions-page.hpp
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <QJsonObject>
++#include <QWidget>
++
++class CaptionController;
++class QCheckBox;
++class QComboBox;
++class QLabel;
++
++/* The dock's "Captions" tab: turn live captions on, pick the audio source
++ * and language, see the status and the current caption. Works signed out;
++ * nothing leaves the Mac. */
++class CaptionsPage : public QWidget {
++	Q_OBJECT
++
++public:
++	explicit CaptionsPage(QWidget *parent = nullptr);
++
++	CaptionController *controller() { return controller_; }
++	void handleEvent(const QJsonObject &event);
++	/* Rebuilds the audio source list (sources come and go). */
++	void refreshSources();
++	QString currentCaption() const;
++	QString statusText() const;
++	/* Automation: same as using the controls. */
++	void setSelection(bool enabled, const QString &sourceName, const QString &locale);
++
++protected:
++	void showEvent(QShowEvent *event) override;
++
++private:
++	void apply();
++	void setStatus(const QString &key, bool error = false);
++
++	CaptionController *controller_;
++	QCheckBox *enabled_;
++	QComboBox *source_;
++	QComboBox *locale_;
++	QLabel *status_;
++	QLabel *preview_;
++	QString finished_;
++	QString partial_;
++};
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 1892a5c3b..81ab23394 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -1,4 +1,5 @@
+ #include "feature-panel.hpp"
++#include "captions-page.hpp"
+ #include "danmaku-feed.hpp"
+ #include "floating-chat.hpp"
+ #include "plugin-settings.hpp"
+@@ -139,9 +140,15 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	roomScroll->setWidgetResizable(true);
+ 	roomScroll->setFrameShape(QFrame::NoFrame);
+ 
++	/* Captions tab: works without signing in. */
++	captions_ = new CaptionsPage(this);
++
++	danmakuPage_ = danmakuPage;
++	roomPage_ = roomScroll;
+ 	tabs_ = new QTabWidget(this);
+ 	tabs_->addTab(danmakuPage, text("LiveHime.Feature.DanmakuTab"));
+ 	tabs_->addTab(roomScroll, text("LiveHime.Feature.RoomTab"));
++	tabs_->addTab(captions_, text("LiveHime.Captions.Tab"));
+ 
+ 	auto *layout = new QVBoxLayout(this);
+ 	layout->setContentsMargins(0, 0, 0, 0);
+@@ -181,7 +188,8 @@ void FeaturePanel::applyState(const QJsonObject &state)
+ 			keywordsLoaded_ = false;
+ 		}
+ 	}
+-	tabs_->setEnabled(ready);
++	danmakuPage_->setEnabled(ready);
++	roomPage_->setEnabled(ready);
+ 	feed_->setReady(ready);
+ 	floating_->feed()->setReady(ready);
+ 	if (ready && !keywordsLoaded_) {
+@@ -195,6 +203,10 @@ void FeaturePanel::applyState(const QJsonObject &state)
+ void FeaturePanel::applyEvent(const QJsonObject &event)
+ {
+ 	const QString name = event.value("event").toString();
++	if (name == "caption" || name == "captions") {
++		captions_->handleEvent(event);
++		return;
++	}
+ 	feed_->handleEvent(event);
+ 	floating_->feed()->handleEvent(event);
+ 	if (name == "room") {
+diff --git a/plugins/livehime/src/feature-panel.hpp b/plugins/livehime/src/feature-panel.hpp
+index 6b7e30ccd..e6aea64d0 100644
+--- a/plugins/livehime/src/feature-panel.hpp
++++ b/plugins/livehime/src/feature-panel.hpp
+@@ -3,6 +3,7 @@
+ #include <QJsonObject>
+ #include <QWidget>
+ 
++class CaptionsPage;
+ class DanmakuFeed;
+ class FloatingChat;
+ class QCheckBox;
+@@ -24,6 +25,7 @@ public:
+ 	explicit FeaturePanel(QWidget *parent = nullptr);
+ 
+ 	FloatingChat *floatingChat() { return floating_; }
++	CaptionsPage *captions() { return captions_; }
+ 
+ public slots:
+ 	void applyState(const QJsonObject &state);
+@@ -46,6 +48,9 @@ private:
+ 
+ 	QLabel *stats_;
+ 	QTabWidget *tabs_;
++	QWidget *danmakuPage_;
++	QWidget *roomPage_;
++	CaptionsPage *captions_;
+ 	DanmakuFeed *feed_;
+ 	FloatingChat *floating_;
+ 	QPushButton *floatingButton_;
+diff --git a/plugins/livehime/src/plugin-main.cpp b/plugins/livehime/src/plugin-main.cpp
+index d43d1023c..c7bc971a0 100644
+--- a/plugins/livehime/src/plugin-main.cpp
++++ b/plugins/livehime/src/plugin-main.cpp
+@@ -5,6 +5,7 @@
+ #include "floating-chat.hpp"
+ #include "plugin-settings.hpp"
+ #include "window-native.hpp"
++#include "caption-overlay.hpp"
+ #include "livehime-dock.hpp"
+ 
+ #include <obs-frontend-api.h>
+@@ -129,6 +130,8 @@ bool obs_module_load(void)
+ {
+ 	DanmakuOverlayHub::create();
+ 	RegisterDanmakuOverlaySource();
++	CaptionOverlayHub::create();
++	RegisterCaptionOverlaySource();
+ 	RegisterCaptureExceptionProcedure();
+ 
+ 	auto *mainWindow = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+@@ -140,6 +143,8 @@ bool obs_module_load(void)
+ 	}
+ 	QObject::connect(dock->account(), &AccountPanel::eventReceived, DanmakuOverlayHub::instance(),
+ 			 &DanmakuOverlayHub::push);
++	QObject::connect(dock->account(), &AccountPanel::eventReceived, CaptionOverlayHub::instance(),
++			 &CaptionOverlayHub::push);
+ 	obs_frontend_add_event_callback(onFrontendEvent, nullptr);
+ 	registerFloatingHotkey();
+ 	blog(LOG_INFO, "[livehime] control dock loaded");
+@@ -158,4 +163,5 @@ void obs_module_unload(void)
+ 		obs_hotkey_unregister(floatingHotkey);
+ 	obs_frontend_remove_event_callback(onFrontendEvent, nullptr);
+ 	DanmakuOverlayHub::destroy();
++	CaptionOverlayHub::destroy();
+ }

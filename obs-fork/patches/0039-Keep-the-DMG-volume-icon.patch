@@ -1,0 +1,43 @@
+From 7cc01c7705d67ad199eed797a8ec50f0c394fcde Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 17:41:04 +0800
+Subject: [PATCH 39/39] Keep the DMG volume icon
+
+Finder removes a .VolumeIcon.icns that is present while it lays the DMG
+window out, so the volume showed the generic disk icon. Add the icon and
+its custom-icon flag after the layout step.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/package-dmg.sh | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/build-aux/livehime/package-dmg.sh b/build-aux/livehime/package-dmg.sh
+index 76fee5645..901f9cd6f 100755
+--- a/build-aux/livehime/package-dmg.sh
++++ b/build-aux/livehime/package-dmg.sh
+@@ -18,12 +18,11 @@ icon="$work/root/LiveHimeMacApp.app/Contents/Resources/AppIcon.icns"
+ swift "$here/dmg/background.swift" "$work/bg.png" 1 "$icon" "$version"
+ swift "$here/dmg/background.swift" "$work/bg@2x.png" 2 "$icon" "$version"
+ tiffutil -cathidpicheck "$work/bg.png" "$work/bg@2x.png" -out "$work/root/.background/background.tiff" 2>/dev/null
+-cp "$icon" "$work/root/.VolumeIcon.icns"
++cp "$icon" "$work/VolumeIcon.icns"
+ 
+ hdiutil detach "/Volumes/$volume" -quiet 2>/dev/null || true
+ hdiutil create -quiet -volname "$volume" -srcfolder "$work/root" -fs HFS+ -format UDRW -size 400m "$work/rw.dmg"
+ hdiutil attach -quiet -readwrite -noverify -noautoopen "$work/rw.dmg"
+-SetFile -a C "/Volumes/$volume"
+ 
+ # Window: 640 x 440 content, no toolbar, icons at the background's spots.
+ osascript <<OSA
+@@ -47,6 +46,10 @@ tell application "Finder"
+   end tell
+ end tell
+ OSA
++# Finder drops a volume icon present while it lays the window out; add it
++# afterwards.
++cp "$work/VolumeIcon.icns" "/Volumes/$volume/.VolumeIcon.icns"
++SetFile -a C "/Volumes/$volume"
+ sync
+ rm -rf "/Volumes/$volume/.fseventsd"
+ hdiutil detach -quiet "/Volumes/$volume"

@@ -1,0 +1,360 @@
+From b26cd4b413c74d77443230a6462d8c24a08a3ffc Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:33:16 +0800
+Subject: [PATCH 33/39] Captions: show a muted source, keep status, one start
+ at launch
+
+- The Captions tab says when the audio source is muted (silence is sent
+  then, so no captions appear) instead of looking stuck.
+- Choosing the same settings again no longer resets the status to
+  "preparing"; nothing restarts, so no new status would arrive.
+- OBS sends SCENE_COLLECTION_CHANGED during startup as well; start once,
+  at FINISHED_LOADING. Recognizer starts and stops now run one after
+  another.
+- The audio source and language fields fill the row.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/e2e-captions.mjs     | 12 ++++++
+ .../Sources/LiveHimeCore/LiveCaptions.swift   | 40 ++++++++++++-------
+ plugins/livehime/data/locale/en-US.ini        |  1 +
+ plugins/livehime/data/locale/zh-CN.ini        |  1 +
+ plugins/livehime/src/caption-controller.cpp   | 15 ++++++-
+ plugins/livehime/src/caption-controller.hpp   | 10 ++++-
+ plugins/livehime/src/captions-page.cpp        | 38 +++++++++++++-----
+ plugins/livehime/src/captions-page.hpp        |  4 ++
+ 8 files changed, 93 insertions(+), 28 deletions(-)
+
+diff --git a/build-aux/livehime/tests/e2e-captions.mjs b/build-aux/livehime/tests/e2e-captions.mjs
+index a8d19acd0..94e9b66dc 100644
+--- a/build-aux/livehime/tests/e2e-captions.mjs
++++ b/build-aux/livehime/tests/e2e-captions.mjs
+@@ -50,6 +50,18 @@ ws.onmessage = async (ev) => {
+     check('recognized the speech', /欢迎来到我的直播间/.test(st?.caption || ''), st?.caption);
+     check('homophone fixed (直播姬)', /直播姬/.test(st?.caption || ''), st?.caption);
+     check('captions source shows the latest words, bottom-aligned', (st?.overlay || '').replace(/\n/g, '').length > 0 && (st.caption || '').endsWith((st.overlay || '').replace(/^\n+/, '').slice(-6)), JSON.stringify(st?.overlay));
++    // A muted source sends silence; the tab says so.
++    await req('SetInputMute', { inputName: MEDIA, inputMuted: true });
++    await req('TriggerMediaInputAction', { inputName: MEDIA, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART' });
++    await sleep(1500);
++    st = await vendor('Captions');
++    check('muted source is shown in the status', /静音|muted/.test(st?.status), st?.status);
++    await req('SetInputMute', { inputName: MEDIA, inputMuted: false });
++    // Choosing the same settings again keeps the recognizer running.
++    st = await vendor('Captions', { enabled: true, source: MEDIA, locale: 'zh-CN' });
++    await sleep(600);
++    st = await vendor('Captions');
++    check('re-applying the same settings keeps listening', /正在识别|Listening/.test(st?.status), st?.status);
+   } catch (e) { check('run', false, e.stack); }
+   finally {
+     await vendor('Captions', { enabled: before?.enabled ?? false, source: '', locale: '' });
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift b/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
+index 995ba2d23..686220c49 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
+@@ -196,24 +196,26 @@ final class LiveCaptioner: @unchecked Sendable {
+ }
+ 
+ /// The running captioner, shared between the main thread (start / stop)
+-/// and the audio thread (push).
++/// and the audio thread (push). Starts and stops run one after another, so
++/// two recognizers never prepare the language model at the same time.
+ final class CaptionSession: @unchecked Sendable {
+     static let shared = CaptionSession()
+     private let lock = NSLock()
+     private var captioner: AnyObject?
+     private var generation = 0
++    private var chain: Task<Void, Never>?
+ 
+     func start(locale: String) {
+         guard #available(macOS 26, *) else {
+             Self.emit(["event": "captions", "status": "unsupported"])
+             return
+         }
+-        stop()
+-        let id = lock.withLock { () -> Int in
++        let (id, previous, running) = lock.withLock { () -> (Int, LiveCaptioner?, Task<Void, Never>?) in
+             generation += 1
+-            return generation
++            return (generation, self.captioner as? LiveCaptioner, chain)
+         }
+         let captioner = LiveCaptioner(localeIdentifier: locale) { [weak self] event in
++            // Events from a replaced session are dropped.
+             guard let self, self.lock.withLock({ self.generation == id }) else { return }
+             switch event {
+             case .preparing: Self.emit(["event": "captions", "status": "preparing"])
+@@ -223,8 +225,14 @@ final class CaptionSession: @unchecked Sendable {
+             case .failed(let message): Self.emit(["event": "captions", "status": "failed", "message": message])
+             }
+         }
+-        lock.withLock { self.captioner = captioner }
+-        Task { await captioner.start() }
++        lock.withLock {
++            self.captioner = captioner
++            chain = Task {
++                await running?.value
++                await previous?.stop()
++                await captioner.start()
++            }
++        }
+     }
+ 
+     func push(_ samples: UnsafePointer<Float>, count: Int, sampleRate: Double) {
+@@ -235,16 +243,18 @@ final class CaptionSession: @unchecked Sendable {
+ 
+     func stop() {
+         guard #available(macOS 26, *) else { return }
+-        let (captioner, id) = lock.withLock { () -> (LiveCaptioner?, Int) in
+-            defer { self.captioner = nil }
++        lock.withLock {
++            guard let current = self.captioner as? LiveCaptioner else { return }
+             generation += 1
+-            return (self.captioner as? LiveCaptioner, generation)
+-        }
+-        guard let captioner else { return }
+-        Task {
+-            await captioner.stop()
+-            // Unless a new session started meanwhile.
+-            if lock.withLock({ generation == id }) { Self.emit(["event": "captions", "status": "stopped"]) }
++            let id = generation
++            let running = chain
++            self.captioner = nil
++            chain = Task {
++                await running?.value
++                await current.stop()
++                // Unless a new session started meanwhile.
++                if self.lock.withLock({ self.generation == id }) { Self.emit(["event": "captions", "status": "stopped"]) }
++            }
+         }
+     }
+ 
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 21aff3f9b..95796adca 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -152,3 +152,4 @@ LiveHime.Captions.SourceName="LiveHime captions"
+ LiveHime.Captions.Linger="Linger"
+ LiveHime.Captions.LingerHint="Seconds a caption stays after speech stops; 0 keeps it."
+ LiveHime.Captions.SourceHint="Turn on live captions and choose the audio source in the LiveHime dock's Captions tab."
++LiveHime.Captions.Status.muted="Listening (the audio source is muted, so no captions)"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 4c5a49a20..a71dbe362 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -152,3 +152,4 @@ LiveHime.Captions.SourceName="直播姬字幕"
+ LiveHime.Captions.Linger="停留时间"
+ LiveHime.Captions.LingerHint="说完之后字幕保留的秒数；设为 0 时一直保留。"
+ LiveHime.Captions.SourceHint="在直播姬面板的「字幕」页开启语音字幕并选择音频来源。"
++LiveHime.Captions.Status.muted="正在识别（音频来源已静音，暂时没有字幕）"
+diff --git a/plugins/livehime/src/caption-controller.cpp b/plugins/livehime/src/caption-controller.cpp
+index a00b9d94e..e266e1722 100644
+--- a/plugins/livehime/src/caption-controller.cpp
++++ b/plugins/livehime/src/caption-controller.cpp
+@@ -28,7 +28,15 @@ void CaptionController::frontendEvent(enum obs_frontend_event event, void *param
+ 	auto *self = static_cast<CaptionController *>(param);
+ 	switch (event) {
+ 	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
++		self->loaded_ = true;
++		self->stop();
++		if (self->enabled_)
++			self->start();
++		break;
+ 	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
++		/* Also sent during startup, before FINISHED_LOADING. */
++		if (!self->loaded_)
++			break;
+ 		self->stop();
+ 		if (self->enabled_)
+ 			self->start();
+@@ -47,7 +55,7 @@ bool CaptionController::supported()
+ 	return livehime_core_captions_supported() != 0;
+ }
+ 
+-void CaptionController::configure(bool enabled, const QString &sourceUuid, const QString &locale)
++bool CaptionController::configure(bool enabled, const QString &sourceUuid, const QString &locale)
+ {
+ 	const bool restart = enabled != enabled_ || sourceUuid != sourceUuid_ || locale != locale_;
+ 	enabled_ = enabled;
+@@ -55,10 +63,11 @@ void CaptionController::configure(bool enabled, const QString &sourceUuid, const
+ 	locale_ = locale.isEmpty() ? QStringLiteral("zh-CN") : locale;
+ 	save();
+ 	if (!restart)
+-		return;
++		return false;
+ 	stop();
+ 	if (enabled_)
+ 		start();
++	return true;
+ }
+ 
+ void CaptionController::start()
+@@ -85,6 +94,7 @@ void CaptionController::stop()
+ 	if (source_) {
+ 		obs_source_remove_audio_capture_callback(source_, &CaptionController::audioCallback, this);
+ 		source_ = nullptr;
++		muted_ = false;
+ 		livehime_core_captions_stop();
+ 		blog(LOG_INFO, "[livehime] captions: stopped");
+ 	}
+@@ -93,6 +103,7 @@ void CaptionController::stop()
+ void CaptionController::audioCallback(void *param, obs_source_t *, const struct audio_data *audio, bool muted)
+ {
+ 	auto *self = static_cast<CaptionController *>(param);
++	self->muted_ = muted;
+ 	const audio_t *output = obs_get_audio();
+ 	const size_t channels = audio_output_get_channels(output);
+ 	const double rate = audio_output_get_sample_rate(output);
+diff --git a/plugins/livehime/src/caption-controller.hpp b/plugins/livehime/src/caption-controller.hpp
+index 45f622bae..31c29febb 100644
+--- a/plugins/livehime/src/caption-controller.hpp
++++ b/plugins/livehime/src/caption-controller.hpp
+@@ -6,6 +6,7 @@
+ #include <QObject>
+ #include <QString>
+ 
++#include <atomic>
+ #include <mutex>
+ #include <vector>
+ 
+@@ -26,8 +27,11 @@ public:
+ 	QString sourceUuid() const { return sourceUuid_; }
+ 	QString locale() const { return locale_; }
+ 
+-	/* Applies and saves; restarts recognition as needed. */
+-	void configure(bool enabled, const QString &sourceUuid, const QString &locale);
++	/* Applies and saves; restarts recognition when something changed and
++	 * returns whether it did. */
++	bool configure(bool enabled, const QString &sourceUuid, const QString &locale);
++	/* Whether the source is muted (silence is sent then, no captions). */
++	bool sourceMuted() const { return muted_.load(); }
+ 
+ signals:
+ 	/* The selected source was removed from OBS; captions stopped. */
+@@ -43,6 +47,8 @@ private:
+ 	static void frontendEvent(enum obs_frontend_event event, void *param);
+ 
+ 	bool enabled_ = false;
++	bool loaded_ = false; /* the scene collection has loaded */
++	std::atomic<bool> muted_{false};
+ 	QString sourceUuid_;
+ 	QString locale_ = QStringLiteral("zh-CN");
+ 	OBSSource source_;
+diff --git a/plugins/livehime/src/captions-page.cpp b/plugins/livehime/src/captions-page.cpp
+index 62e7bddaa..c6bb5c84c 100644
+--- a/plugins/livehime/src/captions-page.cpp
++++ b/plugins/livehime/src/captions-page.cpp
+@@ -9,6 +9,7 @@
+ #include <QFormLayout>
+ #include <QLabel>
+ #include <QSignalBlocker>
++#include <QTimer>
+ #include <QVBoxLayout>
+ 
+ namespace {
+@@ -24,8 +25,10 @@ CaptionsPage::CaptionsPage(QWidget *parent) : QWidget(parent)
+ 
+ 	enabled_ = new QCheckBox(text("LiveHime.Captions.Enable"), this);
+ 	source_ = new QComboBox(this);
+-	source_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
++	source_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
++	source_->setMinimumContentsLength(8);
+ 	locale_ = new QComboBox(this);
++	locale_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+ 	for (const auto &[label, code] : {std::pair{"LiveHime.Captions.Lang.zhCN", "zh-CN"},
+ 					  std::pair{"LiveHime.Captions.Lang.zhTW", "zh-TW"},
+ 					  std::pair{"LiveHime.Captions.Lang.yue", "yue-CN"},
+@@ -44,6 +47,8 @@ CaptionsPage::CaptionsPage(QWidget *parent) : QWidget(parent)
+ 	hint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+ 
+ 	auto *form = new QFormLayout;
++	form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
++	form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+ 	form->addRow(text("LiveHime.Captions.Source"), source_);
+ 	form->addRow(text("LiveHime.Captions.Language"), locale_);
+ 	auto *layout = new QVBoxLayout(this);
+@@ -77,6 +82,18 @@ CaptionsPage::CaptionsPage(QWidget *parent) : QWidget(parent)
+ 	connect(locale_, &QComboBox::activated, this, &CaptionsPage::apply);
+ 	connect(controller_, &CaptionController::sourceLost, this,
+ 		[this] { setStatus("LiveHime.Captions.Status.noSource", true); });
++
++	/* A muted source sends silence: say so instead of looking broken. */
++	muteCheck_ = new QTimer(this);
++	muteCheck_->setInterval(500);
++	connect(muteCheck_, &QTimer::timeout, this, [this] {
++		if (status_key_ != QStringLiteral("LiveHime.Captions.Status.listening"))
++			return;
++		const bool muted = controller_->sourceMuted();
++		status_->setText(text(muted ? "LiveHime.Captions.Status.muted" : "LiveHime.Captions.Status.listening"));
++		status_->setStyleSheet(muted ? QStringLiteral("color: #e0a040;") : QStringLiteral("color: #9aa0ab;"));
++	});
++	muteCheck_->start();
+ }
+ 
+ void CaptionsPage::showEvent(QShowEvent *event)
+@@ -117,19 +134,18 @@ void CaptionsPage::refreshSources()
+ 
+ void CaptionsPage::apply()
+ {
+-	finished_.clear();
+-	partial_.clear();
+-	preview_->clear();
+ 	const QString uuid = source_->currentData().toString();
+ 	if (enabled_->isChecked() && uuid.isEmpty()) {
+ 		setStatus("LiveHime.Captions.Status.noSource", true);
+ 		return;
+ 	}
+-	if (enabled_->isChecked())
+-		setStatus("LiveHime.Captions.Status.preparing");
+-	controller_->configure(enabled_->isChecked(), uuid, locale_->currentData().toString());
+-	if (!enabled_->isChecked())
+-		setStatus("LiveHime.Captions.Status.off");
++	/* Unchanged settings keep the running recognizer and its status. */
++	if (!controller_->configure(enabled_->isChecked(), uuid, locale_->currentData().toString()))
++		return;
++	finished_.clear();
++	partial_.clear();
++	preview_->clear();
++	setStatus(enabled_->isChecked() ? "LiveHime.Captions.Status.preparing" : "LiveHime.Captions.Status.off");
+ }
+ 
+ void CaptionsPage::handleEvent(const QJsonObject &event)
+@@ -137,6 +153,8 @@ void CaptionsPage::handleEvent(const QJsonObject &event)
+ 	const QString name = event.value("event").toString();
+ 	if (name == "captions") {
+ 		const QString status = event.value("status").toString();
++		blog(LOG_INFO, "[livehime] captions status: %s %s", status.toUtf8().constData(),
++		     event.value("message").toString().toUtf8().constData());
+ 		if (status == "stopped") {
+ 			if (!controller_->enabled())
+ 				setStatus("LiveHime.Captions.Status.off");
+@@ -189,6 +207,8 @@ QString CaptionsPage::currentCaption() const
+ 
+ void CaptionsPage::setStatus(const QString &key, bool error)
+ {
++	status_key_ = key;
++	status_error_ = error;
+ 	status_->setText(text(key.toUtf8().constData()));
+ 	status_->setStyleSheet(error ? QStringLiteral("color: #e06c75;") : QStringLiteral("color: #9aa0ab;"));
+ }
+diff --git a/plugins/livehime/src/captions-page.hpp b/plugins/livehime/src/captions-page.hpp
+index 39cedbc62..5ed0c9ba0 100644
+--- a/plugins/livehime/src/captions-page.hpp
++++ b/plugins/livehime/src/captions-page.hpp
+@@ -7,6 +7,7 @@ class CaptionController;
+ class QCheckBox;
+ class QComboBox;
+ class QLabel;
++class QTimer;
+ 
+ /* The dock's "Captions" tab: turn live captions on, pick the audio source
+  * and language, see the status and the current caption. Works signed out;
+@@ -39,6 +40,9 @@ private:
+ 	QComboBox *locale_;
+ 	QLabel *status_;
+ 	QLabel *preview_;
++	QString status_key_;   /* last status from the captioner */
++	bool status_error_ = false;
++	QTimer *muteCheck_;
+ 	QString finished_;
+ 	QString partial_;
+ };
