@@ -1,7 +1,7 @@
 From 45033272fad79937abf2c86f0d8a74b1131221d7 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 00:48:57 +0800
-Subject: [PATCH 18/43] Add danmaku moderation, blocked words, Super Chat pin
+Subject: [PATCH 18/48] Add danmaku moderation, blocked words, Super Chat pin
  and gift filter
 
 Right-clicking a chat line offers copy and mute (this stream, 1 hour,

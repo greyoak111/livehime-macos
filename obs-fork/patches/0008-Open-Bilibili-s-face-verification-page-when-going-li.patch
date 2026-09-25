@@ -1,7 +1,7 @@
 From 27a0a6de83b3a418f44662488b8706af649cd678 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 23:26:09 +0800
-Subject: [PATCH 08/43] Open Bilibili's face verification page when going live
+Subject: [PATCH 08/48] Open Bilibili's face verification page when going live
  requires it
 
 When startLive answers with a face-verification requirement, the dock

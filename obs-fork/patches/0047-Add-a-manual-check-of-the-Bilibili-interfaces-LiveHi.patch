@@ -1,0 +1,719 @@
+From 8ff8c211034954b759e50488bfab7125123df202 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 12:58:03 +0800
+Subject: [PATCH 47/48] Add a manual check of the Bilibili interfaces LiveHime
+ uses
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+"B 站接口巡检…" on the Updates tab runs a read-only check through the same
+client code the app uses: identity (nav and its WBI keys), buvid, live
+categories, the LiveHime version info, QR login, room info, danmaku
+servers and an actual danmaku connection, the official login, cover and
+face verification pages, and when signed in the account's own room, face
+verification state and blocked words. Nothing is sent, changed or started.
+Each result shows its time and details; the report can be copied into an
+issue and holds no credentials. Test hook: Probe.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |   9 +
+ plugins/livehime/CMakeLists.txt               |   3 +
+ .../core/Sources/LiveHimeCore/ApiProbe.swift  | 179 ++++++++++++++++++
+ plugins/livehime/core/include/livehime-core.h |   8 +
+ plugins/livehime/data/locale/en-US.ini        |  41 ++++
+ plugins/livehime/data/locale/zh-CN.ini        |  41 ++++
+ plugins/livehime/src/automation.cpp           |  18 ++
+ plugins/livehime/src/feature-panel.cpp        |   4 +
+ plugins/livehime/src/probe-dialog.cpp         | 144 ++++++++++++++
+ plugins/livehime/src/probe-dialog.hpp         |  34 ++++
+ plugins/livehime/src/update-page.cpp          |  20 ++
+ plugins/livehime/src/update-page.hpp          |   6 +
+ 12 files changed, 507 insertions(+)
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/ApiProbe.swift
+ create mode 100644 plugins/livehime/src/probe-dialog.cpp
+ create mode 100644 plugins/livehime/src/probe-dialog.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 2b640a041..2f2433643 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -108,6 +108,15 @@ node e2e-update.mjs <websocket password> build_macos/frontend/RelWithDebInfo/Liv
+ The `Snapshot` vendor request renders the dock (optionally a tab) to a PNG,
+ for checking layouts without screen recording permission.
+ 
++## Bilibili interface check
++
++The Updates tab's "B 站接口巡检…" runs a read-only check of the Bilibili
++interfaces LiveHime uses and lists each result; it is the manual tool for
++when Bilibili changes something. The `Probe` vendor request drives it
++(`{"room":"<room id>","action":"run"}`, then poll until `running` is false
++and read `report`). Signed out, the account checks are skipped; with a room
++id (or signed in, the account's room) the room and danmaku checks run too.
++
+ ## Cover manager check
+ 
+ `e2e-cover.mjs` drives Bilibili's cover manager in the real window: a real
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index cea28b228..b4ab0bfb5 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -11,6 +11,7 @@ target_sources(
+     core/include/livehime-core.h
+     core/Sources/LiveHimeCore/AppUpdateBridge.swift
+     core/Sources/LiveHimeCore/AppUpdater.swift
++    core/Sources/LiveHimeCore/ApiProbe.swift
+     core/Sources/LiveHimeCore/AuthBridgeContract.swift
+     core/Sources/LiveHimeCore/AuthWebViewBridge.swift
+     core/Sources/LiveHimeCore/BilibiliControlClient.swift
+@@ -38,6 +39,8 @@ target_sources(
+     src/caption-controller.hpp
+     src/caption-recorder.cpp
+     src/caption-recorder.hpp
++    src/probe-dialog.cpp
++    src/probe-dialog.hpp
+     src/update-page.cpp
+     src/update-page.hpp
+     src/caption-overlay.cpp
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/ApiProbe.swift b/plugins/livehime/core/Sources/LiveHimeCore/ApiProbe.swift
+new file mode 100644
+index 000000000..623f60852
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/ApiProbe.swift
+@@ -0,0 +1,179 @@
++import Foundation
++
++/// A manual health check of the Bilibili interfaces LiveHime depends on, for
++/// when something stops working. Every check is read-only and goes through
++/// the same client code the app uses; nothing is sent, changed or started.
++/// Checks that need the account run only when it is signed in.
++@MainActor
++enum ApiProbe {
++    struct Result {
++        enum Outcome: String { case ok, fail, skip }
++        let id: String
++        let outcome: Outcome
++        let detail: String
++        let milliseconds: Int
++    }
++
++    /// Runs every check in order, reporting each as it finishes. `room` is the
++    /// live room for the room and danmaku checks (0: the account's own room).
++    static func run(room requested: Int64, report: @escaping (Result) -> Void) async {
++        let bridge = CoreBridge.shared
++        var account: LiveAccount?
++        if case .ready(let ready) = bridge?.coordinator.state { account = ready }
++        let cookie = account == nil ? "" : (bridge?.coordinator.credentials?.cookieHeader ?? "")
++        let room = requested > 0 ? requested : (account?.room.roomID ?? 0)
++        let client = BilibiliLiveClient(cookieHeader: cookie, session: BilibiliWeb.session)
++
++        func check(_ id: String, needs: Bool = true, skip reason: String = "",
++                   _ body: () async throws -> String) async {
++            guard needs else {
++                report(Result(id: id, outcome: .skip, detail: reason, milliseconds: 0))
++                return
++            }
++            let start = ContinuousClock.now
++            let outcome: Result.Outcome, detail: String
++            do {
++                detail = try await body()
++                outcome = .ok
++            } catch {
++                detail = describe(error)
++                outcome = .fail
++            }
++            let elapsed = ContinuousClock.now - start
++            let ms = Int(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
++            report(Result(id: id, outcome: outcome, detail: detail, milliseconds: ms))
++        }
++
++        await check("nav") { try await nav(cookie: cookie) }
++        await check("buvid") {
++            let buvid = try await client.buvid3(cookieHeader: cookie)
++            guard !buvid.isEmpty else { throw BilibiliLiveError.invalidResponse }
++            return "ok"
++        }
++        await check("areas") {
++            let areas = try await client.fetchAreas()
++            guard !areas.isEmpty else { throw BilibiliLiveError.invalidResponse }
++            return "\(areas.count)"
++        }
++        await check("liveVersion") {
++            let version = try await client.fetchLiveVersion()
++            return "\(version.version) (\(version.build))"
++        }
++        await check("qrcode") {
++            let code = try await QRLoginClient().generate()
++            guard !code.url.isEmpty, !code.key.isEmpty else { throw BilibiliLiveError.invalidResponse }
++            return "ok"
++        }
++        let noRoom = "noRoom"
++        await check("roomInfo", needs: room > 0, skip: noRoom) {
++            let info = try await client.fetchRoomInfo(roomID: room, cookieHeader: cookie)
++            return "\(info.roomID) · \(info.liveStatus == 1 ? "live" : "offline")"
++        }
++        await check("danmakuInfo", needs: room > 0, skip: noRoom) {
++            let info = try await client.danmakuConnectInfo(roomID: room, cookieHeader: cookie)
++            guard !info.token.isEmpty else { throw BilibiliLiveError.invalidResponse }
++            return "\(info.servers.count)"
++        }
++        await check("danmakuSocket", needs: room > 0, skip: noRoom) {
++            try await danmakuConnects(room: room, uid: account?.mid ?? 0, cookie: cookie)
++        }
++        for (id, page) in [("loginPage", "https://live.bilibili.com/p/html/live-pc-blink/mini-login-v2/"),
++                           ("coverPage", "https://live.bilibili.com/p/html/live-pc-blink/hime-live-cover/"),
++                           ("faceAuthPage", "https://live.bilibili.com/p/html/bilili-page-face-auth/index.html")] {
++            await check(id) { try await pageLoads(page) }
++        }
++        let signedOut = "signedOut"
++        await check("myRoom", needs: account != nil, skip: signedOut) {
++            let info = try await client.fetchCurrentRoom(mid: account!.mid)
++            return "\(info.roomID)"
++        }
++        await check("faceAuthState", needs: account != nil, skip: signedOut) {
++            try await client.isIdentifiedByFaceAuth(roomID: account!.room.roomID, cookieHeader: cookie) ? "verified" : "notVerified"
++        }
++        await check("shieldKeywords", needs: account != nil, skip: signedOut) {
++            let words = try await client.shieldKeywords(roomID: account!.room.roomID, cookieHeader: cookie)
++            return "\(words.count)"
++        }
++    }
++
++    /// The identity endpoint answers 0 (signed in) or -101 (signed out), and
++    /// always carries the WBI keys that signed requests need.
++    static func nav(cookie: String) async throws -> String {
++        var request = URLRequest(url: URL(string: "https://api.bilibili.com/x/web-interface/nav")!, timeoutInterval: 12)
++        request.setValue(cookie, forHTTPHeaderField: "Cookie")
++        request.setValue(BilibiliWeb.userAgent, forHTTPHeaderField: "User-Agent")
++        let (data, response) = try await BilibiliWeb.session.data(for: request)
++        try httpOK(response)
++        let root = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
++        let code = (root["code"] as? NSNumber)?.intValue ?? Int.min
++        let body = root["data"] as? [String: Any]
++        guard code == 0 || code == -101, body?["wbi_img"] is [String: Any] else {
++            throw ProbeError.unexpected("code \(code)")
++        }
++        return (body?["isLogin"] as? Bool) == true ? "signedIn" : "signedOut"
++    }
++
++    static func pageLoads(_ address: String) async throws -> String {
++        var request = URLRequest(url: URL(string: address)!, timeoutInterval: 12)
++        request.setValue(BilibiliWeb.userAgent, forHTTPHeaderField: "User-Agent")
++        let (data, response) = try await BilibiliWeb.session.data(for: request)
++        try httpOK(response)
++        guard data.count > 200 else { throw ProbeError.unexpected("empty page") }
++        return "ok"
++    }
++
++    /// Connects to the room's danmaku server and waits for the handshake.
++    static func danmakuConnects(room: Int64, uid: Int64, cookie: String) async throws -> String {
++        let client = DanmakuClient()
++        defer { client.stop() }
++        client.start(roomID: room, uid: uid, cookieHeader: cookie)
++        for _ in 0..<60 {
++            if client.status == .connected { return "connected" }
++            try await Task.sleep(for: .milliseconds(200))
++        }
++        throw ProbeError.unexpected(client.status == .reconnecting ? "reconnecting" : "timeout")
++    }
++
++    static func httpOK(_ response: URLResponse) throws {
++        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
++            throw ProbeError.unexpected("HTTP \(http.statusCode)")
++        }
++    }
++
++    enum ProbeError: Error { case unexpected(String) }
++
++    /// A short, credential-free description of a failure.
++    static func describe(_ error: Error) -> String {
++        switch error {
++        case ProbeError.unexpected(let detail): return detail
++        case BilibiliLiveError.api(let code, let message): return "code \(code) \(message)".trimmingCharacters(in: .whitespaces)
++        case BilibiliLiveError.network(let code): return "network \(code)"
++        case let error as URLError: return "network \(error.code.rawValue)"
++        default: return String(describing: error).prefix(80).description
++        }
++    }
++}
++
++/// Runs the interface check (see ApiProbe). Emits {"event":"probe",
++/// "status":"running"}, one {"event":"probe","check":id,"result":"ok|fail|
++/// skip","detail","ms"} per check, then {"event":"probe","status":"done",
++/// "passed","failed","skipped"}. `room` 0 uses the account's own room.
++@_cdecl("livehime_core_probe_run")
++public func livehime_core_probe_run(_ room: Int64) {
++    DispatchQueue.main.async {
++        MainActor.assumeIsolated {
++            guard let bridge = CoreBridge.shared else { return }
++            bridge.emit(["event": "probe", "status": "running"])
++            Task { @MainActor in
++                var counts: [ApiProbe.Result.Outcome: Int] = [:]
++                await ApiProbe.run(room: room) { result in
++                    counts[result.outcome, default: 0] += 1
++                    CoreBridge.shared?.emit(["event": "probe", "check": result.id, "result": result.outcome.rawValue,
++                                             "detail": result.detail, "ms": result.milliseconds])
++                }
++                CoreBridge.shared?.emit(["event": "probe", "status": "done", "passed": counts[.ok] ?? 0,
++                                         "failed": counts[.fail] ?? 0, "skipped": counts[.skip] ?? 0])
++            }
++        }
++    }
++}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 794030a6f..eea9082e4 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -91,6 +91,14 @@ int livehime_core_update_rollback(void);
+ /* Emits the idle state ("status":"idle") with current, obsCurrent, previous. */
+ void livehime_core_update_state(void);
+ 
++/* Read-only check of the Bilibili interfaces LiveHime uses (public ones, the
++ * danmaku connection, the official pages; the account's own read-only ones
++ * when signed in). room 0 uses the account's room. Emits
++ * {"event":"probe","status":"running"}, then per check {"event":"probe",
++ * "check":id,"result":"ok|fail|skip","detail","ms"}, then {"event":"probe",
++ * "status":"done","passed","failed","skipped"}. */
++void livehime_core_probe_run(long long room);
++
+ /* Room activity. Once the account is ready the core keeps the room's danmaku
+  * connection open and emits:
+  *   {"event":"danmakuStatus","status":"connecting|connected|reconnecting|stopped"}
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 8fcc763ac..62addd8a2 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -232,3 +232,44 @@ LiveHime.Update.Status.availableBeta="Beta %1 is available."
+ LiveHime.Update.Status.skipped="Version %1 is skipped: automatic updates leave it alone; Check for Updates still shows it."
+ LiveHime.Update.Status.busyRollback="Streaming or recording: roll back to %1 after you stop."
+ LiveHime.Update.ObsUpgrade="This update moves OBS from %1 to %2. Scenes and settings are backed up before installing and can come back with a rollback."
++LiveHime.Probe.Open="Check Bilibili Interfaces…"
++LiveHime.Probe.OpenTip="Checks one by one whether the Bilibili interfaces LiveHime uses still work. Read-only: nothing is sent, changed or started."
++LiveHime.Probe.Title="Check Bilibili Interfaces"
++LiveHime.Probe.Intro="Checks the Bilibili interfaces LiveHime depends on: public endpoints, the danmaku connection and the official pages, plus your account's read-only ones when signed in. Every check is read-only: nothing is sent, changed or started. Going live, sending danmaku and other writes cannot be checked here."
++LiveHime.Probe.RoomPlaceholder="Room number (empty: your own room)"
++LiveHime.Probe.Run="Run Check"
++LiveHime.Probe.Copy="Copy Report"
++LiveHime.Probe.Running="Checking…"
++LiveHime.Probe.SummaryOk="All good: %1 passed, %2 failed, %3 skipped."
++LiveHime.Probe.SummaryFailed="Problems found: %1 passed, %2 failed, %3 skipped. Copy the report into a GitHub issue (it holds no account data)."
++LiveHime.Probe.Column.Check="Interface"
++LiveHime.Probe.Column.Result="Result"
++LiveHime.Probe.Column.Time="Time"
++LiveHime.Probe.Column.Detail="Details"
++LiveHime.Probe.Result.ok="OK"
++LiveHime.Probe.Result.fail="Failed"
++LiveHime.Probe.Result.skip="Skipped"
++LiveHime.Probe.Check.nav="Account identity"
++LiveHime.Probe.Check.buvid="Device id (buvid)"
++LiveHime.Probe.Check.areas="Live categories"
++LiveHime.Probe.Check.liveVersion="LiveHime version info"
++LiveHime.Probe.Check.qrcode="QR login"
++LiveHime.Probe.Check.roomInfo="Room info"
++LiveHime.Probe.Check.danmakuInfo="Danmaku servers"
++LiveHime.Probe.Check.danmakuSocket="Danmaku connection"
++LiveHime.Probe.Check.loginPage="Official login page"
++LiveHime.Probe.Check.coverPage="Official cover page"
++LiveHime.Probe.Check.faceAuthPage="Official face verification page"
++LiveHime.Probe.Check.myRoom="My room"
++LiveHime.Probe.Check.faceAuthState="Face verification state"
++LiveHime.Probe.Check.shieldKeywords="Blocked words"
++LiveHime.Probe.Detail.signedIn="signed in"
++LiveHime.Probe.Detail.signedOut="signed out"
++LiveHime.Probe.Detail.noRoom="needs a room number (your own room once signed in)"
++LiveHime.Probe.Detail.live="live"
++LiveHime.Probe.Detail.offline="offline"
++LiveHime.Probe.Detail.verified="verified"
++LiveHime.Probe.Detail.notVerified="not verified"
++LiveHime.Probe.Detail.connected="connected"
++LiveHime.Probe.Detail.reconnecting="failed, retrying"
++LiveHime.Probe.Detail.timeout="timed out"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 42fc5e3ea..6ee1c7310 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -232,3 +232,44 @@ LiveHime.Update.Status.availableBeta="发现测试版 v%1。"
+ LiveHime.Update.Status.skipped="已跳过 v%1。自动更新不会再安装它，手动“检查更新”时仍会显示。"
+ LiveHime.Update.Status.busyRollback="正在直播或录制，结束后再回退到 v%1。"
+ LiveHime.Update.ObsUpgrade="这次更新会把 OBS 从 %1 升级到 %2。安装前会自动备份场景和设置，回退时可以恢复。"
++LiveHime.Probe.Open="B 站接口巡检…"
++LiveHime.Probe.OpenTip="逐项检查 LiveHime 用到的 B 站接口还能不能用。只读，不会发弹幕、改设置或开播。"
++LiveHime.Probe.Title="B 站接口巡检"
++LiveHime.Probe.Intro="逐项检查 LiveHime 依赖的 B 站接口：公开接口、弹幕连接和官方页面；登录后还会检查你账号的只读接口。所有检查都是只读的，不会发弹幕、改设置或开播。开播、发弹幕这类写入操作无法在这里检查。"
++LiveHime.Probe.RoomPlaceholder="直播间号（不填则用你自己的直播间）"
++LiveHime.Probe.Run="开始巡检"
++LiveHime.Probe.Copy="复制报告"
++LiveHime.Probe.Running="正在检查…"
++LiveHime.Probe.SummaryOk="全部正常：%1 项通过，%2 项失败，%3 项跳过。"
++LiveHime.Probe.SummaryFailed="发现问题：%1 项通过，%2 项失败，%3 项跳过。可以复制报告发到 GitHub Issue（报告里没有账号信息）。"
++LiveHime.Probe.Column.Check="接口"
++LiveHime.Probe.Column.Result="结果"
++LiveHime.Probe.Column.Time="耗时"
++LiveHime.Probe.Column.Detail="说明"
++LiveHime.Probe.Result.ok="正常"
++LiveHime.Probe.Result.fail="失败"
++LiveHime.Probe.Result.skip="跳过"
++LiveHime.Probe.Check.nav="账号身份接口"
++LiveHime.Probe.Check.buvid="设备标识（buvid）"
++LiveHime.Probe.Check.areas="直播分区列表"
++LiveHime.Probe.Check.liveVersion="直播姬版本信息"
++LiveHime.Probe.Check.qrcode="扫码登录接口"
++LiveHime.Probe.Check.roomInfo="直播间信息"
++LiveHime.Probe.Check.danmakuInfo="弹幕服务器地址"
++LiveHime.Probe.Check.danmakuSocket="弹幕连接"
++LiveHime.Probe.Check.loginPage="官方登录页"
++LiveHime.Probe.Check.coverPage="官方封面页"
++LiveHime.Probe.Check.faceAuthPage="官方人脸认证页"
++LiveHime.Probe.Check.myRoom="我的直播间"
++LiveHime.Probe.Check.faceAuthState="人脸认证状态"
++LiveHime.Probe.Check.shieldKeywords="屏蔽词列表"
++LiveHime.Probe.Detail.signedIn="已登录"
++LiveHime.Probe.Detail.signedOut="未登录"
++LiveHime.Probe.Detail.noRoom="需要直播间号（登录后自动使用你的直播间）"
++LiveHime.Probe.Detail.live="直播中"
++LiveHime.Probe.Detail.offline="未开播"
++LiveHime.Probe.Detail.verified="已认证"
++LiveHime.Probe.Detail.notVerified="未认证"
++LiveHime.Probe.Detail.connected="已连接"
++LiveHime.Probe.Detail.reconnecting="连接失败，正在重试"
++LiveHime.Probe.Detail.timeout="超时"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index ce2abd66e..e1df11e29 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -8,6 +8,7 @@
+ #include "floating-chat.hpp"
+ #include "danmaku-feed.hpp"
+ #include "update-page.hpp"
++#include "probe-dialog.hpp"
+ #include "livehime-dock.hpp"
+ 
+ #include <livehime-core.h>
+@@ -184,6 +185,21 @@ void floatingChat(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
++/* Interface check for tests: optional "room" (number), "action":"run" starts it;
++ * replies with whether it is running and the copyable report so far. */
++void probe(obs_data_t *request, obs_data_t *response, void *)
++{
++	onUiThread([&] {
++		ProbeDialog *dialog = target->features()->updates()->probe();
++		if (obs_data_has_user_value(request, "room"))
++			dialog->setRoom(QString::fromUtf8(obs_data_get_string(request, "room")));
++		if (QString::fromUtf8(obs_data_get_string(request, "action")) == "run")
++			dialog->start();
++		obs_data_set_bool(response, "running", dialog->running());
++		obs_data_set_string(response, "report", dialog->report().toUtf8().constData());
++	});
++}
++
+ /* Test hook: renders the dock (optionally switched to "tab" 0-3) into the
+  * PNG file "path", as it would appear on screen. */
+ void snapshot(obs_data_t *request, obs_data_t *response, void *)
+@@ -353,6 +369,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "OverlayState", overlayState, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Update", update, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Snapshot", snapshot, nullptr);
++	obs_websocket_vendor_register_request(vendor, "Probe", probe, nullptr);
+ }
+ 
+ void UnregisterAutomation()
+@@ -372,6 +389,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "OverlayState");
+ 		obs_websocket_vendor_unregister_request(vendor, "Update");
+ 		obs_websocket_vendor_unregister_request(vendor, "Snapshot");
++		obs_websocket_vendor_unregister_request(vendor, "Probe");
+ 		vendor = nullptr;
+ 	}
+ 	target.clear();
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 737662aed..46748db74 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -256,6 +256,10 @@ void FeaturePanel::applyEvent(const QJsonObject &event)
+ 		updates_->handleEvent(event);
+ 		return;
+ 	}
++	if (name == "probe") {
++		updates_->handleProbeEvent(event);
++		return;
++	}
+ 	feed_->handleEvent(event);
+ 	floating_->feed()->handleEvent(event);
+ 	if (name == "room") {
+diff --git a/plugins/livehime/src/probe-dialog.cpp b/plugins/livehime/src/probe-dialog.cpp
+new file mode 100644
+index 000000000..327041d75
+--- /dev/null
++++ b/plugins/livehime/src/probe-dialog.cpp
+@@ -0,0 +1,144 @@
++#include "probe-dialog.hpp"
++#include "update-page.hpp"
++
++#include <livehime-core.h>
++#include <obs-module.h>
++
++#include <QApplication>
++#include <QClipboard>
++#include <QDateTime>
++#include <QHBoxLayout>
++#include <QHeaderView>
++#include <QLabel>
++#include <QLineEdit>
++#include <QPushButton>
++#include <QTreeWidget>
++#include <QVBoxLayout>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++
++/* Details the core reports as keywords ("123 · live"), shown in words. */
++QString detailText(const QString &detail)
++{
++	static const QStringList keys = {"signedIn", "signedOut", "noRoom",    "live",         "offline",
++					 "verified", "notVerified", "connected", "reconnecting", "timeout"};
++	if (detail == QStringLiteral("ok"))
++		return QString();
++	QStringList parts = detail.split(QStringLiteral(" · "));
++	for (QString &part : parts) {
++		if (keys.contains(part)) {
++			const QByteArray name = "LiveHime.Probe.Detail." + part.toUtf8();
++			part = text(name.constData());
++		}
++	}
++	return parts.join(QStringLiteral(" · "));
++}
++} // namespace
++
++ProbeDialog::ProbeDialog(QWidget *parent) : QDialog(parent)
++{
++	setWindowTitle(text("LiveHime.Probe.Title"));
++	resize(560, 560);
++	auto *intro = new QLabel(text("LiveHime.Probe.Intro"), this);
++	intro->setWordWrap(true);
++	room_ = new QLineEdit(this);
++	room_->setPlaceholderText(text("LiveHime.Probe.RoomPlaceholder"));
++	room_->setValidator(nullptr);
++	run_ = new QPushButton(text("LiveHime.Probe.Run"), this);
++	copy_ = new QPushButton(text("LiveHime.Probe.Copy"), this);
++	copy_->setEnabled(false);
++	summary_ = new QLabel(this);
++	summary_->setWordWrap(true);
++	list_ = new QTreeWidget(this);
++	list_->setColumnCount(4);
++	list_->setHeaderLabels({text("LiveHime.Probe.Column.Check"), text("LiveHime.Probe.Column.Result"),
++				text("LiveHime.Probe.Column.Time"), text("LiveHime.Probe.Column.Detail")});
++	list_->setRootIsDecorated(false);
++	list_->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
++	list_->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
++	list_->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
++	list_->header()->setStretchLastSection(true);
++
++	auto *row = new QHBoxLayout;
++	row->addWidget(room_, 1);
++	row->addWidget(run_);
++	row->addWidget(copy_);
++	auto *layout = new QVBoxLayout(this);
++	layout->addWidget(intro);
++	layout->addLayout(row);
++	layout->addWidget(summary_);
++	layout->addWidget(list_, 1);
++
++	connect(run_, &QPushButton::clicked, this, &ProbeDialog::start);
++	connect(copy_, &QPushButton::clicked, this, [this] { QApplication::clipboard()->setText(report()); });
++}
++
++void ProbeDialog::start()
++{
++	if (running_)
++		return;
++	running_ = true;
++	list_->clear();
++	run_->setEnabled(false);
++	copy_->setEnabled(false);
++	summary_->setText(text("LiveHime.Probe.Running"));
++	summary_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++	livehime_core_probe_run(room_->text().trimmed().toLongLong());
++}
++
++void ProbeDialog::setRoom(const QString &room)
++{
++	room_->setText(room);
++}
++
++void ProbeDialog::handleEvent(const QJsonObject &event)
++{
++	if (event.contains("check")) {
++		const QString id = event.value("check").toString();
++		const QString result = event.value("result").toString();
++		const QByteArray name = "LiveHime.Probe.Check." + id.toUtf8();
++		const QByteArray outcome = "LiveHime.Probe.Result." + result.toUtf8();
++		auto *item = new QTreeWidgetItem(list_);
++		item->setText(0, text(name.constData()));
++		item->setText(1, text(outcome.constData()));
++		item->setText(2, result == "skip" ? QString() : QStringLiteral("%1 ms").arg(event.value("ms").toInt()));
++		item->setText(3, detailText(event.value("detail").toString()));
++		item->setData(0, Qt::UserRole, id);
++		item->setData(1, Qt::UserRole, result);
++		item->setForeground(1, QColor(result == "ok" ? "#6cc070" : result == "fail" ? "#e06c75" : "#9aa0ab"));
++		return;
++	}
++	if (event.value("status").toString() != "done")
++		return;
++	running_ = false;
++	run_->setEnabled(true);
++	copy_->setEnabled(true);
++	const int failed = event.value("failed").toInt();
++	summary_->setText(text(failed ? "LiveHime.Probe.SummaryFailed" : "LiveHime.Probe.SummaryOk")
++				  .arg(event.value("passed").toInt())
++				  .arg(failed)
++				  .arg(event.value("skipped").toInt()));
++	summary_->setStyleSheet(failed ? QStringLiteral("color: #e06c75;") : QStringLiteral("color: #6cc070;"));
++}
++
++QString ProbeDialog::report() const
++{
++	QString out = QStringLiteral("LiveHime %1 · %2\n%3\n\n")
++			      .arg(UpdatePage::currentVersion(),
++				   QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm")),
++				   summary_->text());
++	for (int i = 0; i < list_->topLevelItemCount(); i++) {
++		const QTreeWidgetItem *item = list_->topLevelItem(i);
++		const QString result = item->data(1, Qt::UserRole).toString();
++		const QString mark = result == "ok" ? QStringLiteral("✓") : result == "fail" ? QStringLiteral("✗") : QStringLiteral("–");
++		out += QStringLiteral("%1 %2 [%3] %4 %5\n")
++			       .arg(mark, item->text(0), item->data(0, Qt::UserRole).toString(), item->text(2), item->text(3))
++			       .trimmed() +
++		       QStringLiteral("\n");
++	}
++	return out;
++}
+diff --git a/plugins/livehime/src/probe-dialog.hpp b/plugins/livehime/src/probe-dialog.hpp
+new file mode 100644
+index 000000000..cfafd8a34
+--- /dev/null
++++ b/plugins/livehime/src/probe-dialog.hpp
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <QDialog>
++#include <QJsonObject>
++
++class QLabel;
++class QLineEdit;
++class QPushButton;
++class QTreeWidget;
++
++/* "Check Bilibili interfaces": runs the core's read-only interface check
++ * (public endpoints, the danmaku connection, the official pages, and with an
++ * account its own read-only ones) and lists each result, for when Bilibili
++ * changes something. The report can be copied; it holds no credentials. */
++class ProbeDialog : public QDialog {
++	Q_OBJECT
++
++public:
++	explicit ProbeDialog(QWidget *parent = nullptr);
++
++	void handleEvent(const QJsonObject &event);
++	void start();
++	void setRoom(const QString &room);
++	bool running() const { return running_; }
++	QString report() const;
++
++private:
++	QLineEdit *room_;
++	QPushButton *run_;
++	QPushButton *copy_;
++	QLabel *summary_;
++	QTreeWidget *list_;
++	bool running_ = false;
++};
+diff --git a/plugins/livehime/src/update-page.cpp b/plugins/livehime/src/update-page.cpp
+index 5811e817d..177a086e5 100644
+--- a/plugins/livehime/src/update-page.cpp
++++ b/plugins/livehime/src/update-page.cpp
+@@ -1,5 +1,6 @@
+ #include "update-page.hpp"
+ #include "plugin-settings.hpp"
++#include "probe-dialog.hpp"
+ 
+ #include <livehime-core.h>
+ #include <obs-module.h>
+@@ -90,6 +91,12 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	link_->setOpenExternalLinks(false);
+ 	connect(link_, &QLabel::linkActivated, this,
+ 		[this](const QString &url) { QDesktopServices::openUrl(QUrl(page_.isEmpty() ? url : page_)); });
++	probeButton_ = new QPushButton(text("LiveHime.Probe.Open"), this);
++	probeButton_->setToolTip(text("LiveHime.Probe.OpenTip"));
++	connect(probeButton_, &QPushButton::clicked, this, [this] {
++		probe()->show();
++		probe()->raise();
++	});
+ 	auto *hint = new QLabel(text("LiveHime.Update.Hint"), this);
+ 	hint->setWordWrap(true);
+ 	hint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+@@ -110,6 +117,7 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	layout->addWidget(link_);
+ 	layout->addWidget(hint);
+ 	layout->addStretch(1);
++	layout->addWidget(probeButton_);
+ 
+ 	connect(auto_, &QCheckBox::toggled, this, &UpdatePage::setAutomatic);
+ 	connect(beta_box_, &QCheckBox::toggled, this, &UpdatePage::setBeta);
+@@ -174,6 +182,18 @@ void UpdatePage::setAutomatic(bool automatic)
+ 		setStatus(automatic_ ? "LiveHime.Update.Status.auto" : "LiveHime.Update.Status.manual");
+ }
+ 
++ProbeDialog *UpdatePage::probe()
++{
++	if (!probe_)
++		probe_ = new ProbeDialog(window());
++	return probe_;
++}
++
++void UpdatePage::handleProbeEvent(const QJsonObject &event)
++{
++	probe()->handleEvent(event);
++}
++
+ void UpdatePage::setBeta(bool beta)
+ {
+ 	if (beta == beta_)
+diff --git a/plugins/livehime/src/update-page.hpp b/plugins/livehime/src/update-page.hpp
+index 55018ee36..135935fcd 100644
+--- a/plugins/livehime/src/update-page.hpp
++++ b/plugins/livehime/src/update-page.hpp
+@@ -5,6 +5,7 @@
+ #include <QJsonObject>
+ #include <QWidget>
+ 
++class ProbeDialog;
+ class QCheckBox;
+ class QLabel;
+ class QProgressBar;
+@@ -28,6 +29,9 @@ public:
+ 	~UpdatePage() override;
+ 
+ 	void handleEvent(const QJsonObject &event);
++	/* Interface check results, forwarded to its dialog. */
++	void handleProbeEvent(const QJsonObject &event);
++	ProbeDialog *probe();
+ 	bool automatic() const { return automatic_; }
+ 	void setAutomatic(bool automatic);
+ 	bool beta() const { return beta_; }
+@@ -89,5 +93,7 @@ private:
+ 	QTextBrowser *notes_;
+ 	QPushButton *action_;
+ 	QLabel *link_;
++	QPushButton *probeButton_;
++	ProbeDialog *probe_ = nullptr;
+ 	QTimer *timer_;
+ };
+-- 
+2.54.0 (Apple Git-157)
+

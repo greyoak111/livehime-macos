@@ -1,7 +1,7 @@
 From edb9c46491aa3f454a35298558d49b4d36dc2a5e Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 22:28:00 +0800
-Subject: [PATCH 01/43] Brand macOS bundle as LiveHime with isolated user
+Subject: [PATCH 01/48] Brand macOS bundle as LiveHime with isolated user
  config
 
 Add cache options for the app bundle identifier, name and display name

@@ -1,7 +1,7 @@
 From 9a67614b73d1cb91f3c2b61c394902003a328b62 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 23:11:57 +0800
-Subject: [PATCH 41/43] Reply to viewers from the danmaku feed; keep the
+Subject: [PATCH 41/48] Reply to viewers from the danmaku feed; keep the
  floating chat on top
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

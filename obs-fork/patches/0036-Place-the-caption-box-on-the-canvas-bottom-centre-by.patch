@@ -1,7 +1,7 @@
 From 31882967e4de4516bb1118c8be15796a15e33898 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 17:10:22 +0800
-Subject: [PATCH 36/43] Place the caption box on the canvas, bottom centre by
+Subject: [PATCH 36/48] Place the caption box on the canvas, bottom centre by
  default
 
 A "Position on canvas" setting puts the caption box at the bottom

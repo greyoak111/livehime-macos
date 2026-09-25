@@ -1,0 +1,1416 @@
+From f285b76e7d455d7ecfde67a58c3d59f166f99720 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 12:33:04 +0800
+Subject: [PATCH 45/48] Check for and install updates from GitHub Releases
+
+A new Updates tab: automatic mode (default) checks shortly after launch
+and every six hours, downloads a newer release in the background and
+installs it when LiveHime quits; manual mode checks and downloads only on
+request through the same path. A download is kept only when its SHA-256
+matches the release's digest and the app inside has this app's bundle id,
+the release's version and a valid signature by the same certificate, so
+permissions carry over. Installing waits for LiveHime to quit, swaps the
+bundle (restoring the old one if that fails) and can reopen it; "Restart
+and update" is refused while streaming or recording. A banner above the
+tabs announces a found or downloaded version. Development builds only
+point to the releases page.
+
+Test hooks: Update (drive the tab) and Snapshot (render the dock to PNG);
+e2e-update.mjs covers checksum and signer rejection and a full automatic
+update and relaunch against a local feed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  18 +
+ build-aux/livehime/tests/e2e-update.mjs       | 118 +++++++
+ plugins/livehime/CMakeLists.txt               |   4 +
+ .../LiveHimeCore/AppUpdateBridge.swift        | 142 ++++++++
+ .../Sources/LiveHimeCore/AppUpdater.swift     | 316 ++++++++++++++++++
+ .../LiveHimeCoreTests/AppUpdaterTests.swift   |  54 +++
+ plugins/livehime/core/include/livehime-core.h |  13 +
+ plugins/livehime/data/locale/en-US.ini        |  30 ++
+ plugins/livehime/data/locale/zh-CN.ini        |  30 ++
+ plugins/livehime/src/automation.cpp           |  49 +++
+ plugins/livehime/src/feature-panel.cpp        |  49 +++
+ plugins/livehime/src/feature-panel.hpp        |   7 +
+ plugins/livehime/src/update-page.cpp          | 267 +++++++++++++++
+ plugins/livehime/src/update-page.hpp          |  73 ++++
+ 14 files changed, 1170 insertions(+)
+ create mode 100644 build-aux/livehime/tests/e2e-update.mjs
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
+ create mode 100644 plugins/livehime/src/update-page.cpp
+ create mode 100644 plugins/livehime/src/update-page.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index e8f852455..40ce5ddf0 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -82,6 +82,24 @@ profile's `basic.ini` first and compare it afterwards.
+ node e2e-captions-srt.mjs <websocket password> speech.aiff
+ ```
+ 
++## Updates
++
++`e2e-update.mjs` runs the updater against a local release feed
++(`LIVEHIME_UPDATE_FEED`), with no GitHub or real account involved. It copies
++the built app to `<work dir>/install`, builds a 9.9.9 variant signed like the
++build and another signed ad hoc, and checks that a download failing its
++digest and the ad hoc app are both discarded, then that automatic mode
++downloads and verifies 9.9.9 and "restart" quits LiveHime, swaps the bundle
++and reopens it at 9.9.9 with a valid signature (still on the e2e keychain):
++
++```bash
++node e2e-update.mjs <websocket password> build_macos/frontend/RelWithDebInfo/LiveHime.app /tmp/livehime-update
++```
++
++Afterwards remove `~/Library/Caches/local.livehime.macos.dev/Updates`.
++The `Snapshot` vendor request renders the dock (optionally a tab) to a PNG,
++for checking layouts without screen recording permission.
++
+ ## Cover manager check
+ 
+ `e2e-cover.mjs` drives Bilibili's cover manager in the real window: a real
+diff --git a/build-aux/livehime/tests/e2e-update.mjs b/build-aux/livehime/tests/e2e-update.mjs
+new file mode 100644
+index 000000000..9f09412e0
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-update.mjs
+@@ -0,0 +1,118 @@
++// Updates end to end, against a local release feed (no GitHub, no real account):
++// - a download whose checksum does not match the feed's digest is discarded;
++// - an app signed by another certificate (ad hoc) is discarded;
++// - automatic mode finds 9.9.9, downloads and verifies it, and "restart" quits LiveHime,
++//   swaps the bundle and reopens it: the installed app is then 9.9.9, validly signed.
++// Usage: node e2e-update.mjs <ws password> <built LiveHime.app> <work dir>
++// Copies the app into <work dir>/install and launches that copy with the e2e keychain and
++// LIVEHIME_UPDATE_FEED; quits it at the end. Back up features.json first (the Updates setting).
++import { createHash } from 'node:crypto';
++import { execFileSync } from 'node:child_process';
++import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const [password, builtApp, work] = process.argv.slice(2);
++const here = path.dirname(fileURLToPath(import.meta.url));
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const sh = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8' });
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const fileSha = (f) => createHash('sha256').update(readFileSync(f)).digest('hex');
++let fails = 0;
++const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
++const plist = (app, key) => sh('/usr/libexec/PlistBuddy', ['-c', `Print ${key}`, `${app}/Contents/Info.plist`]).trim();
++const install = path.join(work, 'install', 'LiveHime.app');
++const feed = path.join(work, 'feed');
++const running = () => { try { return sh('/usr/bin/pgrep', ['-f', `${install}/Contents/MacOS/LiveHime`]).trim(); } catch { return ''; } };
++
++// Fixtures: the installed copy, a 9.9.9 signed like the build, and a 9.9.9 signed ad hoc.
++rmSync(work, { recursive: true, force: true });
++for (const d of ['install', 'new', 'adhoc', 'feed']) mkdirSync(path.join(work, d), { recursive: true });
++sh('/usr/bin/ditto', [builtApp, install]);
++function variant(dir, sign) {
++  const app = path.join(work, dir, 'LiveHime.app');
++  sh('/usr/bin/ditto', [builtApp, app]);
++  sh('/usr/libexec/PlistBuddy', ['-c', 'Set CFBundleShortVersionString 9.9.9', `${app}/Contents/Info.plist`]);
++  sign(app);
++  const zip = path.join(feed, `${dir}.zip`);
++  sh('/usr/bin/ditto', ['-c', '-k', '--keepParent', app, zip]);
++  return zip;
++}
++const good = variant('new', (app) => sh('python3', [path.join(here, '..', 'local-signing.py'), '--deep', '--sign', app]));
++const adhoc = variant('adhoc', (app) => sh('/usr/bin/codesign', ['--force', '--deep', '-s', '-', app]));
++function publish(zip, digest) {
++  writeFileSync(path.join(feed, 'feed.json'), JSON.stringify({
++    tag_name: 'v9.9.9', html_url: 'https://example.invalid/releases/v9.9.9', body: '## Test release\n\n- e2e',
++    assets: [{ name: 'LiveHimeMacApp-v9.9.9-arm64.zip', browser_download_url: `file://${zip}`,
++      size: readFileSync(zip).length, digest: `sha256:${digest}` }],
++  }));
++}
++publish(good, '0'.repeat(64));
++
++async function connect() {
++  for (let i = 0; i < 60; i++) {
++    try {
++      const ws = new WebSocket('ws://127.0.0.1:4466');
++      await new Promise((ok, bad) => { ws.onopen = ok; ws.onerror = bad; });
++      let id = 1; const pend = new Map();
++      await new Promise((ok) => { ws.onmessage = (m) => { const msg = JSON.parse(m.data);
++        if (msg.op === 0) { const a = msg.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + a.salt) + a.challenge) } })); }
++        else if (msg.op === 2) ok(); else if (msg.op === 7) { pend.get(msg.d.requestId)?.(msg.d); pend.delete(msg.d.requestId); } }; });
++      const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++      const update = async (d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: 'Update', requestData: d })).responseData?.responseData;
++      return { ws, update };
++    } catch { await sleep(1000); }
++  }
++  throw new Error('websocket did not come up');
++}
++async function until(update, pred, seconds) {
++  let st;
++  for (let i = 0; i < seconds * 4; i++) { st = await update(); if (pred(st)) return st; await sleep(250); }
++  return st;
++}
++
++sh('/usr/bin/open', ['-n', '--env', 'LIVEHIME_KEYCHAIN_SERVICE=local.livehime.macos.e2e-test',
++  '--env', `LIVEHIME_UPDATE_FEED=file://${feed}/feed.json`, install]);
++let { ws, update } = await connect();
++try {
++  // Manual mode for the failure cases.
++  await update({ automatic: false });
++  for (const [label, zip, digest, reason] of [['checksum mismatch', good, '0'.repeat(64), 'checksum'],
++                                              ['ad hoc signature', adhoc, fileSha(adhoc), 'invalidApp']]) {
++    publish(zip, digest);
++    await update({ action: 'check' });
++    let st = await until(update, (s) => s?.available === '9.9.9' && s.status !== 'LiveHime.Update.Status.checking', 20);
++    check(`${label}: 9.9.9 found`, st?.available === '9.9.9', JSON.stringify(st));
++    await update({ action: 'download' });
++    st = await until(update, (s) => s?.status === 'failed', 60);
++    check(`${label}: discarded (${reason})`, st?.status === 'failed' && st.reason === reason && !st.ready, JSON.stringify(st));
++  }
++  check('installed app untouched', plist(install, 'CFBundleShortVersionString') !== '9.9.9');
++
++  // Automatic mode: finds, downloads, verifies; restart installs and reopens.
++  publish(good, fileSha(good));
++  await update({ automatic: true });
++  const st = await until(update, (s) => s?.ready === '9.9.9', 90);
++  check('automatic: 9.9.9 downloaded and verified', st?.ready === '9.9.9', JSON.stringify(st));
++  const before = running();
++  const restart = await update({ action: 'restart' });
++  check('restart accepted', restart?.accepted, JSON.stringify(restart));
++  ws.close();
++  for (let i = 0; i < 60 && running() === before; i++) await sleep(500);
++  let reopened = '';
++  for (let i = 0; i < 60 && !(reopened = running()); i++) await sleep(500);
++  check('LiveHime quit and reopened', reopened && reopened !== before, `before ${before}, after ${reopened}`);
++  check('installed app is 9.9.9', plist(install, 'CFBundleShortVersionString') === '9.9.9');
++  let valid = true;
++  try { sh('/usr/bin/codesign', ['--verify', '--deep', '--strict', install]); } catch { valid = false; }
++  check('installed app signature valid', valid);
++  ({ ws, update } = await connect());
++  // The plugin registers its test hooks a moment after the websocket server starts.
++  const after = await until(update, (s) => s !== undefined, 30);
++  check('reopened app runs 9.9.9', after?.current === '9.9.9', JSON.stringify(after));
++} finally {
++  try { ws.close(); } catch {}
++  try { sh('/usr/bin/osascript', ['-e', `tell application id "${plist(install, 'CFBundleIdentifier')}" to quit`]); } catch {}
++  for (let i = 0; i < 40 && running(); i++) await sleep(500);
++}
++process.exit(fails ? 1 : 0);
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 7c90d75ca..cea28b228 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -9,6 +9,8 @@ target_sources(
+   livehime
+   PRIVATE
+     core/include/livehime-core.h
++    core/Sources/LiveHimeCore/AppUpdateBridge.swift
++    core/Sources/LiveHimeCore/AppUpdater.swift
+     core/Sources/LiveHimeCore/AuthBridgeContract.swift
+     core/Sources/LiveHimeCore/AuthWebViewBridge.swift
+     core/Sources/LiveHimeCore/BilibiliControlClient.swift
+@@ -36,6 +38,8 @@ target_sources(
+     src/caption-controller.hpp
+     src/caption-recorder.cpp
+     src/caption-recorder.hpp
++    src/update-page.cpp
++    src/update-page.hpp
+     src/caption-overlay.cpp
+     src/caption-overlay.hpp
+     src/captions-page.cpp
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
+new file mode 100644
+index 000000000..d30dbbd96
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
+@@ -0,0 +1,142 @@
++import Foundation
++
++/// Update state behind the C entry points below; everything on the main thread.
++@MainActor
++final class UpdateState {
++    static let shared = UpdateState()
++    var release: AppRelease?
++    var staged: URL?
++    var busy = false
++    var cleaned = false
++    var lastPercent = -1
++
++    func emit(_ fields: [String: Any]) {
++        var object: [String: Any] = ["event": "update", "current": AppUpdater.currentVersion,
++                                     "supported": AppUpdater.installSupported]
++        object.merge(fields) { $1 }
++        CoreBridge.shared?.emit(object)
++    }
++
++    func releaseFields(_ release: AppRelease) -> [String: Any] {
++        ["version": release.version, "notes": release.notes, "page": release.page.absoluteString, "size": release.size]
++    }
++
++    func failed(_ error: Error) {
++        let update = error as? AppUpdateError
++        emit(["status": "failed", "reason": update?.reason ?? "network",
++              "message": update?.errorDescription ?? error.localizedDescription])
++    }
++}
++
++private func onMainThread(_ body: @escaping @MainActor () -> Void) {
++    if Thread.isMainThread {
++        MainActor.assumeIsolated { body() }
++    } else {
++        DispatchQueue.main.async { MainActor.assumeIsolated { body() } }
++    }
++}
++
++/// Looks for a newer release. Emits "checking", then "upToDate",
++/// "available" (with version, notes, page, size) or "failed".
++@_cdecl("livehime_core_update_check")
++public func livehime_core_update_check() {
++    onMainThread {
++        let state = UpdateState.shared
++        guard !state.busy else { return }
++        if !state.cleaned, state.staged == nil {
++            // Leftovers of the last update (the replaced app, downloads).
++            AppUpdater.cleanUp()
++            state.cleaned = true
++        }
++        state.busy = true
++        state.emit(["status": "checking"])
++        Task.detached {
++            do {
++                let release = try await AppUpdater.latest()
++                await MainActor.run {
++                    state.busy = false
++                    state.release = release
++                    if let staged = state.staged, staged.path.contains("/\(release.version)/") {
++                        state.emit(["status": "ready"].merging(state.releaseFields(release)) { $1 })
++                    } else if AppUpdater.isNewer(release.version, than: AppUpdater.currentVersion) {
++                        state.emit(["status": "available"].merging(state.releaseFields(release)) { $1 })
++                    } else {
++                        state.emit(["status": "upToDate", "version": release.version])
++                    }
++                }
++            } catch {
++                await MainActor.run {
++                    state.busy = false
++                    state.failed(error)
++                }
++            }
++        }
++    }
++}
++
++/// Downloads and verifies the release found by the last check. Emits
++/// "downloading" with "progress" (0–1), then "ready" or "failed".
++@_cdecl("livehime_core_update_download")
++public func livehime_core_update_download() {
++    onMainThread {
++        let state = UpdateState.shared
++        guard !state.busy, let release = state.release,
++              AppUpdater.isNewer(release.version, than: AppUpdater.currentVersion) else { return }
++        guard AppUpdater.installSupported else {
++            state.emit(["status": "failed", "reason": "unsupported", "message": "development build"])
++            return
++        }
++        if let staged = state.staged, staged.path.contains("/\(release.version)/") {
++            state.emit(["status": "ready"].merging(state.releaseFields(release)) { $1 })
++            return
++        }
++        state.busy = true
++        state.lastPercent = -1
++        state.emit(["status": "downloading", "progress": 0.0, "version": release.version])
++        Task.detached {
++            do {
++                let app = try await AppUpdater.download(release) { fraction in
++                    DispatchQueue.main.async {
++                        MainActor.assumeIsolated {
++                            let percent = Int(fraction * 100)
++                            guard percent != state.lastPercent else { return }
++                            state.lastPercent = percent
++                            state.emit(["status": "downloading", "progress": fraction, "version": release.version])
++                        }
++                    }
++                }
++                await MainActor.run {
++                    state.busy = false
++                    state.staged = app
++                    state.emit(["status": "ready"].merging(state.releaseFields(release)) { $1 })
++                }
++            } catch {
++                await MainActor.run {
++                    state.busy = false
++                    state.failed(error)
++                }
++            }
++        }
++    }
++}
++
++/// Installs the downloaded update once LiveHime quits (the caller quits it
++/// when `relaunch` is set, and LiveHime reopens afterwards). Returns 1 when
++/// the installer is waiting, 0 when there is nothing to install or it could
++/// not start (then "failed" is emitted). Call on the main thread.
++@_cdecl("livehime_core_update_install")
++public func livehime_core_update_install(_ relaunch: Int32) -> Int32 {
++    guard Thread.isMainThread else { return 0 }
++    return MainActor.assumeIsolated {
++        let state = UpdateState.shared
++        guard let staged = state.staged, !state.busy else { return 0 }
++        do {
++            try AppUpdater.scheduleInstall(staged: staged, relaunch: relaunch != 0)
++            state.staged = nil
++            return 1
++        } catch {
++            state.failed(error)
++            return 0
++        }
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+new file mode 100644
+index 000000000..b77d35af2
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+@@ -0,0 +1,316 @@
++import CryptoKit
++import Foundation
++import Security
++
++/// A published LiveHime release: the app archive and its checksum.
++public struct AppRelease: Equatable, Sendable {
++    public let version: String
++    public let notes: String
++    public let page: URL
++    public let archive: URL
++    public let size: Int64
++    /// Hex SHA-256 of the archive as published by GitHub ("digest").
++    public let sha256: String?
++}
++
++public enum AppUpdateError: Error, Equatable, LocalizedError {
++    case network(String)
++    case noArchive           // the release has no app archive
++    case missingChecksum     // the release gives no checksum for it
++    case checksumMismatch
++    case invalidApp(String)  // not the same app, version or signer
++    case location(String)    // the running app cannot be replaced in place
++    case busy
++
++    /// Short machine-readable reason for the UI.
++    public var reason: String {
++        switch self {
++        case .network: return "network"
++        case .noArchive: return "noArchive"
++        case .missingChecksum, .checksumMismatch: return "checksum"
++        case .invalidApp: return "invalidApp"
++        case .location: return "location"
++        case .busy: return "busy"
++        }
++    }
++
++    public var errorDescription: String? {
++        switch self {
++        case .network(let detail), .invalidApp(let detail), .location(let detail): return detail
++        default: return reason
++        }
++    }
++}
++
++/// Finds, downloads, verifies and installs LiveHime updates from GitHub
++/// Releases. A download is installed only when its SHA-256 matches the
++/// release's published digest and the app inside has the running app's
++/// bundle identifier, the release's version and a valid signature by the
++/// same certificate as the running app. Installing waits for LiveHime to
++/// quit, then swaps the bundle in place (the old one kept until the swap
++/// succeeds) and optionally reopens it.
++public enum AppUpdater {
++    public static let releasesPage = URL(string: "https://github.com/greyoak111/livehime-macos/releases")!
++    static let latestAPI = URL(string: "https://api.github.com/repos/greyoak111/livehime-macos/releases/latest")!
++
++    /// The release feed; tests point LIVEHIME_UPDATE_FEED at a local JSON file.
++    static var feed: URL {
++        ProcessInfo.processInfo.environment["LIVEHIME_UPDATE_FEED"].flatMap(URL.init(string:)) ?? latestAPI
++    }
++
++    public static var currentVersion: String {
++        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
++    }
++
++    /// Development builds (bundle id ending in ".dev") are not replaced by
++    /// release downloads, unless a test feed is set.
++    public static var installSupported: Bool {
++        !(Bundle.main.bundleIdentifier ?? "").hasSuffix(".dev")
++            || ProcessInfo.processInfo.environment["LIVEHIME_UPDATE_FEED"] != nil
++    }
++
++    // MARK: Versions and the release feed
++
++    /// Numeric comparison of dotted versions ("0.2.10" > "0.2.9").
++    public static func isNewer(_ candidate: String, than current: String) -> Bool {
++        func parts(_ v: String) -> [Int] {
++            v.split(whereSeparator: { !$0.isNumber }).map { Int($0) ?? 0 }
++        }
++        let a = parts(candidate), b = parts(current)
++        for i in 0..<max(a.count, b.count) {
++            let x = i < a.count ? a[i] : 0, y = i < b.count ? b[i] : 0
++            if x != y { return x > y }
++        }
++        return false
++    }
++
++    /// Reads a GitHub "latest release" object.
++    static func release(from data: Data) throws -> AppRelease {
++        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let tag = root["tag_name"] as? String else { throw AppUpdateError.network("invalid release feed") }
++        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
++        let assets = root["assets"] as? [[String: Any]] ?? []
++        guard let asset = assets.first(where: {
++            let name = $0["name"] as? String ?? ""
++            return name.hasPrefix("LiveHimeMacApp-") && name.hasSuffix("-arm64.zip")
++        }), let archive = (asset["browser_download_url"] as? String).flatMap(URL.init(string:)) else {
++            throw AppUpdateError.noArchive
++        }
++        var sha: String?
++        if let digest = asset["digest"] as? String, digest.hasPrefix("sha256:") {
++            sha = String(digest.dropFirst("sha256:".count)).lowercased()
++        }
++        return AppRelease(version: version, notes: root["body"] as? String ?? "",
++                          page: (root["html_url"] as? String).flatMap(URL.init(string:)) ?? releasesPage,
++                          archive: archive, size: (asset["size"] as? NSNumber)?.int64Value ?? 0, sha256: sha)
++    }
++
++    public static func latest() async throws -> AppRelease {
++        var request = URLRequest(url: feed, timeoutInterval: 20)
++        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
++        request.setValue("LiveHime/\(currentVersion)", forHTTPHeaderField: "User-Agent")
++        let data: Data, response: URLResponse
++        do {
++            (data, response) = try await URLSession.shared.data(for: request)
++        } catch {
++            throw AppUpdateError.network(error.localizedDescription)
++        }
++        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
++            throw AppUpdateError.network("HTTP \(http.statusCode)")
++        }
++        return try release(from: data)
++    }
++
++    // MARK: Download and verification
++
++    static var updatesDirectory: URL {
++        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
++        return caches.appendingPathComponent(Bundle.main.bundleIdentifier ?? "LiveHime")
++            .appendingPathComponent("Updates", isDirectory: true)
++    }
++
++    /// Removes leftovers of earlier updates (downloads, the replaced app).
++    public static func cleanUp() {
++        try? FileManager.default.removeItem(at: updatesDirectory)
++    }
++
++    /// Downloads, checks and unpacks `release`; returns the verified app.
++    public static func download(_ release: AppRelease, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
++        guard let expected = release.sha256 else { throw AppUpdateError.missingChecksum }
++        let folder = updatesDirectory.appendingPathComponent(release.version, isDirectory: true)
++        let fm = FileManager.default
++        try? fm.removeItem(at: folder)
++        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
++        let archive = folder.appendingPathComponent("app.zip")
++        try await Downloader.fetch(release.archive, to: archive, expectedSize: release.size, progress: progress)
++        guard try sha256(of: archive) == expected else {
++            try? fm.removeItem(at: folder)
++            throw AppUpdateError.checksumMismatch
++        }
++        let unpacked = folder.appendingPathComponent("unpacked", isDirectory: true)
++        try run("/usr/bin/ditto", ["-x", "-k", archive.path, unpacked.path])
++        try? fm.removeItem(at: archive)
++        guard let app = try fm.contentsOfDirectory(at: unpacked, includingPropertiesForKeys: nil)
++            .first(where: { $0.pathExtension == "app" }) else {
++            throw AppUpdateError.invalidApp("no app in the archive")
++        }
++        try verify(app: app, version: release.version)
++        return app
++    }
++
++    static func sha256(of file: URL) throws -> String {
++        let handle = try FileHandle(forReadingFrom: file)
++        defer { try? handle.close() }
++        var hasher = SHA256()
++        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
++            hasher.update(data: chunk)
++        }
++        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
++    }
++
++    /// The app at `app` must be this app (bundle id), at `version`, validly
++    /// signed by the certificate that signed the running app.
++    static func verify(app: URL, version: String, current: URL = Bundle.main.bundleURL) throws {
++        guard let info = Bundle(url: app)?.infoDictionary else { throw AppUpdateError.invalidApp("not an app") }
++        guard let id = info["CFBundleIdentifier"] as? String, id == Bundle(url: current)?.bundleIdentifier else {
++            throw AppUpdateError.invalidApp("different bundle identifier")
++        }
++        guard (info["CFBundleShortVersionString"] as? String) == version else {
++            throw AppUpdateError.invalidApp("version is not \(version)")
++        }
++        var code: SecStaticCode?
++        guard SecStaticCodeCreateWithPath(app as CFURL, [], &code) == errSecSuccess, let code else {
++            throw AppUpdateError.invalidApp("unreadable signature")
++        }
++        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate)
++        let status = SecStaticCodeCheckValidity(code, flags, nil)
++        guard status == errSecSuccess else { throw AppUpdateError.invalidApp("invalid signature (\(status))") }
++        guard let signer = leafCertificate(of: app), signer == leafCertificate(of: current) else {
++            throw AppUpdateError.invalidApp("signed by a different certificate")
++        }
++    }
++
++    static func leafCertificate(of app: URL) -> Data? {
++        var code: SecStaticCode?
++        guard SecStaticCodeCreateWithPath(app as CFURL, [], &code) == errSecSuccess, let code else { return nil }
++        var info: CFDictionary?
++        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
++              let certificates = (info as? [String: Any])?[kSecCodeInfoCertificates as String] as? [SecCertificate],
++              let leaf = certificates.first else { return nil }
++        return SecCertificateCopyData(leaf) as Data
++    }
++
++    // MARK: Installation
++
++    /// Starts a helper that waits for this process to exit, replaces `target`
++    /// with `staged`, and reopens it when `relaunch` is set.
++    public static func scheduleInstall(staged: URL, target: URL = Bundle.main.bundleURL, relaunch: Bool) throws {
++        let fm = FileManager.default
++        if target.path.contains("/AppTranslocation/") {
++            throw AppUpdateError.location("LiveHime is running from a temporary location; move it to Applications first")
++        }
++        guard fm.isWritableFile(atPath: target.deletingLastPathComponent().path), fm.isWritableFile(atPath: target.path) else {
++            throw AppUpdateError.location("no permission to replace \(target.path)")
++        }
++        let folder = staged.deletingLastPathComponent().deletingLastPathComponent()
++        let script = folder.appendingPathComponent("install.sh")
++        try """
++        #!/bin/sh
++        # LiveHime update: wait for the app to quit, swap the bundle, keep the old one on failure.
++        # Arguments after the fifth are "--env NAME=VALUE" pairs passed on to the reopened app.
++        pid="$1"; target="$2"; staged="$3"; backup="$4"; relaunch="$5"; shift 5
++        while /bin/kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.3; done
++        /bin/rm -rf "$backup"
++        /bin/mv "$target" "$backup" || exit 1
++        if /usr/bin/ditto "$staged" "$target"; then
++            /bin/rm -rf "$staged"
++        else
++            /bin/rm -rf "$target"
++            /bin/mv "$backup" "$target"
++            exit 1
++        fi
++        if [ "$relaunch" = 1 ]; then /usr/bin/open "$@" "$target"; fi
++        """.write(to: script, atomically: true, encoding: .utf8)
++        let process = Process()
++        process.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
++        process.arguments = ["/bin/sh", script.path, String(getpid()), target.path, staged.path,
++                             updatesDirectory.appendingPathComponent("previous.app").path, relaunch ? "1" : "0"]
++            // LiveHime's own settings from the environment (test keychain, test feed) survive the relaunch.
++            + ProcessInfo.processInfo.environment.filter { $0.key.hasPrefix("LIVEHIME_") }.sorted { $0.key < $1.key }
++                .flatMap { ["--env", "\($0.key)=\($0.value)"] }
++        let log = folder.appendingPathComponent("install.log")
++        fm.createFile(atPath: log.path, contents: nil)
++        process.standardOutput = try FileHandle(forWritingTo: log)
++        process.standardError = process.standardOutput
++        try process.run()
++    }
++
++    @discardableResult
++    static func run(_ tool: String, _ arguments: [String]) throws -> Int32 {
++        let process = Process()
++        process.executableURL = URL(fileURLWithPath: tool)
++        process.arguments = arguments
++        try process.run()
++        process.waitUntilExit()
++        guard process.terminationStatus == 0 else {
++            throw AppUpdateError.invalidApp("\((tool as NSString).lastPathComponent) failed (\(process.terminationStatus))")
++        }
++        return process.terminationStatus
++    }
++}
++
++/// A download task that reports progress and moves the file into place.
++private final class Downloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
++    private let destination: URL
++    private let expectedSize: Int64
++    private let progress: @Sendable (Double) -> Void
++    private var continuation: CheckedContinuation<Void, Error>?
++    private var moveError: Error?
++
++    private init(destination: URL, expectedSize: Int64, progress: @escaping @Sendable (Double) -> Void) {
++        self.destination = destination
++        self.expectedSize = expectedSize
++        self.progress = progress
++    }
++
++    static func fetch(_ url: URL, to destination: URL, expectedSize: Int64,
++                      progress: @escaping @Sendable (Double) -> Void) async throws {
++        let delegate = Downloader(destination: destination, expectedSize: expectedSize, progress: progress)
++        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
++        defer { session.finishTasksAndInvalidate() }
++        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
++            delegate.continuation = continuation
++            session.downloadTask(with: url).resume()
++        }
++    }
++
++    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
++                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
++        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedSize
++        if total > 0 { progress(min(1, Double(totalBytesWritten) / Double(total))) }
++    }
++
++    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
++        if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
++            moveError = AppUpdateError.network("HTTP \(http.statusCode)")
++            return
++        }
++        do {
++            try? FileManager.default.removeItem(at: destination)
++            try FileManager.default.moveItem(at: location, to: destination)
++        } catch {
++            moveError = error
++        }
++    }
++
++    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
++        if let error {
++            continuation?.resume(throwing: AppUpdateError.network(error.localizedDescription))
++        } else if let moveError {
++            continuation?.resume(throwing: moveError)
++        } else {
++            continuation?.resume()
++        }
++        continuation = nil
++    }
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
+new file mode 100644
+index 000000000..0f31422c4
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
+@@ -0,0 +1,54 @@
++import XCTest
++@testable import LiveHimeCore
++
++final class AppUpdaterTests: XCTestCase {
++    func testVersionsCompareNumerically() {
++        XCTAssertTrue(AppUpdater.isNewer("0.2.10", than: "0.2.9"))
++        XCTAssertTrue(AppUpdater.isNewer("0.3", than: "0.2.7"))
++        XCTAssertTrue(AppUpdater.isNewer("1.0.0", than: "0.9.99"))
++        XCTAssertFalse(AppUpdater.isNewer("0.2.7", than: "0.2.7"))
++        XCTAssertFalse(AppUpdater.isNewer("0.2.7", than: "0.2.7.0"))
++        XCTAssertFalse(AppUpdater.isNewer("0.2.6", than: "0.2.7"))
++    }
++
++    func testReadsTheAppArchiveAndItsDigest() throws {
++        let json = #"""
++        {"tag_name":"v0.2.8","html_url":"https://github.com/x/y/releases/tag/v0.2.8","body":"notes",
++         "assets":[
++          {"name":"DEPENDENCY-INVENTORY-v0.2.8.txt","browser_download_url":"https://example.invalid/inv.txt","size":1,
++           "digest":"sha256:00"},
++          {"name":"LiveHimeMacApp-v0.2.8-arm64.dmg","browser_download_url":"https://example.invalid/a.dmg","size":2},
++          {"name":"LiveHimeMacApp-v0.2.8-arm64.zip","browser_download_url":"https://example.invalid/a.zip","size":3,
++           "digest":"sha256:ABCDEF"}]}
++        """#
++        let release = try AppUpdater.release(from: Data(json.utf8))
++        XCTAssertEqual(release.version, "0.2.8")
++        XCTAssertEqual(release.archive.absoluteString, "https://example.invalid/a.zip")
++        XCTAssertEqual(release.size, 3)
++        XCTAssertEqual(release.sha256, "abcdef")
++        XCTAssertEqual(release.notes, "notes")
++    }
++
++    func testReleaseWithoutArchiveIsRejected() {
++        let json = #"{"tag_name":"v0.2.8","assets":[{"name":"x.dmg","browser_download_url":"https://e.invalid/x"}]}"#
++        XCTAssertThrowsError(try AppUpdater.release(from: Data(json.utf8))) {
++            XCTAssertEqual($0 as? AppUpdateError, .noArchive)
++        }
++    }
++
++    func testSha256OfAFile() throws {
++        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++        try Data("abc".utf8).write(to: file)
++        defer { try? FileManager.default.removeItem(at: file) }
++        XCTAssertEqual(try AppUpdater.sha256(of: file),
++                       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
++    }
++
++    func testAnotherAppIsNotAccepted() {
++        // A system app: different bundle identifier and signer than the test host.
++        let other = URL(fileURLWithPath: "/System/Applications/Calculator.app")
++        XCTAssertThrowsError(try AppUpdater.verify(app: other, version: "1.0", current: URL(fileURLWithPath: "/System/Applications/TextEdit.app"))) {
++            guard case .invalidApp = $0 as? AppUpdateError else { return XCTFail("\($0)") }
++        }
++    }
++}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 9f8a6aad6..7d465de17 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -70,6 +70,19 @@ typedef void (*livehime_page_result_callback)(const char *result_json, void *con
+ void livehime_core_page_eval(const char *key, const char *script, livehime_page_result_callback done, void *context);
+ int livehime_core_page_click(const char *key, double x, double y);
+ 
++/* App updates from GitHub Releases (a test feed can be set with the
++ * LIVEHIME_UPDATE_FEED environment variable). check looks for a newer
++ * release, download fetches and verifies it (SHA-256 digest, same bundle id,
++ * version and signing certificate as the running app), install arranges for
++ * it to replace the app once LiveHime quits and returns 1 when it will (with
++ * relaunch set, LiveHime reopens; the caller then quits). Main thread only.
++ * Emits {"event":"update","status":"checking|upToDate|available|downloading|
++ * ready|failed","current","supported"(false for development builds),
++ * ["version","notes","page","size","progress"(0-1),"reason","message"]}. */
++void livehime_core_update_check(void);
++void livehime_core_update_download(void);
++int livehime_core_update_install(int relaunch);
++
+ /* Room activity. Once the account is ready the core keeps the room's danmaku
+  * connection open and emits:
+  *   {"event":"danmakuStatus","status":"connecting|connected|reconnecting|stopped"}
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 285981eb6..c0908e0dd 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -191,3 +191,33 @@ LiveHime.Box.Place.TopLeft="Top left"
+ LiveHime.Box.Place.TopRight="Top right"
+ LiveHime.Box.Place.Free="Free"
+ LiveHime.Overlay.NameColor="Name color"
++LiveHime.Update.Tab="Updates"
++LiveHime.Update.Current="Version %1"
++LiveHime.Update.Automatic="Check for and download updates automatically"
++LiveHime.Update.AutomaticTip="When on, LiveHime checks GitHub for a new version after launch and every few hours, downloads it in the background and installs it when you quit. When off, it checks only when you click Check for Updates; downloading and installing work the same way."
++LiveHime.Update.Check="Check for Updates"
++LiveHime.Update.Download="Download and install v%1"
++LiveHime.Update.Restart="Restart and update to v%1"
++LiveHime.Update.OpenReleases="Open the releases page on GitHub"
++LiveHime.Update.Hint="Updates come from this project's GitHub Releases. Before installing, the file checksum is checked and the new version must be signed with the same certificate as this app; your login and settings are kept. LiveHime never restarts while streaming or recording."
++LiveHime.Update.Status.auto="Automatic updates are on."
++LiveHime.Update.Status.manual="Automatic updates are off; click Check for Updates."
++LiveHime.Update.Status.checking="Checking for updates…"
++LiveHime.Update.Status.upToDate="LiveHime is up to date."
++LiveHime.Update.Status.available="Version %1 is available."
++LiveHime.Update.Status.devBuild="Version %1 is available. This is a development build; download it from the releases page."
++LiveHime.Update.Status.downloading="Downloading %1…"
++LiveHime.Update.Status.ready="Version %1 is downloaded and verified; it installs when you quit LiveHime."
++LiveHime.Update.Status.busyOutput="Streaming or recording: restart after you stop (or %1 installs when you quit)."
++LiveHime.Update.Status.manualHint="You can also download it from the releases page."
++LiveHime.Update.Failed.network="Could not check for or download the update. Check your network."
++LiveHime.Update.Failed.checksum="The download failed its checksum and was discarded."
++LiveHime.Update.Failed.invalidApp="The downloaded app failed the signature check and was discarded."
++LiveHime.Update.Failed.location="LiveHime cannot replace itself here (keep it in the Applications folder)."
++LiveHime.Update.Failed.noArchive="This release has no app package."
++LiveHime.Update.Failed.unsupported="Development builds do not update themselves."
++LiveHime.Update.BannerAvailable="Version %1 is available"
++LiveHime.Update.BannerView="View"
++LiveHime.Update.BannerReady="Version %1 is downloaded and installs when you quit"
++LiveHime.Update.BannerRestart="Restart now"
++LiveHime.Update.BannerDismiss="Hide for now"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 530dce23c..58a61cbd0 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -191,3 +191,33 @@ LiveHime.Box.Place.TopLeft="左上"
+ LiveHime.Box.Place.TopRight="右上"
+ LiveHime.Box.Place.Free="自由摆放"
+ LiveHime.Overlay.NameColor="用户名颜色"
++LiveHime.Update.Tab="更新"
++LiveHime.Update.Current="当前版本 %1"
++LiveHime.Update.Automatic="自动检查并下载更新"
++LiveHime.Update.AutomaticTip="打开后，LiveHime 会在启动后和每隔几个小时检查一次 GitHub 上的新版本，在后台下载好，退出时自动安装。关闭后只在你点“检查更新”时检查，下载和安装走同一个流程。"
++LiveHime.Update.Check="检查更新"
++LiveHime.Update.Download="下载并安装 v%1"
++LiveHime.Update.Restart="立即重启并更新到 v%1"
++LiveHime.Update.OpenReleases="在 GitHub 查看发布页"
++LiveHime.Update.Hint="更新从本项目的 GitHub Releases 下载。安装前会核对文件校验值，并确认新版本和当前应用的签名证书一致；登录和设置都会保留。直播或录制时不会重启。"
++LiveHime.Update.Status.auto="自动更新已开启。"
++LiveHime.Update.Status.manual="自动更新已关闭，点“检查更新”手动检查。"
++LiveHime.Update.Status.checking="正在检查更新…"
++LiveHime.Update.Status.upToDate="已是最新版本。"
++LiveHime.Update.Status.available="发现新版本 v%1。"
++LiveHime.Update.Status.devBuild="发现新版本 v%1。这是开发版，请到发布页下载。"
++LiveHime.Update.Status.downloading="正在下载 v%1…"
++LiveHime.Update.Status.ready="v%1 已下载并通过校验，退出 LiveHime 时会自动安装。"
++LiveHime.Update.Status.busyOutput="正在直播或录制，结束后再重启更新（或者退出时自动安装 v%1）。"
++LiveHime.Update.Status.manualHint="也可以到发布页手动下载。"
++LiveHime.Update.Failed.network="检查或下载更新失败，请检查网络。"
++LiveHime.Update.Failed.checksum="下载的文件没有通过校验，已丢弃。"
++LiveHime.Update.Failed.invalidApp="下载的应用没有通过签名检查，已丢弃。"
++LiveHime.Update.Failed.location="无法替换当前应用（请把 LiveHime 放在“应用程序”文件夹里再更新）。"
++LiveHime.Update.Failed.noArchive="这个版本没有可用的安装包。"
++LiveHime.Update.Failed.unsupported="开发版不能自动更新。"
++LiveHime.Update.BannerAvailable="发现新版本 v%1"
++LiveHime.Update.BannerView="查看"
++LiveHime.Update.BannerReady="v%1 已下载，退出时自动安装"
++LiveHime.Update.BannerRestart="立即重启"
++LiveHime.Update.BannerDismiss="暂时隐藏"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 51bd6d1b3..4d9e3572b 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -7,6 +7,7 @@
+ #include "feature-panel.hpp"
+ #include "floating-chat.hpp"
+ #include "danmaku-feed.hpp"
++#include "update-page.hpp"
+ #include "livehime-dock.hpp"
+ 
+ #include <livehime-core.h>
+@@ -16,6 +17,8 @@
+ #include <obs-websocket-api.h>
+ 
+ #include <QAction>
++#include <QTabWidget>
++#include <QApplication>
+ #include <QJsonDocument>
+ #include <QMainWindow>
+ #include <QMenu>
+@@ -181,6 +184,48 @@ void floatingChat(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
++/* Test hook: renders the dock (optionally switched to "tab" 0-3) into the
++ * PNG file "path", as it would appear on screen. */
++void snapshot(obs_data_t *request, obs_data_t *response, void *)
++{
++	const QString path = QString::fromUtf8(obs_data_get_string(request, "path"));
++	onUiThread([&] {
++		if (obs_data_has_user_value(request, "tab"))
++			target->features()->tabs()->setCurrentIndex(static_cast<int>(obs_data_get_int(request, "tab")));
++		QApplication::processEvents();
++		const bool ok = !path.isEmpty() && target->grab().save(path, "PNG");
++		obs_data_set_bool(response, "saved", ok);
++	});
++}
++
++/* Updates for tests: optional "automatic" (bool) and "action" (check |
++ * download | restart), then replies with the Updates tab's state. With
++ * LIVEHIME_UPDATE_FEED set the feed and archive can be local files. */
++void update(obs_data_t *request, obs_data_t *response, void *)
++{
++	onUiThread([&] {
++		UpdatePage *page = target->features()->updates();
++		if (obs_data_has_user_value(request, "automatic"))
++			page->setAutomatic(obs_data_get_bool(request, "automatic"));
++		const QString action = QString::fromUtf8(obs_data_get_string(request, "action"));
++		bool accepted = true;
++		if (action == "check")
++			page->check();
++		else if (action == "download")
++			page->download();
++		else if (action == "restart")
++			accepted = page->restartNow();
++		obs_data_set_bool(response, "accepted", accepted);
++		obs_data_set_bool(response, "automatic", page->automatic());
++		obs_data_set_string(response, "status", page->status().toUtf8().constData());
++		obs_data_set_string(response, "available", page->availableVersion().toUtf8().constData());
++		obs_data_set_string(response, "ready", page->readyVersion().toUtf8().constData());
++		obs_data_set_double(response, "progress", page->progress());
++		obs_data_set_string(response, "reason", page->failReason().toUtf8().constData());
++		obs_data_set_string(response, "current", UpdatePage::currentVersion().toUtf8().constData());
++	});
++}
++
+ /* Live captions for tests: optional {"enabled","source" (name),"locale"}
+  * applies like the Captions tab; replies with the state, the current
+  * caption and what the captions source "overlay_source" shows. */
+@@ -296,6 +341,8 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "HostedPage", hostedPage, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Captions", captions, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "OverlayState", overlayState, nullptr);
++	obs_websocket_vendor_register_request(vendor, "Update", update, nullptr);
++	obs_websocket_vendor_register_request(vendor, "Snapshot", snapshot, nullptr);
+ }
+ 
+ void UnregisterAutomation()
+@@ -313,6 +360,8 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "HostedPage");
+ 		obs_websocket_vendor_unregister_request(vendor, "Captions");
+ 		obs_websocket_vendor_unregister_request(vendor, "OverlayState");
++		obs_websocket_vendor_unregister_request(vendor, "Update");
++		obs_websocket_vendor_unregister_request(vendor, "Snapshot");
+ 		vendor = nullptr;
+ 	}
+ 	target.clear();
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 81ab23394..737662aed 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -1,4 +1,5 @@
+ #include "feature-panel.hpp"
++#include "update-page.hpp"
+ #include "captions-page.hpp"
+ #include "danmaku-feed.hpp"
+ #include "floating-chat.hpp"
+@@ -26,6 +27,7 @@
+ #include <QScrollArea>
+ #include <QScrollBar>
+ #include <QTabWidget>
++#include <QToolButton>
+ #include <QVBoxLayout>
+ 
+ namespace {
+@@ -142,6 +144,47 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 
+ 	/* Captions tab: works without signing in. */
+ 	captions_ = new CaptionsPage(this);
++	updates_ = new UpdatePage(this);
++
++	/* A slim notice above the tabs when an update is found or downloaded. */
++	updateBanner_ = new QWidget(this);
++	updateBanner_->setObjectName(QStringLiteral("updateBanner"));
++	updateBanner_->setStyleSheet(QStringLiteral(
++		"#updateBanner { background: #2c2330; border: 1px solid #fb7299; border-radius: 6px; }"));
++	updateBannerText_ = new QLabel(updateBanner_);
++	updateBannerText_->setWordWrap(true);
++	updateBannerButton_ = new QPushButton(updateBanner_);
++	auto *dismiss = new QToolButton(updateBanner_);
++	dismiss->setText(QStringLiteral("×"));
++	dismiss->setAutoRaise(true);
++	dismiss->setToolTip(text("LiveHime.Update.BannerDismiss"));
++	auto *bannerRow = new QHBoxLayout(updateBanner_);
++	bannerRow->setContentsMargins(8, 4, 4, 4);
++	bannerRow->addWidget(updateBannerText_, 1);
++	bannerRow->addWidget(updateBannerButton_);
++	bannerRow->addWidget(dismiss);
++	updateBanner_->hide();
++	connect(dismiss, &QToolButton::clicked, updateBanner_, &QWidget::hide);
++	connect(updateBannerButton_, &QPushButton::clicked, this, [this] {
++		if (!updates_->readyVersion().isEmpty()) {
++			if (!updates_->restartNow())
++				tabs_->setCurrentWidget(updates_);
++		} else {
++			tabs_->setCurrentWidget(updates_);
++		}
++	});
++	connect(updates_, &UpdatePage::available, this, [this](const QString &version) {
++		if (updates_->automatic())
++			return; /* it downloads; the banner comes with "ready" */
++		updateBannerText_->setText(text("LiveHime.Update.BannerAvailable").arg(version));
++		updateBannerButton_->setText(text("LiveHime.Update.BannerView"));
++		updateBanner_->show();
++	});
++	connect(updates_, &UpdatePage::ready, this, [this](const QString &version) {
++		updateBannerText_->setText(text("LiveHime.Update.BannerReady").arg(version));
++		updateBannerButton_->setText(text("LiveHime.Update.BannerRestart"));
++		updateBanner_->show();
++	});
+ 
+ 	danmakuPage_ = danmakuPage;
+ 	roomPage_ = roomScroll;
+@@ -149,11 +192,13 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	tabs_->addTab(danmakuPage, text("LiveHime.Feature.DanmakuTab"));
+ 	tabs_->addTab(roomScroll, text("LiveHime.Feature.RoomTab"));
+ 	tabs_->addTab(captions_, text("LiveHime.Captions.Tab"));
++	tabs_->addTab(updates_, text("LiveHime.Update.Tab"));
+ 
+ 	auto *layout = new QVBoxLayout(this);
+ 	layout->setContentsMargins(0, 0, 0, 0);
+ 	layout->addWidget(stats_);
+ 	layout->addWidget(signedOutHint_);
++	layout->addWidget(updateBanner_);
+ 	layout->addWidget(tabs_, 1);
+ 
+ 	connect(saveTitle_, &QPushButton::clicked, this, &FeaturePanel::saveTitle);
+@@ -207,6 +252,10 @@ void FeaturePanel::applyEvent(const QJsonObject &event)
+ 		captions_->handleEvent(event);
+ 		return;
+ 	}
++	if (name == "update") {
++		updates_->handleEvent(event);
++		return;
++	}
+ 	feed_->handleEvent(event);
+ 	floating_->feed()->handleEvent(event);
+ 	if (name == "room") {
+diff --git a/plugins/livehime/src/feature-panel.hpp b/plugins/livehime/src/feature-panel.hpp
+index e6aea64d0..21108ad34 100644
+--- a/plugins/livehime/src/feature-panel.hpp
++++ b/plugins/livehime/src/feature-panel.hpp
+@@ -13,6 +13,7 @@ class QListWidget;
+ class QPushButton;
+ class QTabWidget;
+ class QTimer;
++class UpdatePage;
+ 
+ /* Everyday live-room features below the account section: room stats, the
+  * live danmaku feed (chat, gifts, Super Chats, guards, entries) with sending
+@@ -26,6 +27,8 @@ public:
+ 
+ 	FloatingChat *floatingChat() { return floating_; }
+ 	CaptionsPage *captions() { return captions_; }
++	UpdatePage *updates() { return updates_; }
++	QTabWidget *tabs() { return tabs_; }
+ 
+ public slots:
+ 	void applyState(const QJsonObject &state);
+@@ -51,6 +54,10 @@ private:
+ 	QWidget *danmakuPage_;
+ 	QWidget *roomPage_;
+ 	CaptionsPage *captions_;
++	UpdatePage *updates_;
++	QWidget *updateBanner_;
++	QLabel *updateBannerText_;
++	QPushButton *updateBannerButton_;
+ 	DanmakuFeed *feed_;
+ 	FloatingChat *floating_;
+ 	QPushButton *floatingButton_;
+diff --git a/plugins/livehime/src/update-page.cpp b/plugins/livehime/src/update-page.cpp
+new file mode 100644
+index 000000000..01ac69fb5
+--- /dev/null
++++ b/plugins/livehime/src/update-page.cpp
+@@ -0,0 +1,267 @@
++#include "update-page.hpp"
++#include "plugin-settings.hpp"
++
++#include <livehime-core.h>
++#include <obs-module.h>
++
++#include <CoreFoundation/CoreFoundation.h>
++
++#include <QCheckBox>
++#include <QDesktopServices>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QMainWindow>
++#include <QProgressBar>
++#include <QPushButton>
++#include <QSignalBlocker>
++#include <QTextBrowser>
++#include <QTimer>
++#include <QUrl>
++#include <QVBoxLayout>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++} // namespace
++
++QString UpdatePage::currentVersion()
++{
++	auto value = static_cast<CFStringRef>(
++		CFBundleGetValueForInfoDictionaryKey(CFBundleGetMainBundle(), CFSTR("CFBundleShortVersionString")));
++	if (!value || CFGetTypeID(value) != CFStringGetTypeID())
++		return QString();
++	char buffer[64] = {};
++	CFStringGetCString(value, buffer, sizeof(buffer), kCFStringEncodingUTF8);
++	return QString::fromUtf8(buffer);
++}
++
++namespace {
++const QString kReleases = QStringLiteral("https://github.com/greyoak111/livehime-macos/releases");
++/* Automatic checks: shortly after launch, then every six hours. */
++constexpr int kFirstCheckMs = 15 * 1000;
++constexpr int kCheckIntervalMs = 6 * 60 * 60 * 1000;
++} // namespace
++
++UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
++{
++	load();
++
++	version_ = new QLabel(text("LiveHime.Update.Current").arg(currentVersion()), this);
++	auto_ = new QCheckBox(text("LiveHime.Update.Automatic"), this);
++	auto_->setToolTip(text("LiveHime.Update.AutomaticTip"));
++	auto_->setChecked(automatic_);
++	check_ = new QPushButton(text("LiveHime.Update.Check"), this);
++	status_ = new QLabel(this);
++	status_->setWordWrap(true);
++	bar_ = new QProgressBar(this);
++	bar_->setRange(0, 100);
++	bar_->setTextVisible(true);
++	bar_->hide();
++	notes_ = new QTextBrowser(this);
++	notes_->setOpenExternalLinks(true);
++	notes_->setMaximumHeight(220);
++	notes_->hide();
++	action_ = new QPushButton(this);
++	action_->hide();
++	link_ = new QLabel(QStringLiteral("<a href=\"%1\" style=\"color:#fb7299\">%2</a>")
++				   .arg(kReleases, text("LiveHime.Update.OpenReleases")),
++			   this);
++	link_->setOpenExternalLinks(false);
++	connect(link_, &QLabel::linkActivated, this,
++		[this](const QString &url) { QDesktopServices::openUrl(QUrl(page_.isEmpty() ? url : page_)); });
++	auto *hint = new QLabel(text("LiveHime.Update.Hint"), this);
++	hint->setWordWrap(true);
++	hint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++
++	auto *top = new QHBoxLayout;
++	top->addWidget(version_, 1);
++	top->addWidget(check_);
++	auto *layout = new QVBoxLayout(this);
++	layout->setContentsMargins(0, 6, 0, 0);
++	layout->addLayout(top);
++	layout->addWidget(auto_);
++	layout->addWidget(status_);
++	layout->addWidget(bar_);
++	layout->addWidget(notes_);
++	layout->addWidget(action_);
++	layout->addWidget(link_);
++	layout->addWidget(hint);
++	layout->addStretch(1);
++
++	connect(auto_, &QCheckBox::toggled, this, &UpdatePage::setAutomatic);
++	connect(check_, &QPushButton::clicked, this, &UpdatePage::check);
++	connect(action_, &QPushButton::clicked, this, [this] {
++		if (!readyVersion_.isEmpty())
++			restartNow();
++		else
++			download();
++	});
++
++	timer_ = new QTimer(this);
++	connect(timer_, &QTimer::timeout, this, [this] {
++		timer_->setInterval(kCheckIntervalMs);
++		if (automatic_ && readyVersion_.isEmpty())
++			check();
++	});
++	if (automatic_) {
++		timer_->setInterval(kFirstCheckMs);
++		timer_->start();
++	}
++	setStatus(automatic_ ? "LiveHime.Update.Status.auto" : "LiveHime.Update.Status.manual");
++	obs_frontend_add_event_callback(frontendEvent, this);
++}
++
++UpdatePage::~UpdatePage()
++{
++	obs_frontend_remove_event_callback(frontendEvent, this);
++}
++
++void UpdatePage::frontendEvent(enum obs_frontend_event event, void *param)
++{
++	auto *self = static_cast<UpdatePage *>(param);
++	/* A downloaded update is installed when LiveHime quits. */
++	if (event == OBS_FRONTEND_EVENT_EXIT && !self->readyVersion_.isEmpty()) {
++		if (livehime_core_update_install(0))
++			blog(LOG_INFO, "[livehime] installing %s after quitting", self->readyVersion_.toUtf8().constData());
++	}
++}
++
++void UpdatePage::setAutomatic(bool automatic)
++{
++	if (automatic == automatic_)
++		return;
++	automatic_ = automatic;
++	{
++		QSignalBlocker block(auto_);
++		auto_->setChecked(automatic);
++	}
++	save();
++	if (automatic_) {
++		timer_->setInterval(kFirstCheckMs);
++		timer_->start();
++	} else {
++		timer_->stop();
++	}
++	if (status_key_ == "LiveHime.Update.Status.auto" || status_key_ == "LiveHime.Update.Status.manual")
++		setStatus(automatic_ ? "LiveHime.Update.Status.auto" : "LiveHime.Update.Status.manual");
++}
++
++void UpdatePage::check()
++{
++	livehime_core_update_check();
++}
++
++void UpdatePage::download()
++{
++	livehime_core_update_download();
++}
++
++bool UpdatePage::restartNow()
++{
++	if (readyVersion_.isEmpty())
++		return false;
++	if (obs_frontend_streaming_active() || obs_frontend_recording_active()) {
++		setStatus("LiveHime.Update.Status.busyOutput", readyVersion_, true);
++		return false;
++	}
++	if (!livehime_core_update_install(1))
++		return false;
++	readyVersion_.clear();
++	blog(LOG_INFO, "[livehime] quitting to install the update");
++	if (auto *main = static_cast<QMainWindow *>(obs_frontend_get_main_window()))
++		QMetaObject::invokeMethod(main, "close", Qt::QueuedConnection);
++	return true;
++}
++
++void UpdatePage::handleEvent(const QJsonObject &event)
++{
++	const QString status = event.value("status").toString();
++	supported_ = event.value("supported").toBool(true);
++	const QString version = event.value("version").toString();
++	if (event.contains("page"))
++		page_ = event.value("page").toString();
++	check_->setEnabled(status != "checking" && status != "downloading");
++	bar_->setVisible(status == "downloading");
++	if (status != "failed")
++		failReason_.clear();
++	if (status == "checking") {
++		setStatus("LiveHime.Update.Status.checking");
++	} else if (status == "upToDate") {
++		availableVersion_.clear();
++		notes_->hide();
++		action_->hide();
++		setStatus("LiveHime.Update.Status.upToDate");
++	} else if (status == "available") {
++		availableVersion_ = version;
++		notes_->setMarkdown(event.value("notes").toString());
++		notes_->setVisible(!notes_->toPlainText().isEmpty());
++		if (!supported_) {
++			action_->hide();
++			setStatus("LiveHime.Update.Status.devBuild", version);
++		} else {
++			action_->setText(text("LiveHime.Update.Download").arg(version));
++			action_->setVisible(!automatic_);
++			setStatus("LiveHime.Update.Status.available", version);
++			if (automatic_)
++				download();
++		}
++		emit available(version);
++	} else if (status == "downloading") {
++		progress_ = event.value("progress").toDouble();
++		bar_->setValue(static_cast<int>(progress_ * 100));
++		action_->hide();
++		setStatus("LiveHime.Update.Status.downloading", version);
++	} else if (status == "ready") {
++		readyVersion_ = version;
++		action_->setText(text("LiveHime.Update.Restart").arg(version));
++		action_->show();
++		setStatus("LiveHime.Update.Status.ready", version);
++		emit ready(version);
++	} else if (status == "failed") {
++		const QString reason = event.value("reason").toString();
++		failReason_ = reason;
++		const QByteArray key = "LiveHime.Update.Failed." + reason.toUtf8();
++		const char *localized = obs_module_text(key.constData());
++		QString message = QString::fromUtf8(localized);
++		if (message == QString::fromUtf8(key))
++			message = text("LiveHime.Update.Failed.network");
++		status_key_ = QStringLiteral("failed");
++		status_->setText(message + QStringLiteral("\n") + text("LiveHime.Update.Status.manualHint"));
++		status_->setStyleSheet(QStringLiteral("color: #e06c75;"));
++		blog(LOG_WARNING, "[livehime] update failed: %s %s", reason.toUtf8().constData(),
++		     event.value("message").toString().toUtf8().constData());
++		/* A manual retry offers the download again. */
++		if (!availableVersion_.isEmpty() && supported_ && readyVersion_.isEmpty()) {
++			action_->setText(text("LiveHime.Update.Download").arg(availableVersion_));
++			action_->show();
++		}
++	}
++}
++
++void UpdatePage::setStatus(const char *key, const QString &arg, bool error)
++{
++	status_key_ = QString::fromUtf8(key);
++	QString message = text(key);
++	if (message.contains(QStringLiteral("%1")))
++		message = message.arg(arg);
++	status_->setText(message);
++	status_->setStyleSheet(error ? QStringLiteral("color: #e06c75;") : QStringLiteral("color: #9aa0ab;"));
++}
++
++void UpdatePage::load()
++{
++	OBSDataAutoRelease settings = LoadPluginSettings();
++	OBSDataAutoRelease update = obs_data_get_obj(settings, "update");
++	automatic_ = !update || !obs_data_has_user_value(update, "automatic") || obs_data_get_bool(update, "automatic");
++}
++
++void UpdatePage::save() const
++{
++	OBSDataAutoRelease update = obs_data_create();
++	obs_data_set_bool(update, "automatic", automatic_);
++	OBSDataAutoRelease changes = obs_data_create();
++	obs_data_set_obj(changes, "update", update);
++	SavePluginSettings(changes);
++}
+diff --git a/plugins/livehime/src/update-page.hpp b/plugins/livehime/src/update-page.hpp
+new file mode 100644
+index 000000000..69e05962f
+--- /dev/null
++++ b/plugins/livehime/src/update-page.hpp
+@@ -0,0 +1,73 @@
++#pragma once
++
++#include <obs-frontend-api.h>
++
++#include <QJsonObject>
++#include <QWidget>
++
++class QCheckBox;
++class QLabel;
++class QProgressBar;
++class QPushButton;
++class QTextBrowser;
++class QTimer;
++
++/* The dock's "Updates" tab. Automatic mode checks GitHub Releases shortly
++ * after launch and every few hours and downloads a new version in the
++ * background; manual mode checks and downloads only on request. Both use
++ * the same verified download, installed when LiveHime quits or at once with
++ * "Restart and update" (not while streaming or recording). Settings live in
++ * features.json under "update". */
++class UpdatePage : public QWidget {
++	Q_OBJECT
++
++public:
++	explicit UpdatePage(QWidget *parent = nullptr);
++	~UpdatePage() override;
++
++	void handleEvent(const QJsonObject &event);
++	bool automatic() const { return automatic_; }
++	void setAutomatic(bool automatic);
++	/* Automation and the banner: same as the buttons. */
++	void check();
++	void download();
++	/* Quits LiveHime to install now; false while streaming or recording. */
++	bool restartNow();
++	QString status() const { return status_key_; }
++	QString readyVersion() const { return readyVersion_; }
++	QString availableVersion() const { return availableVersion_; }
++	double progress() const { return progress_; }
++	QString failReason() const { return failReason_; }
++	/* The running app's version (CFBundleShortVersionString). */
++	static QString currentVersion();
++
++signals:
++	/* A newer version was found (not yet downloaded), or is downloaded. */
++	void available(const QString &version);
++	void ready(const QString &version);
++
++private:
++	static void frontendEvent(enum obs_frontend_event event, void *param);
++	void setStatus(const char *key, const QString &arg = QString(), bool error = false);
++	void load();
++	void save() const;
++
++	bool automatic_ = true;
++	bool supported_ = true;
++	QString status_key_;
++	QString availableVersion_;
++	QString readyVersion_;
++	QString page_;
++	double progress_ = 0;
++	QString failReason_;
++
++	QLabel *version_;
++	QCheckBox *auto_;
++	QPushButton *check_;
++	QLabel *status_;
++	QProgressBar *bar_;
++	QTextBrowser *notes_;
++	QPushButton *action_;
++	QLabel *link_;
++	QTimer *timer_;
++};
+-- 
+2.54.0 (Apple Git-157)
+

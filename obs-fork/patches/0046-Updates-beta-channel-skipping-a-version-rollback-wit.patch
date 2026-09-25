@@ -1,0 +1,1090 @@
+From 556dfe36d52ee06b15588b3bce39a6ceae481f33 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 12:52:10 +0800
+Subject: [PATCH 46/48] Updates: beta channel, skipping a version, rollback
+ with settings backups
+
+- Beta: an opt-in option also offers pre-releases (the release list instead
+  of the latest stable release).
+- Skip: a skipped version is left alone by automatic mode; a manual check
+  still shows it and downloading it clears the skip.
+- Every install first backs up OBS's settings (scenes, profiles, plugin
+  settings; the newest 8 are kept) under Application Support/LiveHime/
+  backups, and keeps the replaced app. "Roll back" puts it back, skips the
+  version left, and when the two use different OBS major versions restores
+  the scenes, profiles and OBS ini files from before the update, since OBS
+  migrates them forward only. An OBS major upgrade is announced before it
+  installs.
+
+e2e-update.mjs now covers the stable/beta choice, skipping, the settings
+backup, and a rollback across OBS major versions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  20 +-
+ build-aux/livehime/tests/e2e-update.mjs       | 147 ++++++++++----
+ .../LiveHimeCore/AppUpdateBridge.swift        |  44 +++-
+ .../Sources/LiveHimeCore/AppUpdater.swift     | 192 +++++++++++++++---
+ .../LiveHimeCoreTests/AppUpdaterTests.swift   |  18 ++
+ plugins/livehime/core/include/livehime-core.h |  12 +-
+ plugins/livehime/data/locale/en-US.ini        |  11 +
+ plugins/livehime/data/locale/zh-CN.ini        |  11 +
+ plugins/livehime/src/automation.cpp           |  16 +-
+ plugins/livehime/src/update-page.cpp          | 126 +++++++++++-
+ plugins/livehime/src/update-page.hpp          |  26 ++-
+ 11 files changed, 528 insertions(+), 95 deletions(-)
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 40ce5ddf0..2b640a041 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -86,17 +86,25 @@ node e2e-captions-srt.mjs <websocket password> speech.aiff
+ 
+ `e2e-update.mjs` runs the updater against a local release feed
+ (`LIVEHIME_UPDATE_FEED`), with no GitHub or real account involved. It copies
+-the built app to `<work dir>/install`, builds a 9.9.9 variant signed like the
+-build and another signed ad hoc, and checks that a download failing its
+-digest and the ad hoc app are both discarded, then that automatic mode
+-downloads and verifies 9.9.9 and "restart" quits LiveHime, swaps the bundle
+-and reopens it at 9.9.9 with a valid signature (still on the e2e keychain):
++the built app to `<work dir>/install` and builds 9.9.9 (claiming OBS 33)
++signed like the build, 9.9.9 signed ad hoc and 9.9.8, then checks: a
++download failing its digest and the ad hoc app are discarded; stable 9.9.8
++is offered, or pre-release 9.9.9 with the beta option; a skipped version is
++left alone by automatic mode; installing 9.9.9 backs up the settings, swaps
++the bundle and reopens it (still on the e2e keychain) with a rollback to the
++old version on offer; rolling back restores the old app and, as the OBS
++major version differs, the scenes and settings from before the update, and
++skips 9.9.9.
++
++The test shares LiveHime's settings folder: copy `basic`, `plugin_config`,
++`plugin_manager`, `user.ini` and `global.ini` first and compare (or put
++them back) afterwards. Move the backups it prints (`BACKUP <path>`) and
++`~/Library/Caches/local.livehime.macos.dev/Updates` to the Trash.
+ 
+ ```bash
+ node e2e-update.mjs <websocket password> build_macos/frontend/RelWithDebInfo/LiveHime.app /tmp/livehime-update
+ ```
+ 
+-Afterwards remove `~/Library/Caches/local.livehime.macos.dev/Updates`.
+ The `Snapshot` vendor request renders the dock (optionally a tab) to a PNG,
+ for checking layouts without screen recording permission.
+ 
+diff --git a/build-aux/livehime/tests/e2e-update.mjs b/build-aux/livehime/tests/e2e-update.mjs
+index 9f09412e0..dd63cbd60 100644
+--- a/build-aux/livehime/tests/e2e-update.mjs
++++ b/build-aux/livehime/tests/e2e-update.mjs
+@@ -1,14 +1,21 @@
+ // Updates end to end, against a local release feed (no GitHub, no real account):
+ // - a download whose checksum does not match the feed's digest is discarded;
+ // - an app signed by another certificate (ad hoc) is discarded;
+-// - automatic mode finds 9.9.9, downloads and verifies it, and "restart" quits LiveHime,
+-//   swaps the bundle and reopens it: the installed app is then 9.9.9, validly signed.
++// - a feed with stable 9.9.8 and pre-release 9.9.9 offers 9.9.8, or 9.9.9 with the beta option;
++// - a skipped version is left alone by automatic mode;
++// - 9.9.9 (on "OBS 33") is downloaded, verified and installed by "restart": LiveHime quits,
++//   the settings are backed up, the bundle is swapped and reopened at 9.9.9;
++// - rollback puts the previous version back, restores the settings from before the update
++//   (the OBS major version differs) and skips 9.9.9.
+ // Usage: node e2e-update.mjs <ws password> <built LiveHime.app> <work dir>
+ // Copies the app into <work dir>/install and launches that copy with the e2e keychain and
+-// LIVEHIME_UPDATE_FEED; quits it at the end. Back up features.json first (the Updates setting).
++// LIVEHIME_UPDATE_FEED. It shares LiveHime's settings folder: back up features.json and the
++// profile's basic.ini first and compare afterwards. Prints the settings backups it created
++// ("BACKUP <path>") so the caller can remove them.
+ import { createHash } from 'node:crypto';
+ import { execFileSync } from 'node:child_process';
+-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
++import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
++import os from 'node:os';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ 
+@@ -20,34 +27,48 @@ const sha = (s) => createHash('sha256').update(s).digest('base64');
+ const fileSha = (f) => createHash('sha256').update(readFileSync(f)).digest('hex');
+ let fails = 0;
+ const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
+-const plist = (app, key) => sh('/usr/libexec/PlistBuddy', ['-c', `Print ${key}`, `${app}/Contents/Info.plist`]).trim();
++const plist = (file, key) => sh('/usr/libexec/PlistBuddy', ['-c', `Print ${key}`, file]).trim();
++const appVersion = (app) => plist(`${app}/Contents/Info.plist`, 'CFBundleShortVersionString');
++const libobs = (app) => `${app}/Contents/Frameworks/libobs.framework/Resources/Info.plist`;
+ const install = path.join(work, 'install', 'LiveHime.app');
+ const feed = path.join(work, 'feed');
++const support = path.join(os.homedir(), 'Library/Application Support/LiveHime');
++const config = path.join(support, 'obs-studio');
++const backups = path.join(support, 'backups');
++const marker = path.join(config, 'basic/e2e-after-update.txt');
+ const running = () => { try { return sh('/usr/bin/pgrep', ['-f', `${install}/Contents/MacOS/LiveHime`]).trim(); } catch { return ''; } };
++const listBackups = () => (existsSync(backups) ? readdirSync(backups).filter((n) => !n.startsWith('.')) : []);
++const backupsBefore = new Set(listBackups());
+ 
+-// Fixtures: the installed copy, a 9.9.9 signed like the build, and a 9.9.9 signed ad hoc.
++// Fixtures: the installed copy, 9.9.9 (claiming OBS 33) signed like the build, 9.9.9 signed ad
++// hoc, and a 9.9.8 archive for the stable/beta choice.
+ rmSync(work, { recursive: true, force: true });
+-for (const d of ['install', 'new', 'adhoc', 'feed']) mkdirSync(path.join(work, d), { recursive: true });
++for (const d of ['install', 'new', 'adhoc', 'stable', 'feed']) mkdirSync(path.join(work, d), { recursive: true });
+ sh('/usr/bin/ditto', [builtApp, install]);
+-function variant(dir, sign) {
++const obsBefore = plist(libobs(install), 'CFBundleShortVersionString');
++const originalVersion = appVersion(install);
++function variant(dir, version, sign, obs) {
+   const app = path.join(work, dir, 'LiveHime.app');
+   sh('/usr/bin/ditto', [builtApp, app]);
+-  sh('/usr/libexec/PlistBuddy', ['-c', 'Set CFBundleShortVersionString 9.9.9', `${app}/Contents/Info.plist`]);
++  sh('/usr/libexec/PlistBuddy', ['-c', `Set CFBundleShortVersionString ${version}`, `${app}/Contents/Info.plist`]);
++  if (obs) sh('/usr/libexec/PlistBuddy', ['-c', `Set CFBundleShortVersionString ${obs}`, libobs(app)]);
+   sign(app);
+   const zip = path.join(feed, `${dir}.zip`);
+   sh('/usr/bin/ditto', ['-c', '-k', '--keepParent', app, zip]);
+   return zip;
+ }
+-const good = variant('new', (app) => sh('python3', [path.join(here, '..', 'local-signing.py'), '--deep', '--sign', app]));
+-const adhoc = variant('adhoc', (app) => sh('/usr/bin/codesign', ['--force', '--deep', '-s', '-', app]));
+-function publish(zip, digest) {
+-  writeFileSync(path.join(feed, 'feed.json'), JSON.stringify({
+-    tag_name: 'v9.9.9', html_url: 'https://example.invalid/releases/v9.9.9', body: '## Test release\n\n- e2e',
+-    assets: [{ name: 'LiveHimeMacApp-v9.9.9-arm64.zip', browser_download_url: `file://${zip}`,
+-      size: readFileSync(zip).length, digest: `sha256:${digest}` }],
+-  }));
+-}
+-publish(good, '0'.repeat(64));
++const signLikeBuild = (app) => sh('python3', [path.join(here, '..', 'local-signing.py'), '--deep', '--sign', app]);
++const good = variant('new', '9.9.9', signLikeBuild, '33.0.0');
++const adhoc = variant('adhoc', '9.9.9', (app) => sh('/usr/bin/codesign', ['--force', '--deep', '-s', '-', app]));
++const stable = variant('stable', '9.9.8', signLikeBuild);
++const entry = (version, zip, digest, prerelease = false) => ({
++  tag_name: `v${version}`, prerelease, draft: false, html_url: `https://example.invalid/releases/v${version}`,
++  body: `## Test release ${version}`,
++  assets: [{ name: `LiveHimeMacApp-v${version}-arm64.zip`, browser_download_url: `file://${zip}`,
++    size: readFileSync(zip).length, digest: `sha256:${digest}` }],
++});
++const publish = (json) => writeFileSync(path.join(feed, 'feed.json'), JSON.stringify(json));
++publish(entry('9.9.9', good, '0'.repeat(64)));
+ 
+ async function connect() {
+   for (let i = 0; i < 60; i++) {
+@@ -60,6 +81,8 @@ async function connect() {
+         else if (msg.op === 2) ok(); else if (msg.op === 7) { pend.get(msg.d.requestId)?.(msg.d); pend.delete(msg.d.requestId); } }; });
+       const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
+       const update = async (d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: 'Update', requestData: d })).responseData?.responseData;
++      // The plugin registers its test hooks a moment after the websocket server starts.
++      for (let j = 0; j < 60 && (await update()) === undefined; j++) await sleep(500);
+       return { ws, update };
+     } catch { await sleep(1000); }
+   }
+@@ -70,16 +93,28 @@ async function until(update, pred, seconds) {
+   for (let i = 0; i < seconds * 4; i++) { st = await update(); if (pred(st)) return st; await sleep(250); }
+   return st;
+ }
++// Quits (through the given action) and waits for the installed copy to come back.
++async function relaunchVia(update, ws, action) {
++  const before = running();
++  const res = await update({ action });
++  check(`${action} accepted`, res?.accepted, JSON.stringify(res));
++  ws.close();
++  for (let i = 0; i < 60 && running() === before; i++) await sleep(500);
++  let after = '';
++  for (let i = 0; i < 60 && !(after = running()); i++) await sleep(500);
++  check(`${action}: LiveHime quit and reopened`, after && after !== before, `before ${before}, after ${after}`);
++  return connect();
++}
+ 
+ sh('/usr/bin/open', ['-n', '--env', 'LIVEHIME_KEYCHAIN_SERVICE=local.livehime.macos.e2e-test',
+   '--env', `LIVEHIME_UPDATE_FEED=file://${feed}/feed.json`, install]);
+ let { ws, update } = await connect();
+ try {
+-  // Manual mode for the failure cases.
+-  await update({ automatic: false });
++  await update({ automatic: false, beta: false });
++
+   for (const [label, zip, digest, reason] of [['checksum mismatch', good, '0'.repeat(64), 'checksum'],
+                                               ['ad hoc signature', adhoc, fileSha(adhoc), 'invalidApp']]) {
+-    publish(zip, digest);
++    publish(entry('9.9.9', zip, digest));
+     await update({ action: 'check' });
+     let st = await until(update, (s) => s?.available === '9.9.9' && s.status !== 'LiveHime.Update.Status.checking', 20);
+     check(`${label}: 9.9.9 found`, st?.available === '9.9.9', JSON.stringify(st));
+@@ -87,32 +122,60 @@ try {
+     st = await until(update, (s) => s?.status === 'failed', 60);
+     check(`${label}: discarded (${reason})`, st?.status === 'failed' && st.reason === reason && !st.ready, JSON.stringify(st));
+   }
+-  check('installed app untouched', plist(install, 'CFBundleShortVersionString') !== '9.9.9');
++  check('installed app untouched', appVersion(install) !== '9.9.9');
+ 
+-  // Automatic mode: finds, downloads, verifies; restart installs and reopens.
+-  publish(good, fileSha(good));
+-  await update({ automatic: true });
+-  const st = await until(update, (s) => s?.ready === '9.9.9', 90);
+-  check('automatic: 9.9.9 downloaded and verified', st?.ready === '9.9.9', JSON.stringify(st));
+-  const before = running();
+-  const restart = await update({ action: 'restart' });
+-  check('restart accepted', restart?.accepted, JSON.stringify(restart));
+-  ws.close();
+-  for (let i = 0; i < 60 && running() === before; i++) await sleep(500);
+-  let reopened = '';
+-  for (let i = 0; i < 60 && !(reopened = running()); i++) await sleep(500);
+-  check('LiveHime quit and reopened', reopened && reopened !== before, `before ${before}, after ${reopened}`);
+-  check('installed app is 9.9.9', plist(install, 'CFBundleShortVersionString') === '9.9.9');
++  // Stable vs beta.
++  publish([entry('9.9.9', good, fileSha(good), true), entry('9.9.8', stable, fileSha(stable))]);
++  for (const [beta, expected] of [[false, '9.9.8'], [true, '9.9.9']]) {
++    await update({ beta, action: 'check' });
++    const st = await until(update, (s) => s?.available === expected && s.status !== 'LiveHime.Update.Status.checking', 20);
++    check(`beta ${beta ? 'on' : 'off'}: offers ${expected}`, st?.available === expected, JSON.stringify(st));
++  }
++
++  // Skipped: automatic mode leaves 9.9.9 alone.
++  await update({ action: 'skip' });
++  let st = await update({ automatic: true });
++  st = await until(update, (s) => s?.status === 'LiveHime.Update.Status.skipped', 40);
++  await sleep(3000);
++  st = await update();
++  check('skipped 9.9.9 not downloaded automatically', st?.skipped === '9.9.9' && !st.ready &&
++    st.status === 'LiveHime.Update.Status.skipped', JSON.stringify(st));
++
++  // Update to 9.9.9 by hand (downloading clears the skip), then restart into it.
++  await update({ automatic: false, action: 'check' });
++  await until(update, (s) => s?.available === '9.9.9' && s.status !== 'LiveHime.Update.Status.checking', 20);
++  await update({ action: 'download' });
++  st = await until(update, (s) => s?.ready === '9.9.9' || s?.status === 'failed', 90);
++  check('9.9.9 downloaded and verified', st?.ready === '9.9.9', JSON.stringify(st));
++  ({ ws, update } = await relaunchVia(update, ws, 'restart'));
++  check('installed app is 9.9.9 on OBS 33', appVersion(install) === '9.9.9' && plist(libobs(install), 'CFBundleShortVersionString') === '33.0.0');
+   let valid = true;
+   try { sh('/usr/bin/codesign', ['--verify', '--deep', '--strict', install]); } catch { valid = false; }
+   check('installed app signature valid', valid);
+-  ({ ws, update } = await connect());
+-  // The plugin registers its test hooks a moment after the websocket server starts.
+-  const after = await until(update, (s) => s !== undefined, 30);
+-  check('reopened app runs 9.9.9', after?.current === '9.9.9', JSON.stringify(after));
++  const updateBackup = listBackups().filter((n) => !backupsBefore.has(n));
++  check('settings backed up before installing', updateBackup.length === 1 && existsSync(path.join(backups, updateBackup[0], 'basic')),
++    updateBackup.join(', '));
++  st = await until(update, (s) => s?.current === '9.9.9' && s.previous, 20);
++  check('reopened 9.9.9 offers a rollback to the old version', st?.current === '9.9.9' && st.previous === originalVersion,
++    JSON.stringify(st));
++
++  // A change made on 9.9.9, then roll back: the settings from before the update come back.
++  writeFileSync(marker, 'made on 9.9.9\n');
++  ({ ws, update } = await relaunchVia(update, ws, 'rollback'));
++  check('installed app is the old version again', appVersion(install) === originalVersion && plist(libobs(install), 'CFBundleShortVersionString') === obsBefore,
++    appVersion(install));
++  check('settings from before the update restored', !existsSync(marker));
++  const all = listBackups().filter((n) => !backupsBefore.has(n));
++  check('settings on 9.9.9 backed up before rolling back',
++    all.some((n) => n.includes(' v9.9.9 OBS 33.0.0') && existsSync(path.join(backups, n, 'basic/e2e-after-update.txt'))),
++    all.join(', '));
++  st = await update();
++  check('9.9.9 skipped after rolling back', st?.skipped === '9.9.9', JSON.stringify(st));
+ } finally {
+   try { ws.close(); } catch {}
+-  try { sh('/usr/bin/osascript', ['-e', `tell application id "${plist(install, 'CFBundleIdentifier')}" to quit`]); } catch {}
++  try { sh('/usr/bin/osascript', ['-e', `tell application id "${plist(`${install}/Contents/Info.plist`, 'CFBundleIdentifier')}" to quit`]); } catch {}
+   for (let i = 0; i < 40 && running(); i++) await sleep(500);
++  rmSync(marker, { force: true });
++  for (const n of listBackups().filter((n) => !backupsBefore.has(n))) console.log(`BACKUP ${path.join(backups, n)}`);
+ }
+ process.exit(fails ? 1 : 0);
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
+index d30dbbd96..95e64f552 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
+@@ -12,13 +12,18 @@ final class UpdateState {
+ 
+     func emit(_ fields: [String: Any]) {
+         var object: [String: Any] = ["event": "update", "current": AppUpdater.currentVersion,
+-                                     "supported": AppUpdater.installSupported]
++                                     "supported": AppUpdater.installSupported,
++                                     "obsCurrent": AppUpdater.obsVersion(of: Bundle.main.bundleURL) ?? ""]
++        if let previous = AppUpdater.previousVersion { object["previous"] = previous }
+         object.merge(fields) { $1 }
+         CoreBridge.shared?.emit(object)
+     }
+ 
+     func releaseFields(_ release: AppRelease) -> [String: Any] {
+-        ["version": release.version, "notes": release.notes, "page": release.page.absoluteString, "size": release.size]
++        var fields: [String: Any] = ["version": release.version, "notes": release.notes, "page": release.page.absoluteString,
++                                     "size": release.size, "prerelease": release.prerelease]
++        if let staged, let obs = AppUpdater.obsVersion(of: staged) { fields["obsNew"] = obs }
++        return fields
+     }
+ 
+     func failed(_ error: Error) {
+@@ -36,10 +41,11 @@ private func onMainThread(_ body: @escaping @MainActor () -> Void) {
+     }
+ }
+ 
+-/// Looks for a newer release. Emits "checking", then "upToDate",
+-/// "available" (with version, notes, page, size) or "failed".
++/// Looks for a newer release (with `beta`, pre-releases count too). Emits
++/// "checking", then "upToDate", "available" (with version, notes, page, size,
++/// prerelease) or "failed".
+ @_cdecl("livehime_core_update_check")
+-public func livehime_core_update_check() {
++public func livehime_core_update_check(_ beta: Int32) {
+     onMainThread {
+         let state = UpdateState.shared
+         guard !state.busy else { return }
+@@ -52,7 +58,7 @@ public func livehime_core_update_check() {
+         state.emit(["status": "checking"])
+         Task.detached {
+             do {
+-                let release = try await AppUpdater.latest()
++                let release = try await AppUpdater.latest(beta: beta != 0)
+                 await MainActor.run {
+                     state.busy = false
+                     state.release = release
+@@ -140,3 +146,29 @@ public func livehime_core_update_install(_ relaunch: Int32) -> Int32 {
+         }
+     }
+ }
++
++/// Puts the previous version back once LiveHime quits and reopens it (the
++/// caller then quits). Returns 1 when arranged; otherwise emits "failed".
++@_cdecl("livehime_core_update_rollback")
++public func livehime_core_update_rollback() -> Int32 {
++    guard Thread.isMainThread else { return 0 }
++    return MainActor.assumeIsolated {
++        let state = UpdateState.shared
++        guard !state.busy else { return 0 }
++        do {
++            try AppUpdater.scheduleRollback()
++            state.staged = nil
++            return 1
++        } catch {
++            state.failed(error)
++            return 0
++        }
++    }
++}
++
++/// Emits the idle state ("status":"idle") with the current, OBS and previous
++/// versions, for the Updates tab before any check.
++@_cdecl("livehime_core_update_state")
++public func livehime_core_update_state() {
++    onMainThread { UpdateState.shared.emit(["status": "idle"]) }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+index b77d35af2..f9ebc106d 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+@@ -11,6 +11,8 @@ public struct AppRelease: Equatable, Sendable {
+     public let size: Int64
+     /// Hex SHA-256 of the archive as published by GitHub ("digest").
+     public let sha256: String?
++    /// A test ("beta") release, offered only to those who opted in.
++    public var prerelease = false
+ }
+ 
+ public enum AppUpdateError: Error, Equatable, LocalizedError {
+@@ -52,10 +54,13 @@ public enum AppUpdateError: Error, Equatable, LocalizedError {
+ public enum AppUpdater {
+     public static let releasesPage = URL(string: "https://github.com/greyoak111/livehime-macos/releases")!
+     static let latestAPI = URL(string: "https://api.github.com/repos/greyoak111/livehime-macos/releases/latest")!
++    static let listAPI = URL(string: "https://api.github.com/repos/greyoak111/livehime-macos/releases?per_page=20")!
+ 
+-    /// The release feed; tests point LIVEHIME_UPDATE_FEED at a local JSON file.
+-    static var feed: URL {
+-        ProcessInfo.processInfo.environment["LIVEHIME_UPDATE_FEED"].flatMap(URL.init(string:)) ?? latestAPI
++    /// The release feed: the latest stable release, or with `beta` the recent
++    /// releases including pre-releases. Tests point LIVEHIME_UPDATE_FEED at a
++    /// local JSON file (one release object or a list).
++    static func feed(beta: Bool) -> URL {
++        ProcessInfo.processInfo.environment["LIVEHIME_UPDATE_FEED"].flatMap(URL.init(string:)) ?? (beta ? listAPI : latestAPI)
+     }
+ 
+     public static var currentVersion: String {
+@@ -84,10 +89,24 @@ public enum AppUpdater {
+         return false
+     }
+ 
+-    /// Reads a GitHub "latest release" object.
+-    static func release(from data: Data) throws -> AppRelease {
+-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+-              let tag = root["tag_name"] as? String else { throw AppUpdateError.network("invalid release feed") }
++    /// The newest release in a feed: a GitHub release object or a list of
++    /// them. Drafts are skipped, and pre-releases unless `beta` is set.
++    static func release(from data: Data, beta: Bool = false) throws -> AppRelease {
++        let json = try JSONSerialization.jsonObject(with: data)
++        if let object = json as? [String: Any] {
++            return try release(from: object)
++        }
++        guard let list = json as? [[String: Any]] else { throw AppUpdateError.network("invalid release feed") }
++        let candidates = list.filter { ($0["draft"] as? Bool) != true && (beta || ($0["prerelease"] as? Bool) != true) }
++            .compactMap { try? release(from: $0) }
++        guard let newest = candidates.max(by: { isNewer($1.version, than: $0.version) }) else {
++            throw AppUpdateError.noArchive
++        }
++        return newest
++    }
++
++    static func release(from root: [String: Any]) throws -> AppRelease {
++        guard let tag = root["tag_name"] as? String else { throw AppUpdateError.network("invalid release feed") }
+         let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+         let assets = root["assets"] as? [[String: Any]] ?? []
+         guard let asset = assets.first(where: {
+@@ -102,11 +121,12 @@ public enum AppUpdater {
+         }
+         return AppRelease(version: version, notes: root["body"] as? String ?? "",
+                           page: (root["html_url"] as? String).flatMap(URL.init(string:)) ?? releasesPage,
+-                          archive: archive, size: (asset["size"] as? NSNumber)?.int64Value ?? 0, sha256: sha)
++                          archive: archive, size: (asset["size"] as? NSNumber)?.int64Value ?? 0, sha256: sha,
++                          prerelease: root["prerelease"] as? Bool ?? false)
+     }
+ 
+-    public static func latest() async throws -> AppRelease {
+-        var request = URLRequest(url: feed, timeoutInterval: 20)
++    public static func latest(beta: Bool = false) async throws -> AppRelease {
++        var request = URLRequest(url: feed(beta: beta), timeoutInterval: 20)
+         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+         request.setValue("LiveHime/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+         let data: Data, response: URLResponse
+@@ -118,7 +138,7 @@ public enum AppUpdater {
+         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+             throw AppUpdateError.network("HTTP \(http.statusCode)")
+         }
+-        return try release(from: data)
++        return try release(from: data, beta: beta)
+     }
+ 
+     // MARK: Download and verification
+@@ -129,9 +149,84 @@ public enum AppUpdater {
+             .appendingPathComponent("Updates", isDirectory: true)
+     }
+ 
+-    /// Removes leftovers of earlier updates (downloads, the replaced app).
++    /// The app replaced by the last update (or rollback), kept for rolling back.
++    static var previousApp: URL { updatesDirectory.appendingPathComponent("previous.app") }
++
++    /// Removes leftovers of earlier updates (downloads, installers) but keeps
++    /// the previous app.
+     public static func cleanUp() {
+-        try? FileManager.default.removeItem(at: updatesDirectory)
++        let fm = FileManager.default
++        for item in (try? fm.contentsOfDirectory(at: updatesDirectory, includingPropertiesForKeys: nil)) ?? []
++        where item.lastPathComponent != previousApp.lastPathComponent {
++            try? fm.removeItem(at: item)
++        }
++    }
++
++    // MARK: Versions of installed apps
++
++    static func appVersion(of app: URL) -> String? {
++        Bundle(url: app)?.infoDictionary?["CFBundleShortVersionString"] as? String
++    }
++
++    /// The OBS version an app is built on (from its libobs framework).
++    static func obsVersion(of app: URL) -> String? {
++        let plist = app.appendingPathComponent("Contents/Frameworks/libobs.framework/Resources/Info.plist")
++        return (NSDictionary(contentsOf: plist)?["CFBundleShortVersionString"] as? String)
++    }
++
++    static func obsMajor(_ version: String?) -> String? {
++        version?.split(separator: ".").first.map(String.init)
++    }
++
++    /// The version a rollback would return to: the kept previous app, when it
++    /// is this app (same bundle id) at a different, older version.
++    public static var previousVersion: String? {
++        guard FileManager.default.fileExists(atPath: previousApp.path),
++              Bundle(url: previousApp)?.bundleIdentifier == Bundle.main.bundleIdentifier,
++              let version = appVersion(of: previousApp), isNewer(currentVersion, than: version) else { return nil }
++        return version
++    }
++
++    // MARK: Settings backups
++
++    /// OBS's configuration (OBS_USER_CONFIG_SUBDIR=LiveHime) and where
++    /// update backups of it go.
++    static var configDirectory: URL {
++        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
++            .appendingPathComponent("LiveHime/obs-studio", isDirectory: true)
++    }
++    static var backupsDirectory: URL {
++        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
++            .appendingPathComponent("LiveHime/backups", isDirectory: true)
++    }
++    /// What a settings backup holds: scenes, profiles and plugin settings.
++    static let configItems = ["basic", "plugin_config", "plugin_manager", "user.ini", "global.ini"]
++    /// What a rollback across OBS major versions restores: what OBS itself
++    /// migrates (scenes, profiles, its ini files). LiveHime's own settings
++    /// stay, so the version rolled back from remains skipped.
++    static let restoredItems = ["basic", "user.ini", "global.ini"]
++    static let keptBackups = 8
++
++    /// Backup folders are named "<yyyy-MM-dd HHmmss> v<app> OBS <obs>".
++    static func backupLabel(app: URL) -> String {
++        "v\(appVersion(of: app) ?? "?") OBS \(obsVersion(of: app) ?? "?")"
++    }
++
++    /// The newest backup taken while `version` was installed.
++    static func newestBackup(of version: String) -> URL? {
++        let fm = FileManager.default
++        return ((try? fm.contentsOfDirectory(at: backupsDirectory, includingPropertiesForKeys: nil)) ?? [])
++            .filter { $0.lastPathComponent.contains(" v\(version) OBS ") }
++            .max { $0.lastPathComponent < $1.lastPathComponent }
++    }
++
++    /// Keeps the newest backups, leaving room for one more.
++    static func pruneBackups() {
++        let fm = FileManager.default
++        let all = ((try? fm.contentsOfDirectory(at: backupsDirectory, includingPropertiesForKeys: nil)) ?? [])
++            .filter { !$0.lastPathComponent.hasPrefix(".") }
++            .sorted { $0.lastPathComponent > $1.lastPathComponent }
++        for old in all.dropFirst(keptBackups - 1) { try? fm.removeItem(at: old) }
+     }
+ 
+     /// Downloads, checks and unpacks `release`; returns the verified app.
+@@ -202,9 +297,12 @@ public enum AppUpdater {
+ 
+     // MARK: Installation
+ 
+-    /// Starts a helper that waits for this process to exit, replaces `target`
+-    /// with `staged`, and reopens it when `relaunch` is set.
+-    public static func scheduleInstall(staged: URL, target: URL = Bundle.main.bundleURL, relaunch: Bool) throws {
++    /// Starts a helper that waits for this process to exit, backs up OBS's
++    /// settings, replaces `target` with `staged` (the replaced app becomes the
++    /// previous app), restores the settings in `restore` when given, and
++    /// reopens the app when `relaunch` is set.
++    public static func scheduleInstall(staged: URL, target: URL = Bundle.main.bundleURL, relaunch: Bool,
++                                       restore: URL? = nil) throws {
+         let fm = FileManager.default
+         if target.path.contains("/AppTranslocation/") {
+             throw AppUpdateError.location("LiveHime is running from a temporary location; move it to Applications first")
+@@ -216,10 +314,16 @@ public enum AppUpdater {
+         let script = folder.appendingPathComponent("install.sh")
+         try """
+         #!/bin/sh
+-        # LiveHime update: wait for the app to quit, swap the bundle, keep the old one on failure.
+-        # Arguments after the fifth are "--env NAME=VALUE" pairs passed on to the reopened app.
+-        pid="$1"; target="$2"; staged="$3"; backup="$4"; relaunch="$5"; shift 5
++        # LiveHime update: wait for the app to quit, back up the settings, swap the bundle
++        # (keeping the old one on failure), optionally restore older settings, reopen.
++        # Arguments after the tenth are "--env NAME=VALUE" pairs passed on to the reopened app.
++        pid="$1"; target="$2"; staged="$3"; backup="$4"; relaunch="$5"
++        config="$6"; saved="$7"; restore="$8"; items="$9"; restored="${10}"; shift 10
+         while /bin/kill -0 "$pid" 2>/dev/null; do /bin/sleep 0.3; done
++        /bin/mkdir -p "$saved"
++        for item in $items; do
++            if [ -e "$config/$item" ]; then /usr/bin/ditto "$config/$item" "$saved/$item" || exit 1; fi
++        done
+         /bin/rm -rf "$backup"
+         /bin/mv "$target" "$backup" || exit 1
+         if /usr/bin/ditto "$staged" "$target"; then
+@@ -229,15 +333,31 @@ public enum AppUpdater {
+             /bin/mv "$backup" "$target"
+             exit 1
+         fi
++        if [ -n "$restore" ] && [ -d "$restore" ]; then
++            for item in $restored; do
++                /bin/rm -rf "$config/$item"
++                if [ -e "$restore/$item" ]; then /usr/bin/ditto "$restore/$item" "$config/$item"; fi
++            done
++        fi
+         if [ "$relaunch" = 1 ]; then /usr/bin/open "$@" "$target"; fi
+         """.write(to: script, atomically: true, encoding: .utf8)
++        try fm.createDirectory(at: backupsDirectory, withIntermediateDirectories: true)
++        pruneBackups()
++        let stamp = DateFormatter()
++        stamp.dateFormat = "yyyy-MM-dd HHmmss"
++        stamp.locale = Locale(identifier: "en_US_POSIX")
++        let saved = backupsDirectory.appendingPathComponent("\(stamp.string(from: Date())) \(backupLabel(app: target))")
+         let process = Process()
+         process.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+-        process.arguments = ["/bin/sh", script.path, String(getpid()), target.path, staged.path,
+-                             updatesDirectory.appendingPathComponent("previous.app").path, relaunch ? "1" : "0"]
+-            // LiveHime's own settings from the environment (test keychain, test feed) survive the relaunch.
+-            + ProcessInfo.processInfo.environment.filter { $0.key.hasPrefix("LIVEHIME_") }.sorted { $0.key < $1.key }
+-                .flatMap { ["--env", "\($0.key)=\($0.value)"] }
++        let arguments: [String] = ["/bin/sh", script.path, String(getpid()), target.path, staged.path,
++                                   previousApp.path, relaunch ? "1" : "0",
++                                   configDirectory.path, saved.path, restore?.path ?? "",
++                                   configItems.joined(separator: " "), restoredItems.joined(separator: " ")]
++        // LiveHime's own settings from the environment (test keychain, test feed) survive the relaunch.
++        let environment = ProcessInfo.processInfo.environment.filter { $0.key.hasPrefix("LIVEHIME_") }
++            .sorted { $0.key < $1.key }
++        let passed: [String] = environment.flatMap { ["--env", "\($0.key)=\($0.value)"] }
++        process.arguments = arguments + passed
+         let log = folder.appendingPathComponent("install.log")
+         fm.createFile(atPath: log.path, contents: nil)
+         process.standardOutput = try FileHandle(forWritingTo: log)
+@@ -245,6 +365,30 @@ public enum AppUpdater {
+         try process.run()
+     }
+ 
++    /// Arranges to put the previous app back once LiveHime quits (and reopen
++    /// it). When the two are built on different OBS major versions, the
++    /// settings saved while the previous app was installed come back too,
++    /// since OBS migrates them forward only. Returns the version rolled back to.
++    @discardableResult
++    public static func scheduleRollback(target: URL = Bundle.main.bundleURL) throws -> String {
++        guard let version = previousVersion else { throw AppUpdateError.invalidApp("no previous version") }
++        try verify(app: previousApp, version: version, current: target)
++        let fm = FileManager.default
++        let staging = updatesDirectory.appendingPathComponent("rollback", isDirectory: true)
++        try? fm.removeItem(at: staging)
++        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
++        let staged = staging.appendingPathComponent(target.lastPathComponent)
++        try fm.moveItem(at: previousApp, to: staged)
++        let restore = obsMajor(obsVersion(of: staged)) != obsMajor(obsVersion(of: target)) ? newestBackup(of: version) : nil
++        do {
++            try scheduleInstall(staged: staged, target: target, relaunch: true, restore: restore)
++        } catch {
++            try? fm.moveItem(at: staged, to: previousApp)
++            throw error
++        }
++        return version
++    }
++
+     @discardableResult
+     static func run(_ tool: String, _ arguments: [String]) throws -> Int32 {
+         let process = Process()
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
+index 0f31422c4..4f9b86d4f 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
+@@ -51,4 +51,22 @@ final class AppUpdaterTests: XCTestCase {
+             guard case .invalidApp = $0 as? AppUpdateError else { return XCTFail("\($0)") }
+         }
+     }
++
++    func testStableFeedSkipsPreReleasesAndDrafts() throws {
++        func release(_ tag: String, pre: Bool = false, draft: Bool = false) -> String {
++            #"{"tag_name":"\#(tag)","prerelease":\#(pre),"draft":\#(draft),"assets":[{"name":"LiveHimeMacApp-\#(tag)-arm64.zip","browser_download_url":"https://e.invalid/\#(tag).zip","digest":"sha256:aa"}]}"#
++        }
++        let feed = Data("[\(release("v0.3.0", draft: true)),\(release("v0.2.9", pre: true)),\(release("v0.2.8")),\(release("v0.2.7"))]".utf8)
++        let stable = try AppUpdater.release(from: feed, beta: false)
++        XCTAssertEqual(stable.version, "0.2.8")
++        XCTAssertFalse(stable.prerelease)
++        let beta = try AppUpdater.release(from: feed, beta: true)
++        XCTAssertEqual(beta.version, "0.2.9")
++        XCTAssertTrue(beta.prerelease)
++    }
++
++    func testObsMajorVersion() {
++        XCTAssertEqual(AppUpdater.obsMajor("32.2.2"), "32")
++        XCTAssertNil(AppUpdater.obsMajor(nil))
++    }
+ }
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 7d465de17..794030a6f 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -78,10 +78,18 @@ int livehime_core_page_click(const char *key, double x, double y);
+  * relaunch set, LiveHime reopens; the caller then quits). Main thread only.
+  * Emits {"event":"update","status":"checking|upToDate|available|downloading|
+  * ready|failed","current","supported"(false for development builds),
+- * ["version","notes","page","size","progress"(0-1),"reason","message"]}. */
+-void livehime_core_update_check(void);
++ * "obsCurrent",["previous"(version a rollback returns to),"version","notes",
++ * "page","size","prerelease","obsNew","progress"(0-1),"reason","message"]}.
++ * Every install first backs up OBS's settings (scenes, profiles, plugin
++ * settings) under Application Support/LiveHime/backups and keeps the replaced
++ * app; rollback puts it back (restoring its settings when the OBS major
++ * version differs) and reopens. With `beta`, check also offers pre-releases. */
++void livehime_core_update_check(int beta);
+ void livehime_core_update_download(void);
+ int livehime_core_update_install(int relaunch);
++int livehime_core_update_rollback(void);
++/* Emits the idle state ("status":"idle") with current, obsCurrent, previous. */
++void livehime_core_update_state(void);
+ 
+ /* Room activity. Once the account is ready the core keeps the room's danmaku
+  * connection open and emits:
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index c0908e0dd..8fcc763ac 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -221,3 +221,14 @@ LiveHime.Update.BannerView="View"
+ LiveHime.Update.BannerReady="Version %1 is downloaded and installs when you quit"
+ LiveHime.Update.BannerRestart="Restart now"
+ LiveHime.Update.BannerDismiss="Hide for now"
++LiveHime.Update.Beta="Join the beta"
++LiveHime.Update.BetaTip="When on, you also get versions marked as pre-releases, days to a couple of weeks before the stable release; they may be unstable. When off, only stable releases."
++LiveHime.Update.Skip="Skip This Version"
++LiveHime.Update.Previous="Previous version: %1"
++LiveHime.Update.Rollback="Roll back to %1"
++LiveHime.Update.RollbackTitle="Roll back to the previous version"
++LiveHime.Update.RollbackConfirm="LiveHime quits, puts %1 back and reopens; %2 is skipped (not installed automatically again).\n\nYour current scenes and settings are backed up first; if the two versions use different OBS major versions, the scenes and settings from before the update come back. Continue?"
++LiveHime.Update.Status.availableBeta="Beta %1 is available."
++LiveHime.Update.Status.skipped="Version %1 is skipped: automatic updates leave it alone; Check for Updates still shows it."
++LiveHime.Update.Status.busyRollback="Streaming or recording: roll back to %1 after you stop."
++LiveHime.Update.ObsUpgrade="This update moves OBS from %1 to %2. Scenes and settings are backed up before installing and can come back with a rollback."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 58a61cbd0..42fc5e3ea 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -221,3 +221,14 @@ LiveHime.Update.BannerView="查看"
+ LiveHime.Update.BannerReady="v%1 已下载，退出时自动安装"
+ LiveHime.Update.BannerRestart="立即重启"
+ LiveHime.Update.BannerDismiss="暂时隐藏"
++LiveHime.Update.Beta="参与测试版"
++LiveHime.Update.BetaTip="打开后也会收到标记为测试版（Pre-release）的新版本，比正式版早几天到一两周，可能不稳定。关闭后只收正式版。"
++LiveHime.Update.Skip="跳过此版本"
++LiveHime.Update.Previous="上一个版本：v%1"
++LiveHime.Update.Rollback="回退到 v%1"
++LiveHime.Update.RollbackTitle="回退到上一个版本"
++LiveHime.Update.RollbackConfirm="LiveHime 会退出，换回 v%1 后重新打开，v%2 会被跳过（不再自动安装）。\n\n退出前会备份当前的场景和设置；如果两个版本的 OBS 大版本不同，会恢复到当初更新前的场景和设置。要继续吗？"
++LiveHime.Update.Status.availableBeta="发现测试版 v%1。"
++LiveHime.Update.Status.skipped="已跳过 v%1。自动更新不会再安装它，手动“检查更新”时仍会显示。"
++LiveHime.Update.Status.busyRollback="正在直播或录制，结束后再回退到 v%1。"
++LiveHime.Update.ObsUpgrade="这次更新会把 OBS 从 %1 升级到 %2。安装前会自动备份场景和设置，回退时可以恢复。"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 4d9e3572b..ce2abd66e 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -198,15 +198,18 @@ void snapshot(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
+-/* Updates for tests: optional "automatic" (bool) and "action" (check |
+- * download | restart), then replies with the Updates tab's state. With
+- * LIVEHIME_UPDATE_FEED set the feed and archive can be local files. */
++/* Updates for tests: optional "automatic" and "beta" (bool) and "action"
++ * (check | download | restart | skip | rollback, rollback without asking),
++ * then replies with the Updates tab's state. With LIVEHIME_UPDATE_FEED set
++ * the feed and archive can be local files. */
+ void update(obs_data_t *request, obs_data_t *response, void *)
+ {
+ 	onUiThread([&] {
+ 		UpdatePage *page = target->features()->updates();
+ 		if (obs_data_has_user_value(request, "automatic"))
+ 			page->setAutomatic(obs_data_get_bool(request, "automatic"));
++		if (obs_data_has_user_value(request, "beta"))
++			page->setBeta(obs_data_get_bool(request, "beta"));
+ 		const QString action = QString::fromUtf8(obs_data_get_string(request, "action"));
+ 		bool accepted = true;
+ 		if (action == "check")
+@@ -215,6 +218,10 @@ void update(obs_data_t *request, obs_data_t *response, void *)
+ 			page->download();
+ 		else if (action == "restart")
+ 			accepted = page->restartNow();
++		else if (action == "skip")
++			page->skipAvailable();
++		else if (action == "rollback")
++			accepted = page->rollback(false);
+ 		obs_data_set_bool(response, "accepted", accepted);
+ 		obs_data_set_bool(response, "automatic", page->automatic());
+ 		obs_data_set_string(response, "status", page->status().toUtf8().constData());
+@@ -223,6 +230,9 @@ void update(obs_data_t *request, obs_data_t *response, void *)
+ 		obs_data_set_double(response, "progress", page->progress());
+ 		obs_data_set_string(response, "reason", page->failReason().toUtf8().constData());
+ 		obs_data_set_string(response, "current", UpdatePage::currentVersion().toUtf8().constData());
++		obs_data_set_bool(response, "beta", page->beta());
++		obs_data_set_string(response, "skipped", page->skipped().toUtf8().constData());
++		obs_data_set_string(response, "previous", page->previousVersion().toUtf8().constData());
+ 	});
+ }
+ 
+diff --git a/plugins/livehime/src/update-page.cpp b/plugins/livehime/src/update-page.cpp
+index 01ac69fb5..5811e817d 100644
+--- a/plugins/livehime/src/update-page.cpp
++++ b/plugins/livehime/src/update-page.cpp
+@@ -11,6 +11,7 @@
+ #include <QHBoxLayout>
+ #include <QLabel>
+ #include <QMainWindow>
++#include <QMessageBox>
+ #include <QProgressBar>
+ #include <QPushButton>
+ #include <QSignalBlocker>
+@@ -52,6 +53,9 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	auto_ = new QCheckBox(text("LiveHime.Update.Automatic"), this);
+ 	auto_->setToolTip(text("LiveHime.Update.AutomaticTip"));
+ 	auto_->setChecked(automatic_);
++	beta_box_ = new QCheckBox(text("LiveHime.Update.Beta"), this);
++	beta_box_->setToolTip(text("LiveHime.Update.BetaTip"));
++	beta_box_->setChecked(beta_);
+ 	check_ = new QPushButton(text("LiveHime.Update.Check"), this);
+ 	status_ = new QLabel(this);
+ 	status_->setWordWrap(true);
+@@ -65,6 +69,21 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	notes_->hide();
+ 	action_ = new QPushButton(this);
+ 	action_->hide();
++	skip_ = new QPushButton(text("LiveHime.Update.Skip"), this);
++	skip_->hide();
++	auto *actions = new QHBoxLayout;
++	actions->addWidget(action_, 1);
++	actions->addWidget(skip_);
++	/* "Previous version: 0.2.7  [Roll back]" once an update replaced one. */
++	rollbackRow_ = new QWidget(this);
++	rollbackText_ = new QLabel(rollbackRow_);
++	rollbackText_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++	rollback_ = new QPushButton(rollbackRow_);
++	auto *rollbackLayout = new QHBoxLayout(rollbackRow_);
++	rollbackLayout->setContentsMargins(0, 0, 0, 0);
++	rollbackLayout->addWidget(rollbackText_, 1);
++	rollbackLayout->addWidget(rollback_);
++	rollbackRow_->hide();
+ 	link_ = new QLabel(QStringLiteral("<a href=\"%1\" style=\"color:#fb7299\">%2</a>")
+ 				   .arg(kReleases, text("LiveHime.Update.OpenReleases")),
+ 			   this);
+@@ -82,16 +101,21 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	layout->setContentsMargins(0, 6, 0, 0);
+ 	layout->addLayout(top);
+ 	layout->addWidget(auto_);
++	layout->addWidget(beta_box_);
+ 	layout->addWidget(status_);
+ 	layout->addWidget(bar_);
+ 	layout->addWidget(notes_);
+-	layout->addWidget(action_);
++	layout->addLayout(actions);
++	layout->addWidget(rollbackRow_);
+ 	layout->addWidget(link_);
+ 	layout->addWidget(hint);
+ 	layout->addStretch(1);
+ 
+ 	connect(auto_, &QCheckBox::toggled, this, &UpdatePage::setAutomatic);
+-	connect(check_, &QPushButton::clicked, this, &UpdatePage::check);
++	connect(beta_box_, &QCheckBox::toggled, this, &UpdatePage::setBeta);
++	connect(check_, &QPushButton::clicked, this, [this] { check(true); });
++	connect(skip_, &QPushButton::clicked, this, &UpdatePage::skipAvailable);
++	connect(rollback_, &QPushButton::clicked, this, [this] { rollback(true); });
+ 	connect(action_, &QPushButton::clicked, this, [this] {
+ 		if (!readyVersion_.isEmpty())
+ 			restartNow();
+@@ -103,7 +127,7 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	connect(timer_, &QTimer::timeout, this, [this] {
+ 		timer_->setInterval(kCheckIntervalMs);
+ 		if (automatic_ && readyVersion_.isEmpty())
+-			check();
++			check(false);
+ 	});
+ 	if (automatic_) {
+ 		timer_->setInterval(kFirstCheckMs);
+@@ -111,6 +135,8 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	}
+ 	setStatus(automatic_ ? "LiveHime.Update.Status.auto" : "LiveHime.Update.Status.manual");
+ 	obs_frontend_add_event_callback(frontendEvent, this);
++	/* The core reports the versions (and a previous one to roll back to). */
++	QTimer::singleShot(2000, this, [] { livehime_core_update_state(); });
+ }
+ 
+ UpdatePage::~UpdatePage()
+@@ -148,16 +174,68 @@ void UpdatePage::setAutomatic(bool automatic)
+ 		setStatus(automatic_ ? "LiveHime.Update.Status.auto" : "LiveHime.Update.Status.manual");
+ }
+ 
+-void UpdatePage::check()
++void UpdatePage::setBeta(bool beta)
+ {
+-	livehime_core_update_check();
++	if (beta == beta_)
++		return;
++	beta_ = beta;
++	{
++		QSignalBlocker block(beta_box_);
++		beta_box_->setChecked(beta);
++	}
++	save();
++}
++
++void UpdatePage::check(bool manual)
++{
++	manualCheck_ = manual;
++	livehime_core_update_check(beta_ ? 1 : 0);
+ }
+ 
+ void UpdatePage::download()
+ {
++	if (skipped_ == availableVersion_) {
++		skipped_.clear();
++		save();
++	}
+ 	livehime_core_update_download();
+ }
+ 
++void UpdatePage::skipAvailable()
++{
++	if (availableVersion_.isEmpty())
++		return;
++	skipped_ = availableVersion_;
++	save();
++	action_->hide();
++	skip_->hide();
++	setStatus("LiveHime.Update.Status.skipped", skipped_);
++}
++
++bool UpdatePage::rollback(bool confirm)
++{
++	if (previous_.isEmpty())
++		return false;
++	if (obs_frontend_streaming_active() || obs_frontend_recording_active()) {
++		setStatus("LiveHime.Update.Status.busyRollback", previous_, true);
++		return false;
++	}
++	if (confirm && QMessageBox::question(this, text("LiveHime.Update.RollbackTitle"),
++					     text("LiveHime.Update.RollbackConfirm").arg(previous_, current_)) !=
++				       QMessageBox::Yes)
++		return false;
++	/* Otherwise automatic updates would bring the left version right back. */
++	const QString left = current_;
++	if (!livehime_core_update_rollback())
++		return false;
++	skipped_ = left;
++	save();
++	blog(LOG_INFO, "[livehime] rolling back from %s to %s", left.toUtf8().constData(), previous_.toUtf8().constData());
++	if (auto *main = static_cast<QMainWindow *>(obs_frontend_get_main_window()))
++		QMetaObject::invokeMethod(main, "close", Qt::QueuedConnection);
++	return true;
++}
++
+ bool UpdatePage::restartNow()
+ {
+ 	if (readyVersion_.isEmpty())
+@@ -179,6 +257,12 @@ void UpdatePage::handleEvent(const QJsonObject &event)
+ {
+ 	const QString status = event.value("status").toString();
+ 	supported_ = event.value("supported").toBool(true);
++	current_ = event.value("current").toString();
++	obsCurrent_ = event.value("obsCurrent").toString();
++	previous_ = event.value("previous").toString();
++	rollbackRow_->setVisible(!previous_.isEmpty() && supported_);
++	rollbackText_->setText(text("LiveHime.Update.Previous").arg(previous_));
++	rollback_->setText(text("LiveHime.Update.Rollback").arg(previous_));
+ 	const QString version = event.value("version").toString();
+ 	if (event.contains("page"))
+ 		page_ = event.value("page").toString();
+@@ -186,7 +270,9 @@ void UpdatePage::handleEvent(const QJsonObject &event)
+ 	bar_->setVisible(status == "downloading");
+ 	if (status != "failed")
+ 		failReason_.clear();
+-	if (status == "checking") {
++	if (status == "idle") {
++		return;
++	} else if (status == "checking") {
+ 		setStatus("LiveHime.Update.Status.checking");
+ 	} else if (status == "upToDate") {
+ 		availableVersion_.clear();
+@@ -195,6 +281,14 @@ void UpdatePage::handleEvent(const QJsonObject &event)
+ 		setStatus("LiveHime.Update.Status.upToDate");
+ 	} else if (status == "available") {
+ 		availableVersion_ = version;
++		const bool prerelease = event.value("prerelease").toBool();
++		if (version == skipped_ && !manualCheck_) {
++			/* Skipped: automatic mode leaves it alone; a manual check shows it. */
++			action_->hide();
++			skip_->hide();
++			setStatus("LiveHime.Update.Status.skipped", version);
++			return;
++		}
+ 		notes_->setMarkdown(event.value("notes").toString());
+ 		notes_->setVisible(!notes_->toPlainText().isEmpty());
+ 		if (!supported_) {
+@@ -202,9 +296,10 @@ void UpdatePage::handleEvent(const QJsonObject &event)
+ 			setStatus("LiveHime.Update.Status.devBuild", version);
+ 		} else {
+ 			action_->setText(text("LiveHime.Update.Download").arg(version));
+-			action_->setVisible(!automatic_);
+-			setStatus("LiveHime.Update.Status.available", version);
+-			if (automatic_)
++			action_->setVisible(!automatic_ || version == skipped_);
++			skip_->setVisible(!automatic_ || version == skipped_);
++			setStatus(prerelease ? "LiveHime.Update.Status.availableBeta" : "LiveHime.Update.Status.available", version);
++			if (automatic_ && version != skipped_)
+ 				download();
+ 		}
+ 		emit available(version);
+@@ -212,12 +307,19 @@ void UpdatePage::handleEvent(const QJsonObject &event)
+ 		progress_ = event.value("progress").toDouble();
+ 		bar_->setValue(static_cast<int>(progress_ * 100));
+ 		action_->hide();
++		skip_->hide();
+ 		setStatus("LiveHime.Update.Status.downloading", version);
+ 	} else if (status == "ready") {
+ 		readyVersion_ = version;
+ 		action_->setText(text("LiveHime.Update.Restart").arg(version));
+ 		action_->show();
++		skip_->hide();
+ 		setStatus("LiveHime.Update.Status.ready", version);
++		/* An OBS major upgrade migrates scenes forward only: say they are backed up. */
++		const QString obsNew = event.value("obsNew").toString();
++		if (!obsNew.isEmpty() && obsNew.section('.', 0, 0) != obsCurrent_.section('.', 0, 0))
++			status_->setText(status_->text() + QStringLiteral("\n") +
++					 text("LiveHime.Update.ObsUpgrade").arg(obsCurrent_, obsNew));
+ 		emit ready(version);
+ 	} else if (status == "failed") {
+ 		const QString reason = event.value("reason").toString();
+@@ -255,12 +357,18 @@ void UpdatePage::load()
+ 	OBSDataAutoRelease settings = LoadPluginSettings();
+ 	OBSDataAutoRelease update = obs_data_get_obj(settings, "update");
+ 	automatic_ = !update || !obs_data_has_user_value(update, "automatic") || obs_data_get_bool(update, "automatic");
++	if (update) {
++		beta_ = obs_data_get_bool(update, "beta");
++		skipped_ = QString::fromUtf8(obs_data_get_string(update, "skipped"));
++	}
+ }
+ 
+ void UpdatePage::save() const
+ {
+ 	OBSDataAutoRelease update = obs_data_create();
+ 	obs_data_set_bool(update, "automatic", automatic_);
++	obs_data_set_bool(update, "beta", beta_);
++	obs_data_set_string(update, "skipped", skipped_.toUtf8().constData());
+ 	OBSDataAutoRelease changes = obs_data_create();
+ 	obs_data_set_obj(changes, "update", update);
+ 	SavePluginSettings(changes);
+diff --git a/plugins/livehime/src/update-page.hpp b/plugins/livehime/src/update-page.hpp
+index 69e05962f..55018ee36 100644
+--- a/plugins/livehime/src/update-page.hpp
++++ b/plugins/livehime/src/update-page.hpp
+@@ -16,8 +16,10 @@ class QTimer;
+  * after launch and every few hours and downloads a new version in the
+  * background; manual mode checks and downloads only on request. Both use
+  * the same verified download, installed when LiveHime quits or at once with
+- * "Restart and update" (not while streaming or recording). Settings live in
+- * features.json under "update". */
++ * "Restart and update" (not while streaming or recording). The beta option
++ * also offers pre-releases; a version can be skipped (automatic mode then
++ * leaves it alone); the previous version can be put back (and skipped).
++ * Settings live in features.json under "update". */
+ class UpdatePage : public QWidget {
+ 	Q_OBJECT
+ 
+@@ -28,8 +30,15 @@ public:
+ 	void handleEvent(const QJsonObject &event);
+ 	bool automatic() const { return automatic_; }
+ 	void setAutomatic(bool automatic);
++	bool beta() const { return beta_; }
++	void setBeta(bool beta);
++	QString skipped() const { return skipped_; }
++	void skipAvailable();
++	QString previousVersion() const { return previous_; }
++	/* Asks, then quits to put the previous version back; false if not done. */
++	bool rollback(bool confirm = true);
+ 	/* Automation and the banner: same as the buttons. */
+-	void check();
++	void check(bool manual = true);
+ 	void download();
+ 	/* Quits LiveHime to install now; false while streaming or recording. */
+ 	bool restartNow();
+@@ -53,6 +62,12 @@ private:
+ 	void save() const;
+ 
+ 	bool automatic_ = true;
++	bool beta_ = false;
++	bool manualCheck_ = false;
++	QString skipped_;
++	QString previous_;
++	QString current_;
++	QString obsCurrent_;
+ 	bool supported_ = true;
+ 	QString status_key_;
+ 	QString availableVersion_;
+@@ -63,6 +78,11 @@ private:
+ 
+ 	QLabel *version_;
+ 	QCheckBox *auto_;
++	QCheckBox *beta_box_;
++	QPushButton *skip_;
++	QWidget *rollbackRow_;
++	QLabel *rollbackText_;
++	QPushButton *rollback_;
+ 	QPushButton *check_;
+ 	QLabel *status_;
+ 	QProgressBar *bar_;
+-- 
+2.54.0 (Apple Git-157)
+

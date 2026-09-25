@@ -1,7 +1,7 @@
 From b1b1ba9c40ba7e5be811a40c2b0d1f1cd8a9c769 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 03:34:14 +0800
-Subject: [PATCH 24/43] Polish: dedupe live pushes, fit login and cover
+Subject: [PATCH 24/48] Polish: dedupe live pushes, fit login and cover
  windows, room tab layout
 
 - Bilibili pushes LIVE twice for one start; repeated LIVE/PREPARING

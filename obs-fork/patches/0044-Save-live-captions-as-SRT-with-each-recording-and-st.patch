@@ -1,0 +1,864 @@
+From f74d5331f479290d2a5d6e9fb152b7c67fe0ad18 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 12:14:57 +0800
+Subject: [PATCH 44/48] Save live captions as SRT with each recording and
+ stream
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Final captions now carry when they were spoken, taken from the recognizer's
+audio timeline. A recording's captions are saved next to it with the same
+name; a stream's go to the recording folder as "直播字幕 <start>.srt".
+Times count from the start of the recording, leaving out paused
+stretches, or of the stream. Long sentences are split at punctuation.
+Late captions are still collected for 2.5 s after a stop, and pending
+files are written when LiveHime quits. A Captions-tab switch (on by
+default) turns it off; the tab shows the saved file with a Finder link.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  15 ++
+ build-aux/livehime/tests/e2e-captions-srt.mjs | 130 ++++++++++
+ plugins/livehime/CMakeLists.txt               |   2 +
+ .../Sources/LiveHimeCore/LiveCaptions.swift   |  36 ++-
+ .../LiveHimeCoreTests/CaptionTextTests.swift  |  16 ++
+ plugins/livehime/core/include/livehime-core.h |   3 +-
+ plugins/livehime/data/locale/en-US.ini        |   7 +
+ plugins/livehime/data/locale/zh-CN.ini        |   7 +
+ plugins/livehime/src/caption-controller.cpp   |  10 +
+ plugins/livehime/src/caption-controller.hpp   |   4 +
+ plugins/livehime/src/caption-recorder.cpp     | 237 ++++++++++++++++++
+ plugins/livehime/src/caption-recorder.hpp     |  67 +++++
+ plugins/livehime/src/captions-page.cpp        |  35 +++
+ plugins/livehime/src/captions-page.hpp        |   5 +
+ 14 files changed, 570 insertions(+), 4 deletions(-)
+ create mode 100644 build-aux/livehime/tests/e2e-captions-srt.mjs
+ create mode 100644 plugins/livehime/src/caption-recorder.cpp
+ create mode 100644 plugins/livehime/src/caption-recorder.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index e549cacf2..e8f852455 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -67,6 +67,21 @@ swiftc -O fullscreen-probe.swift -o /tmp/fullscreen-probe
+ node e2e-float-fullscreen.mjs <websocket password> <LiveHime pid> /tmp/fullscreen-probe
+ ```
+ 
++## Captions saved as SRT
++
++`e2e-captions-srt.mjs` plays Chinese speech into live captions while OBS
++records, then checks the `.srt` saved next to the recording: the words, the
++first cue starting when the speech did, cues ordered and inside the
++recording. A second recording pauses for 4 s mid-speech under a temporary
++profile (pausing needs a recording encoder of its own) and checks that the
++pause is left out. It records two short files into the recording folder and
++prints them as `OUTPUT <path>` lines; remove them afterwards. Back up the
++profile's `basic.ini` first and compare it afterwards.
++
++```bash
++node e2e-captions-srt.mjs <websocket password> speech.aiff
++```
++
+ ## Cover manager check
+ 
+ `e2e-cover.mjs` drives Bilibili's cover manager in the real window: a real
+diff --git a/build-aux/livehime/tests/e2e-captions-srt.mjs b/build-aux/livehime/tests/e2e-captions-srt.mjs
+new file mode 100644
+index 000000000..3056c3730
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-captions-srt.mjs
+@@ -0,0 +1,130 @@
++// Captions saved as SRT: a media source plays Chinese speech into live captions while OBS records;
++// after the recording stops, a .srt with the recording's name must sit next to it, with the
++// speech's words and times counted from the start of the recording. A second recording pauses
++// in the middle: the paused stretch must be left out of the times. It records under a temporary
++// profile whose recording has its own encoder (pausing needs that), then switches back to the
++// original profile and removes the temporary one.
++// Usage: node e2e-captions-srt.mjs <ws password> <speech audio file>
++// Records two short files into the profile's recording folder and prints their paths
++// ("OUTPUT <path>") so the caller can remove them; restores the captions settings it changed.
++import { createHash } from 'node:crypto';
++import { existsSync, readFileSync } from 'node:fs';
++const [password, audioFile] = process.argv.slice(2);
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const ws = new WebSocket('ws://127.0.0.1:4466');
++let id = 1; const pend = new Map();
++const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: t, requestData: d })).responseData?.responseData;
++let fails = 0;
++const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
++const MEDIA = 'livehime-e2e-speech', PROFILE = 'LiveHime E2E';
++
++// SRT → [{start, end, text}] in seconds.
++function parseSrt(text) {
++  const t = (s) => { const [h, m, rest] = s.split(':'); const [sec, ms] = rest.split(','); return +h * 3600 + +m * 60 + +sec + +ms / 1000; };
++  return text.trim().split(/\n\n+/).map((block) => {
++    const lines = block.split('\n');
++    const [a, b] = lines[1].split(' --> ');
++    return { start: t(a), end: t(b), text: lines.slice(2).join('') };
++  });
++}
++
++async function waitProfile(name) {
++  for (let i = 0; i < 40; i++) {
++    if ((await req('GetProfileList')).responseData?.currentProfileName === name) return true;
++    await sleep(250);
++  }
++  return false;
++}
++
++async function record(label, { pauseAfter = 0, pauseFor = 0 } = {}) {
++  const started = await req('StartRecord');
++  check(`${label}: recording started`, started.requestStatus.result, started.requestStatus.comment);
++  const t0 = Date.now();
++  await sleep(2000);
++  await req('TriggerMediaInputAction', { inputName: MEDIA, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART' });
++  const speechAt = (Date.now() - t0) / 1000;
++  if (pauseAfter) {
++    await sleep(pauseAfter * 1000);
++    await req('PauseRecord');
++    const status = (await req('GetRecordStatus')).responseData;
++    check(`${label}: recording paused`, status?.outputPaused, JSON.stringify(status));
++    await sleep(pauseFor * 1000);
++    await req('ResumeRecord');
++  }
++  await sleep(15000 - pauseAfter * 1000);
++  const stopped = await req('StopRecord');
++  const elapsed = (Date.now() - t0) / 1000;
++  const video = stopped.responseData?.outputPath;
++  console.log(`OUTPUT ${video}`);
++  const srt = video?.replace(/\.[^./]+$/, '.srt');
++  console.log(`OUTPUT ${srt}`);
++  for (let i = 0; i < 40 && !(srt && existsSync(srt)); i++) await sleep(250);
++  check(`${label}: .srt saved next to the recording`, srt && existsSync(srt), srt);
++  if (!srt || !existsSync(srt)) return;
++  const cues = parseSrt(readFileSync(srt, 'utf8'));
++  const text = cues.map((c) => c.text).join('');
++  console.log(`      ${cues.length} cues: ${text}`);
++  const length = elapsed - pauseFor;
++  check(`${label}: cues hold the speech`, cues.length >= 2 && /直播姬|字幕|电脑/.test(text), text);
++  check(`${label}: first cue starts when the speech did`, Math.abs(cues[0].start - speechAt) < 2.5,
++    `cue ${cues[0].start.toFixed(2)} s, speech at ${speechAt.toFixed(2)} s`);
++  check(`${label}: cues ordered, inside the recording`,
++    cues.every((c, i) => c.end > c.start && c.end <= length + 0.5 && (i === 0 || c.start >= cues[i - 1].end - 0.001)),
++    `last end ${cues.at(-1).end.toFixed(2)} s, recording ${length.toFixed(2)} s`);
++  return cues;
++}
++
++ws.onmessage = async (ev) => {
++  const m = JSON.parse(ev.data);
++  if (m.op === 0) { const { challenge, salt } = m.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + salt) + challenge), eventSubscriptions: 0 } })); return; }
++  if (m.op === 7) { pend.get(m.d.requestId)?.(m.d); return; }
++  if (m.op !== 2) return;
++  for (let i = 0; i < 40 && !(await req('GetVersion')).requestStatus.result; i++) await sleep(500);
++  const before = await vendor('Captions');
++  check('captions supported on this Mac', before?.supported, JSON.stringify(before));
++  const scene = (await req('GetCurrentProgramScene')).responseData.currentProgramSceneName;
++  const originalProfile = (await req('GetProfileList')).responseData.currentProfileName;
++  const recordFolder = (await req('GetRecordDirectory')).responseData.recordDirectory;
++  try {
++    const media = await req('CreateInput', { sceneName: scene, inputName: MEDIA, inputKind: 'ffmpeg_source',
++      inputSettings: { local_file: audioFile, is_local_file: true, looping: false, restart_on_activate: false, close_when_inactive: false } });
++    check('speech media source created', media.requestStatus.result, media.requestStatus.comment);
++    await req('TriggerMediaInputAction', { inputName: MEDIA, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP' });
++    let st = await vendor('Captions', { enabled: true, source: MEDIA, locale: 'zh-CN' });
++    for (let i = 0; i < 40 && !/识别|Listening/.test(st?.status); i++) { await sleep(250); st = await vendor('Captions'); }
++    check('captions listening', /识别|Listening/.test(st?.status), st?.status);
++
++    await record('plain');
++    await sleep(1500);
++    // Pause 3 s into the speech for 4 s: later words shift 4 s earlier than on the clock.
++    // CreateProfile switches asynchronously: only write settings once the temporary profile is
++    // current, or they would land in the user's profile.
++    const created = await req('CreateProfile', { profileName: PROFILE });
++    check('temporary profile created', created.requestStatus.result, created.requestStatus.comment);
++    if (!(await waitProfile(PROFILE))) throw new Error('the temporary profile did not become current');
++    for (const [name, value] of [['RecQuality', 'Small'], ['RecFormat2', 'mkv'], ['RecEncoder', 'x264'], ['FilePath', recordFolder]]) {
++      if (!(await waitProfile(PROFILE))) throw new Error('left the temporary profile');
++      await req('SetProfileParameter', { parameterCategory: 'SimpleOutput', parameterName: name, parameterValue: value });
++    }
++    // Outputs are rebuilt from the profile only when it is loaded: switch away and back.
++    await req('SetCurrentProfile', { profileName: originalProfile });
++    await waitProfile(originalProfile);
++    await req('SetCurrentProfile', { profileName: PROFILE });
++    if (!(await waitProfile(PROFILE))) throw new Error('could not return to the temporary profile');
++    await sleep(1000);
++    const paused = await record('paused', { pauseAfter: 3, pauseFor: 4 });
++    if (paused) check('paused: the pause is left out', paused.at(-1).end < 12, `last end ${paused.at(-1).end.toFixed(2)} s`);
++  } finally {
++    if ((await req('GetProfileList')).responseData?.profiles?.includes(PROFILE)) {
++      await req('SetCurrentProfile', { profileName: originalProfile });
++      if (await waitProfile(originalProfile)) await req('RemoveProfile', { profileName: PROFILE });
++    }
++    await vendor('Captions', { enabled: before?.enabled ?? false, source: '', locale: '' });
++    await req('RemoveInput', { inputName: MEDIA });
++  }
++  ws.close();
++  await sleep(1500);
++  process.exit(fails ? 1 : 0);
++};
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 9462de012..7c90d75ca 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -34,6 +34,8 @@ target_sources(
+     src/canvas-box.hpp
+     src/caption-controller.cpp
+     src/caption-controller.hpp
++    src/caption-recorder.cpp
++    src/caption-recorder.hpp
+     src/caption-overlay.cpp
+     src/caption-overlay.hpp
+     src/captions-page.cpp
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift b/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
+index 686220c49..6954af868 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/LiveCaptions.swift
+@@ -35,7 +35,7 @@ final class LiveCaptioner: @unchecked Sendable {
+         case preparing          // downloading / loading the language model
+         case listening
+         case partial(String)    // in-progress text, replaced by later updates
+-        case final(String)      // a finished sentence
++        case final(String, start: Date, end: Date)  // a finished sentence and when it was spoken
+         case failed(String)
+     }
+ 
+@@ -58,6 +58,10 @@ final class LiveCaptioner: @unchecked Sendable {
+     private var lastPush = Date.distantFuture
+     private var lastRate: Double = 48000
+     private var silenceTimer: DispatchSourceTimer?
++    /// Wall-clock time of the first audio given to the analyzer. Results carry
++    /// times on the analyzer's audio timeline, which starts there and advances
++    /// with every sample (silence is fed while the source is quiet).
++    private var audioStart: Date?
+ 
+     init(localeIdentifier: String, onEvent: @escaping @Sendable (Event) -> Void) {
+         locale = Locale(identifier: localeIdentifier)
+@@ -98,12 +102,21 @@ final class LiveCaptioner: @unchecked Sendable {
+                 return
+             }
+             let onEvent = self.onEvent
++            let audioStart = { [weak self] () -> Date? in
++                guard let self else { return nil }
++                return self.lock.withLock { self.audioStart }
++            }
+             resultsTask = Task {
+                 do {
+                     for try await result in transcriber.results {
+                         let text = CaptionText.clean(String(result.text.characters))
+                         guard !text.isEmpty else { continue }
+-                        onEvent(result.isFinal ? .final(text) : .partial(text))
++                        guard result.isFinal else {
++                            onEvent(.partial(text))
++                            continue
++                        }
++                        let (start, end) = Self.spoken(result.range, audioStart: audioStart(), text: text)
++                        onEvent(.final(text, start: start, end: end))
+                     }
+                 } catch is CancellationError {
+                 } catch {
+@@ -118,6 +131,20 @@ final class LiveCaptioner: @unchecked Sendable {
+         }
+     }
+ 
++    /// When a finished sentence was spoken, from its range on the audio
++    /// timeline; falls back to "just now" when the range is unusable.
++    static func spoken(_ range: CMTimeRange, audioStart: Date?, text: String, now: Date = Date()) -> (Date, Date) {
++        let begin = range.start.seconds, length = range.duration.seconds
++        if let audioStart, begin.isFinite, length.isFinite, begin >= 0, length > 0 {
++            let start = audioStart.addingTimeInterval(begin)
++            let end = start.addingTimeInterval(length)
++            if end <= now.addingTimeInterval(1), start >= now.addingTimeInterval(-120) {
++                return (start, end)
++            }
++        }
++        return (now.addingTimeInterval(-max(1, Double(text.count) * 0.25)), now)
++    }
++
+     private func startSilenceWatch() {
+         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+         timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
+@@ -171,6 +198,7 @@ final class LiveCaptioner: @unchecked Sendable {
+             return input
+         }
+         if error == nil, output.frameLength > 0 {
++            if audioStart == nil { audioStart = Date() }
+             continuation.yield(AnalyzerInput(buffer: output))
+         }
+     }
+@@ -221,7 +249,9 @@ final class CaptionSession: @unchecked Sendable {
+             case .preparing: Self.emit(["event": "captions", "status": "preparing"])
+             case .listening: Self.emit(["event": "captions", "status": "listening"])
+             case .partial(let text): Self.emit(["event": "caption", "text": text, "final": false])
+-            case .final(let text): Self.emit(["event": "caption", "text": text, "final": true])
++            case let .final(text, start, end):
++                Self.emit(["event": "caption", "text": text, "final": true,
++                           "start": start.timeIntervalSince1970, "end": end.timeIntervalSince1970])
+             case .failed(let message): Self.emit(["event": "captions", "status": "failed", "message": message])
+             }
+         }
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/CaptionTextTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/CaptionTextTests.swift
+index f652fce47..819a521b4 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/CaptionTextTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/CaptionTextTests.swift
+@@ -1,3 +1,4 @@
++import CoreMedia
+ import XCTest
+ @testable import LiveHimeCore
+ 
+@@ -17,4 +18,19 @@ final class CaptionTextTests: XCTestCase {
+     func testDropsPunctuationOnlyResults() {
+         XCTAssertEqual(CaptionText.clean(" 。"), "")
+     }
++
++    func testSpokenTimesComeFromTheAudioTimeline() throws {
++        guard #available(macOS 26, *) else { throw XCTSkip("SpeechAnalyzer needs macOS 26") }
++        let start = Date(timeIntervalSince1970: 1_000)
++        let now = start.addingTimeInterval(20)
++        let range = CMTimeRange(start: CMTime(seconds: 12.5, preferredTimescale: 1000),
++                                duration: CMTime(seconds: 2, preferredTimescale: 1000))
++        let (s, e) = LiveCaptioner.spoken(range, audioStart: start, text: "你好", now: now)
++        XCTAssertEqual(s.timeIntervalSince(start), 12.5, accuracy: 0.001)
++        XCTAssertEqual(e.timeIntervalSince(start), 14.5, accuracy: 0.001)
++        // No usable range: the sentence ends now and lasts about as long as it reads.
++        let (fs, fe) = LiveCaptioner.spoken(.invalid, audioStart: start, text: "一二三四五六七八", now: now)
++        XCTAssertEqual(fe, now)
++        XCTAssertEqual(fe.timeIntervalSince(fs), 2, accuracy: 0.001)
++    }
+ }
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 4f05056fc..9f8a6aad6 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -52,7 +52,8 @@ void livehime_core_open_cover_page(void);
+  * the main thread; push mono float samples from the audio thread. Emits
+  *   {"event":"captions","status":"preparing|listening|stopped|failed|unsupported"[,"message"]}
+  *   {"event":"caption","text","final":true|false}  (in-progress text is
+- *   replaced by later updates until a final sentence arrives) */
++ *   replaced by later updates until a final sentence arrives; a final one
++ *   also has "start" and "end", when it was spoken, in Unix seconds) */
+ int livehime_core_captions_supported(void);
+ void livehime_core_captions_start(const char *locale);
+ void livehime_core_captions_push(const float *samples, int count, double sample_rate);
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 93c8ff16a..285981eb6 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -151,6 +151,13 @@ LiveHime.Captions.Status.failed="Live captions stopped with an error"
+ LiveHime.Captions.Status.unsupported="Live captions need macOS 26 or later."
+ LiveHime.Captions.Status.noSource="The selected audio source is gone. Choose another."
+ LiveHime.Captions.Hint="Add \"LiveHime captions\" in Sources to show captions on stream. Speech is recognized on this Mac and never uploaded."
++LiveHime.Captions.SaveSrt="Save captions (SRT) when recording or streaming"
++LiveHime.Captions.SaveSrtTip="After a recording, a .srt with the same name is saved next to it; after a stream, “Stream captions <start time>.srt” goes to the recording folder. Times count from the start of the recording (pauses left out) or stream, ready for editors or replays."
++LiveHime.Captions.SrtRecording="Recording captions %1"
++LiveHime.Captions.SrtStream="Stream captions %1"
++LiveHime.Captions.SrtSaved="Captions saved: %1"
++LiveHime.Captions.SrtFailed="Could not save captions: %1"
++LiveHime.Captions.ShowInFinder="Show in Finder"
+ LiveHime.Captions.SourceName="LiveHime captions"
+ LiveHime.Captions.Linger="Linger"
+ LiveHime.Captions.LingerHint="Seconds a caption stays after speech stops; 0 keeps it."
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 3f441b8b2..530dce23c 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -151,6 +151,13 @@ LiveHime.Captions.Status.failed="语音字幕出错"
+ LiveHime.Captions.Status.unsupported="语音字幕需要 macOS 26 或更高版本。"
+ LiveHime.Captions.Status.noSource="找不到所选的音频来源，请重新选择。"
+ LiveHime.Captions.Hint="在「来源」里添加「直播姬字幕」，字幕就会出现在直播画面上。语音只在这台 Mac 上识别，不会上传。"
++LiveHime.Captions.SaveSrt="录制或直播时保存字幕文件（SRT）"
++LiveHime.Captions.SaveSrtTip="录制结束后在录像旁边保存同名的 .srt；直播结束后在录像文件夹保存“直播字幕 开播时间.srt”。时间从录制（不含暂停）或开播算起，可以直接导入剪辑软件或上传录播。"
++LiveHime.Captions.SrtRecording="录制字幕 %1"
++LiveHime.Captions.SrtStream="直播字幕 %1"
++LiveHime.Captions.SrtSaved="字幕已保存：%1"
++LiveHime.Captions.SrtFailed="字幕文件保存失败：%1"
++LiveHime.Captions.ShowInFinder="在访达中显示"
+ LiveHime.Captions.SourceName="直播姬字幕"
+ LiveHime.Captions.Linger="停留时间"
+ LiveHime.Captions.LingerHint="说完之后字幕保留的秒数；设为 0 时一直保留。"
+diff --git a/plugins/livehime/src/caption-controller.cpp b/plugins/livehime/src/caption-controller.cpp
+index e266e1722..e7abc1061 100644
+--- a/plugins/livehime/src/caption-controller.cpp
++++ b/plugins/livehime/src/caption-controller.cpp
+@@ -154,18 +154,28 @@ void CaptionController::load()
+ 	if (!captions)
+ 		return;
+ 	enabled_ = obs_data_get_bool(captions, "enabled");
++	saveSrt_ = !obs_data_has_user_value(captions, "save_srt") || obs_data_get_bool(captions, "save_srt");
+ 	sourceUuid_ = QString::fromUtf8(obs_data_get_string(captions, "source_uuid"));
+ 	const QString locale = QString::fromUtf8(obs_data_get_string(captions, "locale"));
+ 	if (!locale.isEmpty())
+ 		locale_ = locale;
+ }
+ 
++void CaptionController::setSaveSrt(bool save)
++{
++	if (save == saveSrt_)
++		return;
++	saveSrt_ = save;
++	this->save();
++}
++
+ void CaptionController::save() const
+ {
+ 	OBSDataAutoRelease captions = obs_data_create();
+ 	obs_data_set_bool(captions, "enabled", enabled_);
+ 	obs_data_set_string(captions, "source_uuid", sourceUuid_.toUtf8().constData());
+ 	obs_data_set_string(captions, "locale", locale_.toUtf8().constData());
++	obs_data_set_bool(captions, "save_srt", saveSrt_);
+ 	OBSDataAutoRelease changes = obs_data_create();
+ 	obs_data_set_obj(changes, "captions", captions);
+ 	SavePluginSettings(changes);
+diff --git a/plugins/livehime/src/caption-controller.hpp b/plugins/livehime/src/caption-controller.hpp
+index 31c29febb..b05e4d7f6 100644
+--- a/plugins/livehime/src/caption-controller.hpp
++++ b/plugins/livehime/src/caption-controller.hpp
+@@ -30,6 +30,9 @@ public:
+ 	/* Applies and saves; restarts recognition when something changed and
+ 	 * returns whether it did. */
+ 	bool configure(bool enabled, const QString &sourceUuid, const QString &locale);
++	/* Whether each recording and stream also gets an SRT file (saved). */
++	bool saveSrt() const { return saveSrt_; }
++	void setSaveSrt(bool save);
+ 	/* Whether the source is muted (silence is sent then, no captions). */
+ 	bool sourceMuted() const { return muted_.load(); }
+ 
+@@ -48,6 +51,7 @@ private:
+ 
+ 	bool enabled_ = false;
+ 	bool loaded_ = false; /* the scene collection has loaded */
++	bool saveSrt_ = true;
+ 	std::atomic<bool> muted_{false};
+ 	QString sourceUuid_;
+ 	QString locale_ = QStringLiteral("zh-CN");
+diff --git a/plugins/livehime/src/caption-recorder.cpp b/plugins/livehime/src/caption-recorder.cpp
+new file mode 100644
+index 000000000..23a54b4ee
+--- /dev/null
++++ b/plugins/livehime/src/caption-recorder.cpp
+@@ -0,0 +1,237 @@
++#include "caption-recorder.hpp"
++
++#include <obs-module.h>
++#include <util/bmem.h>
++
++#include <QDateTime>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QTimer>
++
++#include <algorithm>
++#include <cmath>
++
++namespace {
++double now()
++{
++	return QDateTime::currentMSecsSinceEpoch() / 1000.0;
++}
++
++QString takeString(char *value)
++{
++	QString result = value ? QString::fromUtf8(value) : QString();
++	bfree(value);
++	return result;
++}
++
++QString timestamp(double seconds)
++{
++	const qint64 ms = std::max<qint64>(0, std::llround(seconds * 1000));
++	return QStringLiteral("%1:%2:%3,%4")
++		.arg(ms / 3600000, 2, 10, QLatin1Char('0'))
++		.arg(ms / 60000 % 60, 2, 10, QLatin1Char('0'))
++		.arg(ms / 1000 % 60, 2, 10, QLatin1Char('0'))
++		.arg(ms % 1000, 3, 10, QLatin1Char('0'));
++}
++
++/* A finished caption arrives about a second after it was spoken; wait that
++ * long after a stop before writing. */
++constexpr int kLateCaptionMs = 2500;
++/* Longest cue line; longer sentences are split at punctuation. */
++constexpr int kMaxCueChars = 24;
++} // namespace
++
++CaptionRecorder::CaptionRecorder(QObject *parent) : QObject(parent)
++{
++	obs_frontend_add_event_callback(frontendEvent, this);
++}
++
++CaptionRecorder::~CaptionRecorder()
++{
++	obs_frontend_remove_event_callback(frontendEvent, this);
++	flush();
++}
++
++void CaptionRecorder::flush()
++{
++	for (Take *take : {&recording_, &stream_})
++		finish(*take);
++	for (const Take &take : finishing_)
++		write(take);
++	finishing_.clear();
++}
++
++void CaptionRecorder::frontendEvent(enum obs_frontend_event event, void *param)
++{
++	auto *self = static_cast<CaptionRecorder *>(param);
++	switch (event) {
++	case OBS_FRONTEND_EVENT_RECORDING_STARTED:
++		self->begin(self->recording_);
++		self->recording_.recording = true;
++		break;
++	case OBS_FRONTEND_EVENT_RECORDING_PAUSED:
++		if (self->recording_.active && !self->recording_.pauseStart)
++			self->recording_.pauseStart = now();
++		break;
++	case OBS_FRONTEND_EVENT_RECORDING_UNPAUSED:
++		if (self->recording_.active && self->recording_.pauseStart) {
++			self->recording_.pauses.emplace_back(self->recording_.pauseStart, now());
++			self->recording_.pauseStart = 0;
++		}
++		break;
++	case OBS_FRONTEND_EVENT_RECORDING_STOPPED:
++		self->finish(self->recording_);
++		break;
++	case OBS_FRONTEND_EVENT_STREAMING_STARTED:
++		self->begin(self->stream_);
++		break;
++	case OBS_FRONTEND_EVENT_STREAMING_STOPPED:
++		self->finish(self->stream_);
++		break;
++	case OBS_FRONTEND_EVENT_EXIT:
++		self->flush();
++		break;
++	default:
++		break;
++	}
++}
++
++void CaptionRecorder::begin(Take &take)
++{
++	take = Take();
++	take.active = true;
++	take.begin = now();
++	take.startLabel = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH-mm-ss"));
++}
++
++void CaptionRecorder::addCaption(const QString &text, double start, double end)
++{
++	auto accept = [&](Take &take) {
++		if (take.active && end > take.begin && (!take.stop || start < take.stop))
++			take.cues.push_back({start, end, text});
++	};
++	accept(recording_);
++	accept(stream_);
++	for (Take &take : finishing_)
++		accept(take);
++}
++
++void CaptionRecorder::finish(Take &take)
++{
++	if (!take.active)
++		return;
++	take.stop = now();
++	if (take.pauseStart) {
++		take.pauses.emplace_back(take.pauseStart, take.stop);
++		take.pauseStart = 0;
++	}
++	/* The recording's file name is known only now. */
++	if (take.recording)
++		take.recordingPath = takeString(obs_frontend_get_last_recording());
++	take.id = nextId_++;
++	finishing_.push_back(take);
++	const int id = take.id;
++	take = Take();
++	QTimer::singleShot(kLateCaptionMs, this, [this, id] {
++		auto done = std::find_if(finishing_.begin(), finishing_.end(), [id](const Take &t) { return t.id == id; });
++		if (done == finishing_.end())
++			return; /* already written by flush() */
++		write(*done);
++		finishing_.erase(done);
++	});
++}
++
++std::vector<CaptionRecorder::Cue> CaptionRecorder::relative(const Take &take)
++{
++	/* Seconds of take time at Unix time t: from the start, minus pauses. */
++	auto at = [&take](double t) {
++		double paused = 0;
++		for (const auto &[from, to] : take.pauses)
++			paused += std::clamp(t, from, to) - from;
++		return std::clamp(t, take.begin, take.stop) - take.begin - paused;
++	};
++	std::vector<Cue> cues;
++	for (const Cue &cue : take.cues) {
++		const double start = at(cue.start), end = at(cue.end);
++		if (end - start >= 0.2)
++			cues.push_back({start, end, cue.text});
++	}
++	std::sort(cues.begin(), cues.end(), [](const Cue &a, const Cue &b) { return a.start < b.start; });
++	return cues;
++}
++
++QString CaptionRecorder::toSrt(const std::vector<Cue> &cues)
++{
++	/* Split long sentences at punctuation into lines of at most
++	 * kMaxCueChars, sharing the sentence's time by length. */
++	static const QString breaks = QStringLiteral("，。？！；、,.?!;");
++	std::vector<Cue> lines;
++	for (const Cue &cue : cues) {
++		QStringList parts;
++		QString current;
++		for (const QChar c : cue.text) {
++			current += c;
++			if ((breaks.contains(c) && current.size() >= 8) || current.size() >= kMaxCueChars) {
++				parts << current;
++				current.clear();
++			}
++		}
++		if (!current.trimmed().isEmpty())
++			parts << current;
++		qsizetype total = 0;
++		for (const QString &part : parts)
++			total += part.size();
++		double t = cue.start;
++		for (const QString &part : parts) {
++			const double length = (cue.end - cue.start) * part.size() / std::max<qsizetype>(total, 1);
++			QString line = part.trimmed();
++			while (!line.isEmpty() && QStringLiteral("，、,").contains(line.back()))
++				line.chop(1);
++			if (!line.isEmpty())
++				lines.push_back({t, t + length, line});
++			t += length;
++		}
++	}
++	QString srt;
++	for (size_t i = 0; i < lines.size(); i++) {
++		/* Never overlap the next line. */
++		const double end = i + 1 < lines.size() ? std::min(lines[i].end, lines[i + 1].start) : lines[i].end;
++		srt += QStringLiteral("%1\n%2 --> %3\n%4\n\n")
++			       .arg(i + 1)
++			       .arg(timestamp(lines[i].start), timestamp(std::max(end, lines[i].start + 0.3)), lines[i].text);
++	}
++	return srt;
++}
++
++void CaptionRecorder::write(const Take &take)
++{
++	if (!enabled_ || take.cues.empty())
++		return;
++	const std::vector<Cue> cues = relative(take);
++	if (cues.empty())
++		return;
++	QString path;
++	if (take.recording && QFileInfo(take.recordingPath).isAbsolute()) {
++		/* Next to the recording, same name. */
++		const QFileInfo video(take.recordingPath);
++		path = video.dir().filePath(video.completeBaseName() + QStringLiteral(".srt"));
++	} else {
++		QString folder = takeString(obs_frontend_get_current_record_output_path());
++		if (folder.isEmpty() || !QDir(folder).exists())
++			folder = QDir::homePath() + QStringLiteral("/Movies");
++		const char *key = take.recording ? "LiveHime.Captions.SrtRecording" : "LiveHime.Captions.SrtStream";
++		path = QDir(folder).filePath(QString::fromUtf8(obs_module_text(key)).arg(take.startLabel) +
++					     QStringLiteral(".srt"));
++	}
++	QFile file(path);
++	if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
++		blog(LOG_WARNING, "[livehime] could not write captions to %s", path.toUtf8().constData());
++		emit saveFailed(path);
++		return;
++	}
++	file.write(toSrt(cues).toUtf8());
++	file.close();
++	blog(LOG_INFO, "[livehime] saved %zu captions to %s", cues.size(), path.toUtf8().constData());
++	emit saved(path);
++}
+diff --git a/plugins/livehime/src/caption-recorder.hpp b/plugins/livehime/src/caption-recorder.hpp
+new file mode 100644
+index 000000000..0ca949598
+--- /dev/null
++++ b/plugins/livehime/src/caption-recorder.hpp
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include <obs-frontend-api.h>
++
++#include <QObject>
++#include <QString>
++
++#include <list>
++#include <vector>
++
++/* Saves the live captions of each recording and live stream as an SRT
++ * file: a recording's next to it with the same name, a stream's in the
++ * recording folder as "直播字幕 <start time>.srt". Cue times count from the
++ * start of the recording (paused stretches left out) or of the stream. */
++class CaptionRecorder : public QObject {
++	Q_OBJECT
++
++public:
++	explicit CaptionRecorder(QObject *parent = nullptr);
++	~CaptionRecorder() override;
++
++	void setEnabled(bool enabled) { enabled_ = enabled; }
++	bool enabled() const { return enabled_; }
++	/* A finished caption and when it was spoken (Unix seconds). */
++	void addCaption(const QString &text, double start, double end);
++
++	struct Cue {
++		double start;
++		double end;
++		QString text;
++	};
++	/* SRT text for cues (times in seconds from 0), long sentences split. */
++	static QString toSrt(const std::vector<Cue> &cues);
++
++signals:
++	void saved(const QString &path);
++	void saveFailed(const QString &path);
++
++private:
++	struct Take {
++		bool active = false;
++		double begin = 0;              /* Unix seconds */
++		double stop = 0;               /* 0 while running */
++		double pauseStart = 0;         /* 0 unless paused */
++		std::vector<std::pair<double, double>> pauses;
++		std::vector<Cue> cues;         /* Unix seconds */
++		QString startLabel;            /* local start time, for file names */
++		QString recordingPath;         /* the recording's file, once stopped */
++		bool recording = false;
++		int id = 0;
++	};
++
++	static void frontendEvent(enum obs_frontend_event event, void *param);
++	void begin(Take &take);
++	void finish(Take &take);
++	void write(const Take &take);
++	/* Writes every stopped take now (LiveHime is quitting). */
++	void flush();
++	static std::vector<Cue> relative(const Take &take);
++
++	bool enabled_ = true;
++	Take recording_;
++	Take stream_;
++	/* Stopped takes waiting for late captions before they are written. */
++	std::list<Take> finishing_;
++	int nextId_ = 1;
++};
+diff --git a/plugins/livehime/src/captions-page.cpp b/plugins/livehime/src/captions-page.cpp
+index c6bb5c84c..b07c98834 100644
+--- a/plugins/livehime/src/captions-page.cpp
++++ b/plugins/livehime/src/captions-page.cpp
+@@ -1,11 +1,14 @@
+ #include "captions-page.hpp"
+ #include "caption-controller.hpp"
++#include "caption-recorder.hpp"
+ 
+ #include <obs-module.h>
+ #include <obs.hpp>
+ 
+ #include <QCheckBox>
+ #include <QComboBox>
++#include <QFileInfo>
++#include <QProcess>
+ #include <QFormLayout>
+ #include <QLabel>
+ #include <QSignalBlocker>
+@@ -22,6 +25,8 @@ QString text(const char *key)
+ CaptionsPage::CaptionsPage(QWidget *parent) : QWidget(parent)
+ {
+ 	controller_ = new CaptionController(this);
++	recorder_ = new CaptionRecorder(this);
++	recorder_->setEnabled(controller_->saveSrt());
+ 
+ 	enabled_ = new QCheckBox(text("LiveHime.Captions.Enable"), this);
+ 	source_ = new QComboBox(this);
+@@ -42,6 +47,31 @@ CaptionsPage::CaptionsPage(QWidget *parent) : QWidget(parent)
+ 	preview_->setAlignment(Qt::AlignLeft | Qt::AlignBottom);
+ 	preview_->setStyleSheet(QStringLiteral(
+ 		"QLabel { background: #1d2025; border: 1px solid #3a3f48; border-radius: 6px; padding: 8px; font-size: 15px; }"));
++	saveSrt_ = new QCheckBox(text("LiveHime.Captions.SaveSrt"), this);
++	saveSrt_->setToolTip(text("LiveHime.Captions.SaveSrtTip"));
++	saveSrt_->setChecked(controller_->saveSrt());
++	connect(saveSrt_, &QCheckBox::toggled, this, [this](bool on) {
++		controller_->setSaveSrt(on);
++		recorder_->setEnabled(on);
++	});
++	/* "Saved: name.srt  Show in Finder" after each recording or stream. */
++	saved_ = new QLabel(this);
++	saved_->setWordWrap(true);
++	saved_->setTextFormat(Qt::RichText);
++	saved_->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++	saved_->hide();
++	connect(saved_, &QLabel::linkActivated, this,
++		[](const QString &path) { QProcess::startDetached(QStringLiteral("/usr/bin/open"), {QStringLiteral("-R"), path}); });
++	connect(recorder_, &CaptionRecorder::saved, this, [this](const QString &path) {
++		saved_->setText(text("LiveHime.Captions.SrtSaved").arg(QFileInfo(path).fileName().toHtmlEscaped()) +
++				QStringLiteral(" <a href=\"%1\" style=\"color:#fb7299\">%2</a>")
++					.arg(path.toHtmlEscaped(), text("LiveHime.Captions.ShowInFinder")));
++		saved_->show();
++	});
++	connect(recorder_, &CaptionRecorder::saveFailed, this, [this](const QString &path) {
++		saved_->setText(text("LiveHime.Captions.SrtFailed").arg(path.toHtmlEscaped()));
++		saved_->show();
++	});
+ 	auto *hint = new QLabel(text("LiveHime.Captions.Hint"), this);
+ 	hint->setWordWrap(true);
+ 	hint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+@@ -57,6 +87,8 @@ CaptionsPage::CaptionsPage(QWidget *parent) : QWidget(parent)
+ 	layout->addLayout(form);
+ 	layout->addWidget(status_);
+ 	layout->addWidget(preview_);
++	layout->addWidget(saveSrt_);
++	layout->addWidget(saved_);
+ 	layout->addWidget(hint);
+ 	layout->addStretch(1);
+ 
+@@ -169,6 +201,9 @@ void CaptionsPage::handleEvent(const QJsonObject &event)
+ 	if (name != "caption")
+ 		return;
+ 	if (event.value("final").toBool()) {
++		if (event.contains("start"))
++			recorder_->addCaption(event.value("text").toString(), event.value("start").toDouble(),
++					      event.value("end").toDouble());
+ 		finished_ = (finished_ + event.value("text").toString()).right(120);
+ 		partial_.clear();
+ 	} else {
+diff --git a/plugins/livehime/src/captions-page.hpp b/plugins/livehime/src/captions-page.hpp
+index 5ed0c9ba0..95ccd2d67 100644
+--- a/plugins/livehime/src/captions-page.hpp
++++ b/plugins/livehime/src/captions-page.hpp
+@@ -4,6 +4,7 @@
+ #include <QWidget>
+ 
+ class CaptionController;
++class CaptionRecorder;
+ class QCheckBox;
+ class QComboBox;
+ class QLabel;
+@@ -19,6 +20,7 @@ public:
+ 	explicit CaptionsPage(QWidget *parent = nullptr);
+ 
+ 	CaptionController *controller() { return controller_; }
++	CaptionRecorder *recorder() { return recorder_; }
+ 	void handleEvent(const QJsonObject &event);
+ 	/* Rebuilds the audio source list (sources come and go). */
+ 	void refreshSources();
+@@ -35,7 +37,10 @@ private:
+ 	void setStatus(const QString &key, bool error = false);
+ 
+ 	CaptionController *controller_;
++	CaptionRecorder *recorder_;
+ 	QCheckBox *enabled_;
++	QCheckBox *saveSrt_;
++	QLabel *saved_;
+ 	QComboBox *source_;
+ 	QComboBox *locale_;
+ 	QLabel *status_;
+-- 
+2.54.0 (Apple Git-157)
+

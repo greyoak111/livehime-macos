@@ -1,7 +1,7 @@
 From 5c2cb84c81bb2a5a99c4c8973244597dce374daf Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 23:55:40 +0800
-Subject: [PATCH 10/43] Pick the RTMP endpoint deterministically when going
+Subject: [PATCH 10/48] Pick the RTMP endpoint deterministically when going
  live
 
 startLive can list several protocols. The endpoint parser inherited from

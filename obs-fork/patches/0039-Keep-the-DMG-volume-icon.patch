@@ -1,7 +1,7 @@
 From 7cc01c7705d67ad199eed797a8ec50f0c394fcde Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 17:41:04 +0800
-Subject: [PATCH 39/43] Keep the DMG volume icon
+Subject: [PATCH 39/48] Keep the DMG volume icon
 
 Finder removes a .VolumeIcon.icns that is present while it lays the DMG
 window out, so the volume showed the generic disk icon. Add the icon and

@@ -1,7 +1,7 @@
 From 054f05e008a8929b530ee4e2517491ba51c6c998 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 00:33:03 +0800
-Subject: [PATCH 15/43] Open Bilibili's cover manager from the room tab
+Subject: [PATCH 15/48] Open Bilibili's cover manager from the room tab
 
 The Windows client manages the live cover in a web page
 (hime-live-cover): upload, crop, history, quality advice and review.
