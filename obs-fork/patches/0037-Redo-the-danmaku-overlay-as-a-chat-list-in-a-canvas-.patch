@@ -1,7 +1,7 @@
 From 9433facf87119bc2339b72c8b0baf56e94cfa753 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 17:23:58 +0800
-Subject: [PATCH 37/49] Redo the danmaku overlay as a chat list in a canvas box
+Subject: [PATCH 37/51] Redo the danmaku overlay as a chat list in a canvas box
 
 The danmaku source now draws a chat list itself (Qt into a texture):
 newest message at the bottom, older ones above until the box is full,

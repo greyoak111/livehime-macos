@@ -1,7 +1,7 @@
-From c3521b254e82df06bc6ba2ebf0d3fcd7d11ae05c Mon Sep 17 00:00:00 2001
+From ee983c5f6f01d32fae86c62c4a2dc461a8933b26 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
-Date: Thu, 24 Sep 2026 17:34:22 +0800
-Subject: [PATCH 38/51] Bump LiveHime to 0.2.6
+Date: Fri, 25 Sep 2026 22:08:46 +0800
+Subject: [PATCH 51/51] Bump LiveHime to 0.2.9
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -9,18 +9,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
-index 0db84b9a2..9992ee8e2 100755
+index dbfe5dad5..838180a96 100755
 --- a/build-aux/livehime/build-macos.sh
 +++ b/build-aux/livehime/build-macos.sh
-@@ -20,7 +20,7 @@ cmake -S "$source_dir" --preset macos \
+@@ -30,7 +30,7 @@ cmake -S "$source_dir" -B "$build_dir" --preset macos \
    -DLIVEHIME_APP_BUNDLE_ID="$bundle_id" \
    -DLIVEHIME_APP_NAME=LiveHime \
    -DLIVEHIME_APP_DISPLAY_NAME=LiveHime \
--  -DLIVEHIME_APP_VERSION=0.2.1 \
-+  -DLIVEHIME_APP_VERSION=0.2.6 \
+-  -DLIVEHIME_APP_VERSION=0.2.8 \
++  -DLIVEHIME_APP_VERSION=0.2.9 \
    -DOBS_USER_CONFIG_SUBDIR=LiveHime
  
- cmake --build "$source_dir/build_macos" --config "$config" --target obs-studio -- -quiet
+ cmake --build "$build_dir" --config "$config" --target obs-studio -- -quiet
 -- 
 2.54.0 (Apple Git-157)
 

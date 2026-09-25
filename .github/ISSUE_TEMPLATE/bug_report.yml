@@ -1,0 +1,55 @@
+name: 问题反馈 / Bug report
+description: 开播、弹幕、表情、字幕、更新等出了问题 / Something does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！**请不要粘贴 Cookie、推流码、钥匙串内容或截图里的二维码。** 下面的巡检报告和日志片段不含账号信息。
+        Thanks! **Never paste cookies, stream keys, Keychain items or QR codes.** The check report below holds no account data.
+  - type: input
+    id: version
+    attributes:
+      label: LiveHime 版本 / Version
+      description: 窗口标题里能看到，例如 0.2.9 / Shown in the window title, e.g. 0.2.9
+    validations:
+      required: true
+  - type: dropdown
+    id: mac
+    attributes:
+      label: Mac 类型 / Mac
+      options:
+        - Apple 芯片 / Apple silicon (arm64)
+        - Intel (x86_64)
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS 版本 / macOS version
+      placeholder: "26.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么 / What happened
+      description: 做了什么、期望什么、实际看到什么；有提示文字请原样贴出 / What you did, expected and saw; paste any message as is
+    validations:
+      required: true
+  - type: textarea
+    id: probe
+    attributes:
+      label: B 站接口巡检报告 / Interface check report
+      description: |
+        “直播姬”面板 → 更新 → “B 站接口巡检…” → “开始巡检” → “复制报告”，粘贴到这里。和 B 站相关的问题（登录、开播、弹幕、表情）请务必附上。
+        Dock → 更新 → “B 站接口巡检…” → “开始巡检” → “复制报告”. Please include it for anything Bilibili-related.
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志片段（可选）/ Log excerpt (optional)
+      description: |
+        菜单 帮助 → 日志文件 → 查看当前日志，只贴含 `[livehime]` 的相关几行。
+        Help → Log Files → View Current Log; paste only the relevant `[livehime]` lines.
+      render: text

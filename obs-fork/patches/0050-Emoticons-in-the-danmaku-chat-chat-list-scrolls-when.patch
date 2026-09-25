@@ -1,0 +1,2136 @@
+From 181c60c2d8c668ee423d1435e5fe40f3ba7573b0 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 22:08:46 +0800
+Subject: [PATCH 50/51] Emoticons in the danmaku chat; chat list scrolls when
+ signed out; face verification status over POST
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- An emoticon panel under the chat (dock and floating chat), inside the
+  chat window so it works over full-screen apps. It offers the room's
+  packs (GetEmoticons) and the account's main-site packs (小黄脸 and owned
+  packs); stickers go out with dm_type 1 as their emoticon_unique, main-site
+  emotes as "upower_[code]" like the Bilibili apps. Locked ones show how to
+  unlock them.
+- Chat lines draw inline emoticons and stickers as pictures. Pictures come
+  only from Bilibili's image hosts, without cookies, scaled to 160 px PNGs
+  in Caches/LiveHime/emoticons (trimmed at 30 MB); at most 16 MB in memory.
+- The danmaku page is no longer disabled as a whole when signed out, which
+  also stopped the chat list from scrolling.
+- IsUserIdentifiedByFaceAuth answers POST only now (GET returns 405). The
+  QR face verification window no longer checks the status by itself; the
+  user confirms, as before, since the status can report an earlier
+  verification.
+- Interface check: room and main-site emoticons, face status field names.
+- Tests: e2e-emoticons.mjs, the panel over a full-screen app.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  18 ++
+ build-aux/livehime/tests/e2e-emoticons.mjs    | 124 +++++++
+ .../livehime/tests/e2e-float-fullscreen.mjs   |  33 +-
+ plugins/livehime/CMakeLists.txt               |   5 +
+ .../core/Sources/LiveHimeCore/ApiProbe.swift  |  18 +-
+ .../LiveHimeCore/BilibiliPageWindow.swift     |  34 +-
+ .../core/Sources/LiveHimeCore/CBridge.swift   |   6 +-
+ .../Sources/LiveHimeCore/DanmakuClient.swift  |   2 +-
+ .../LiveHimeCore/DanmakuProtocol.swift        |  36 ++-
+ .../core/Sources/LiveHimeCore/Emoticons.swift | 303 ++++++++++++++++++
+ .../LiveHimeCore/LiveRoomActions.swift        |  15 +-
+ .../LiveHimeCore/SessionCoordinator.swift     |  27 ++
+ .../DanmakuProtocolTests.swift                |  97 ++++++
+ .../SessionCoordinatorTests.swift             |   6 +
+ plugins/livehime/core/include/livehime-core.h |  18 +-
+ plugins/livehime/data/locale/en-US.ini        |  13 +
+ plugins/livehime/data/locale/zh-CN.ini        |  13 +
+ plugins/livehime/src/automation.cpp           |  56 ++++
+ plugins/livehime/src/danmaku-feed.cpp         | 255 ++++++++++++++-
+ plugins/livehime/src/danmaku-feed.hpp         |  23 +-
+ plugins/livehime/src/emoji-picker.cpp         | 260 +++++++++++++++
+ plugins/livehime/src/emoji-picker.hpp         |  55 ++++
+ plugins/livehime/src/emoticon-store.cpp       |  88 +++++
+ plugins/livehime/src/emoticon-store.hpp       |  64 ++++
+ plugins/livehime/src/feature-panel.cpp        |  10 +-
+ plugins/livehime/src/feature-panel.hpp        |   1 +
+ 26 files changed, 1534 insertions(+), 46 deletions(-)
+ create mode 100644 build-aux/livehime/tests/e2e-emoticons.mjs
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/Emoticons.swift
+ create mode 100644 plugins/livehime/src/emoji-picker.cpp
+ create mode 100644 plugins/livehime/src/emoji-picker.hpp
+ create mode 100644 plugins/livehime/src/emoticon-store.cpp
+ create mode 100644 plugins/livehime/src/emoticon-store.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 2f2433643..09c01dd28 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -144,3 +144,21 @@ file up and restore it around the run. A Chinese sample:
+ ```bash
+ node e2e-captions.mjs <websocket password> /path/to/speech.aiff
+ ```
++
++## Emoticons
++
++`e2e-emoticons.mjs` checks emoticons without an account: chat lines with
++inline emoticons and a sticker are drawn with their pictures (fetched from
++Bilibili's public image host), and the panel works from an injected pack
++list (insert, locked hint, sticker send failing while signed out, shared by
++the floating chat). The feed is told it is signed in while the core is not,
++so nothing is sent. It saves a snapshot of the dock:
++
++```bash
++node e2e-emoticons.mjs <websocket password> /tmp/emoticons-dock.png
++```
++
++`e2e-float-fullscreen.mjs` also opens the panel over a full-screen app: it
++must stay inside the chat window (no extra window) and show its pictures.
++The real pack list and sending need a signed-in instance: open the panel,
++check the packs against the web room, send one inline emoji and one sticker.
+diff --git a/build-aux/livehime/tests/e2e-emoticons.mjs b/build-aux/livehime/tests/e2e-emoticons.mjs
+new file mode 100644
+index 000000000..ac9dc2067
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-emoticons.mjs
+@@ -0,0 +1,124 @@
++// Emoticons end to end, without an account (nothing is sent to Bilibili):
++// - chat lines with inline emoticons ("[笑哭]") and a sticker are drawn with their pictures,
++//   fetched from Bilibili's image host (a snapshot of the dock is saved for a look);
++// - the dock's panel shows an injected pack list: tabs, pictures, an inline emoji inserts its
++//   code into the send box, a locked one only explains itself, a sticker is sent on its own and
++//   (the core being signed out) fails without touching the draft;
++// - Esc closes the panel first; signing out hides it and forgets the list.
++// The feed is told it is signed in ("ready") while the core stays signed out.
++// Usage: node e2e-emoticons.mjs <ws password> <snapshot.png>
++import { createHash } from 'node:crypto';
++const [password, snapshot] = process.argv.slice(2);
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++let ws, id = 1; const pend = new Map();
++for (let i = 0; i < 60; i++) {
++  try { ws = new WebSocket('ws://127.0.0.1:4466'); await new Promise((ok, bad) => { ws.onopen = ok; ws.onerror = bad; }); break; }
++  catch { await sleep(1000); }
++}
++await new Promise((ok) => {
++  ws.onmessage = (m) => {
++    const msg = JSON.parse(m.data);
++    if (msg.op === 0) {
++      const a = msg.d.authentication;
++      ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + a.salt) + a.challenge) } }));
++    } else if (msg.op === 2) ok();
++    else if (msg.op === 7) { pend.get(msg.d.requestId)?.(msg.d); pend.delete(msg.d.requestId); }
++  };
++});
++const req = (t, d = {}) => new Promise((r) => { const k = String(id++); pend.set(k, r); ws.send(JSON.stringify({ op: 6, d: { requestType: t, requestId: k, requestData: d } })); });
++const vendor = async (t, d = {}) => (await req('CallVendorRequest', { vendorName: 'livehime', requestType: t, requestData: d })).responseData?.responseData;
++for (let i = 0; i < 60 && (await vendor('Emoticons', { dock: true })) === undefined; i++) await sleep(500);
++let fails = 0;
++const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i ? '  — ' + i : ''}`); };
++const until = async (fn, pred, seconds = 15) => { let v; for (let i = 0; i < seconds * 4; i++) { v = await fn(); if (pred(v)) return v; await sleep(250); } return v; };
++
++const img = (h) => `https://i0.hdslb.com/bfs/emote/${h}.png`;
++const xiaoku = img('c3043ba94babf824dea03ce500d0e73763bf4f40');
++const dundun = img('878f1dfac79622050f730d1fee5f7b1a55951c74');
++const star = img('63c9d1a31c0da745b61cdb35e0ecb28635675db2');
++const doge = img('aadaca1895e09c5596fc6365192ec93a23718cf0');
++const packs = {
++  event: 'emoticons', ok: true, room: 1, packs: [
++    { id: 1, name: '通用表情', items: [
++      { key: 'emoji_1', text: '[笑哭]', name: '笑哭', url: xiaoku, inline: true, usable: true, hint: '' },
++      { key: 'emoji_2', text: '[蹲蹲]', name: '蹲蹲', url: dundun, inline: true, usable: true, hint: '' }] },
++    { id: 9, name: '房间专属表情', large: true, items: [
++      { key: 'room_1_1', text: '星星', name: '星星', url: star, inline: false, usable: true, hint: '' },
++      { key: 'room_1_2', text: '金箍', name: '金箍', url: doge, inline: false, usable: false, hint: '粉丝团3级' }] },
++  ],
++};
++
++try {
++  // Chat lines with pictures.
++  await vendor('Snapshot', { path: snapshot, tab: 0 });
++  const before = (await vendor('Emoticons', { dock: true, ready: true, draft: '' })).lines;
++  await vendor('InjectOverlayEvent', { kind: 'chat', uid: 11, user: '测试观众', text: '好耶[笑哭][笑哭] 不是表情[abc]',
++    emots: { '[笑哭]': xiaoku } });
++  await vendor('InjectOverlayEvent', { kind: 'chat', uid: 12, user: '测试观众B', text: '星星', sticker: { url: star, w: 160, h: 160 } });
++  // A main-site emote sent by the apps: a 20 px sticker named "upower_[code]", drawn at text size.
++  await vendor('InjectOverlayEvent', { kind: 'chat', uid: 13, user: '测试观众C', text: '[蹲蹲]',
++    sticker: { url: dundun, w: 20, h: 20, key: 'upower_[蹲蹲]' } });
++  const lines = await until(() => vendor('Emoticons', { dock: true }), (s) => s?.lines >= before + 3);
++  check('chat lines with emoticons added', lines?.lines >= before + 3, `lines ${before} -> ${lines?.lines}`);
++
++  // The dock's panel with an injected list.
++  let st = await vendor('Emoticons', { dock: true, inject: packs, picker: true, pack: 0 });
++  check('panel open with both packs', st?.picker_visible && st.packs === 2 && st.status === 'ready', JSON.stringify(st));
++  st = await until(() => vendor('Emoticons', { dock: true }), (s) => s?.pictures === 2);
++  check('inline pack shows its pictures', st?.pictures === 2 && st.items === 2, JSON.stringify(st));
++  await sleep(500);
++  await vendor('Snapshot', { path: snapshot, tab: 0 });
++  console.log(`      snapshot: ${snapshot}`);
++
++  st = await vendor('Emoticons', { dock: true, click: 0 });
++  st = await vendor('Emoticons', { dock: true, click: 1 });
++  check('inline emoji inserted into the send box', st?.draft === '[笑哭][蹲蹲]', JSON.stringify(st?.draft));
++
++  st = await vendor('Emoticons', { dock: true, pack: 1 });
++  st = await until(() => vendor('Emoticons', { dock: true }), (s) => s?.pictures === 2);
++  check('sticker pack shows its pictures (locked one greyed)', st?.pack === 1 && st.pictures === 2, JSON.stringify(st));
++  const linesBefore = st.lines;
++  st = await vendor('Emoticons', { dock: true, click: 1 });
++  await sleep(1000);
++  st = await vendor('Emoticons', { dock: true });
++  check('locked sticker explains itself and sends nothing', /粉丝团3级|locked/.test(st?.hint) && st.lines === linesBefore, st?.hint);
++  st = await vendor('Emoticons', { dock: true, click: 0 });
++  st = await until(() => vendor('Emoticons', { dock: true }), (s) => s?.lines > linesBefore, 10);
++  check('sticker sent on its own: fails while signed out, draft kept', st?.lines === linesBefore + 1 && st.draft === '[笑哭][蹲蹲]',
++    `lines ${linesBefore} -> ${st?.lines}, draft ${st?.draft}`);
++
++  // The floating chat's feed shares the list.
++  await vendor('FloatingChat', { visible: true });
++  st = await vendor('Emoticons', { ready: true, picker: true, pack: 1 });
++  st = await until(() => vendor('Emoticons'), (s) => s?.pictures === 2);
++  check('floating chat panel shares the list', st?.picker_visible && st.packs === 2 && st.items === 2 && st.pictures === 2,
++    JSON.stringify(st));
++  await vendor('Emoticons', { picker: false });
++  await vendor('FloatingChat', { visible: false });
++
++  // A flood of chat in the dock: the list scrolls, stays where the reader scrolled to while new
++  // lines come in, and follows the newest again once back at the bottom.
++  for (let i = 1; i <= 60; i++) await vendor('InjectOverlayEvent', { kind: 'chat', uid: 100 + i, user: `刷屏${i}`, text: `第${i}条` });
++  st = await until(() => vendor('Emoticons', { dock: true }), (s) => s?.scroll_max > 0 && s.scroll === s.scroll_max);
++  check('flood: dock list enabled, scrollable and at the newest line', st?.list_enabled && st.scroll_max > 0 && st.scroll === st.scroll_max,
++    JSON.stringify({ enabled: st?.list_enabled, scroll: st?.scroll, max: st?.scroll_max }));
++  await vendor('Emoticons', { dock: true, scroll: 0 });
++  for (let i = 61; i <= 70; i++) await vendor('InjectOverlayEvent', { kind: 'chat', uid: 100 + i, user: `刷屏${i}`, text: `第${i}条` });
++  await sleep(500);
++  st = await vendor('Emoticons', { dock: true });
++  check('flood: scrolled up stays put while lines arrive', st?.scroll === 0 && st.scroll_max > 0, JSON.stringify({ scroll: st?.scroll, max: st?.scroll_max }));
++  await vendor('Emoticons', { dock: true, scroll: st.scroll_max });
++  await vendor('InjectOverlayEvent', { kind: 'chat', uid: 171, user: '刷屏71', text: '第71条' });
++  st = await until(() => vendor('Emoticons', { dock: true }), (s) => s?.scroll === s?.scroll_max && s.lines >= 74, 5);
++  check('flood: back at the bottom follows the newest', st?.scroll === st?.scroll_max, JSON.stringify({ scroll: st?.scroll, max: st?.scroll_max }));
++  // Signed out (the test instance's real state), the list still takes input.
++  st = await vendor('Emoticons', { dock: true, ready: false });
++  check('signed out: panel closed, list not disabled', st?.picker_visible === false && st.list_enabled, JSON.stringify(st));
++} finally {
++  // Back to the real state: the core is signed out, so both feeds are too; forget the injected list.
++  await vendor('Emoticons', { dock: true, ready: false, reset: true, draft: '' });
++  await vendor('Emoticons', { ready: false });
++  ws.close();
++}
++process.exit(fails ? 1 : 0);
+diff --git a/build-aux/livehime/tests/e2e-float-fullscreen.mjs b/build-aux/livehime/tests/e2e-float-fullscreen.mjs
+index df355bc1f..7f84b71f3 100644
+--- a/build-aux/livehime/tests/e2e-float-fullscreen.mjs
++++ b/build-aux/livehime/tests/e2e-float-fullscreen.mjs
+@@ -3,7 +3,8 @@
+ // another app's normal window while LiveHime is inactive.
+ // Usage: swiftc -O fullscreen-probe.swift -o /tmp/fullscreen-probe
+ //        node e2e-float-fullscreen.mjs <ws password> <LiveHime pid> /tmp/fullscreen-probe
+-// The "⋯" menu must also open over the full-screen window.
++// The "⋯" menu must also open over the full-screen window, and the emoticon panel must open
++// inside the chat there (no separate window) with its pictures.
+ // The probe takes over the screen for a few seconds per case.
+ import { createHash } from 'node:crypto';
+ import { execFile, execFileSync } from 'node:child_process';
+@@ -72,6 +73,36 @@ for (const onTop of [true, false]) {
+   console.log(`${ok ? 'PASS' : 'FAIL'}  "⋯" menu over a full-screen app: menu_visible=${st?.menu_visible}, menu window ${menu ? menu.trim() : 'not on screen'}`);
+   await sleep(1500);
+ }
++{
++  // The emoticon panel opened while another app is full screen: it is part of the chat window,
++  // so the chat keeps its size and place in front, and LiveHime shows no other window there.
++  const url = 'https://i0.hdslb.com/bfs/emote/c3043ba94babf824dea03ce500d0e73763bf4f40.png';
++  const packs = { event: 'emoticons', ok: true, room: 1, packs: [{ id: 1, name: '通用表情', items: [
++    { key: 'emoji_1', text: '[笑哭]', name: '笑哭', url, inline: true, usable: true, hint: '' }] }] };
++  await vendor('FloatingChat', { visible: true, on_top: true, x: 120, y: 160, w: 340, h: 460 });
++  await vendor('Emoticons', { ready: true, inject: packs, draft: '' });
++  await sleep(800);
++  const probe = new Promise((ok) => execFile(helper, [pid, '4'], { encoding: 'utf8' }, (_, out) => ok(out)));
++  await sleep(2500);
++  await vendor('Emoticons', { picker: true });
++  await sleep(600);
++  const st = await vendor('Emoticons', { click: 0 });
++  const out = await probe;
++  const targets = out.split('\n').filter((l) => / target /.test(l));
++  const chat = targets.find((l) => /340x460/.test(l));
++  const z = (l) => Number((l?.match(/z=(\d+)/) || [])[1] ?? 99);
++  const helperZ = Number((out.match(/z=(\d+) helper/) || [])[1] ?? -1);
++  const inside = st && st.picker_x >= 120 && st.picker_y >= 160 && st.picker_x + st.picker_w <= 460 && st.picker_y + st.picker_h <= 620;
++  const ok = /fullscreen=true/.test(out) && st?.picker_visible && st.pictures === 1 && st.draft === '[笑哭]' && inside &&
++    chat && z(chat) < helperZ && targets.length === 1;
++  if (!ok) fails++;
++  console.log(`${ok ? 'PASS' : 'FAIL'}  emoticon panel over a full-screen app: visible=${st?.picker_visible}, pictures=${st?.pictures}, ` +
++    `draft=${st?.draft}, inside chat=${inside}, LiveHime windows there=${targets.length}, ` +
++    `helper fullscreen=${/fullscreen=true/.test(out)}, chat z=${z(chat)} helper z=${helperZ}`);
++  console.log(targets.map((l) => '      ' + l.trim()).join('\n'));
++  await vendor('Emoticons', { picker: false, ready: false, reset: true, draft: '' });
++  await sleep(1500);
++}
+ await vendor('FloatingChat', { visible: false, on_top: true });
+ ws.close();
+ await sleep(1500);
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index b4ab0bfb5..f03bb0644 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -21,6 +21,7 @@ target_sources(
+     core/Sources/LiveHimeCore/CredentialStore.swift
+     core/Sources/LiveHimeCore/DanmakuClient.swift
+     core/Sources/LiveHimeCore/DanmakuProtocol.swift
++    core/Sources/LiveHimeCore/Emoticons.swift
+     core/Sources/LiveHimeCore/Diagnostics.swift
+     core/Sources/LiveHimeCore/LiveCaptions.swift
+     core/Sources/LiveHimeCore/LiveRoomActions.swift
+@@ -51,6 +52,10 @@ target_sources(
+     src/danmaku-feed.hpp
+     src/danmaku-overlay.cpp
+     src/danmaku-overlay.hpp
++    src/emoji-picker.cpp
++    src/emoji-picker.hpp
++    src/emoticon-store.cpp
++    src/emoticon-store.hpp
+     src/feature-panel.cpp
+     src/feature-panel.hpp
+     src/floating-chat.cpp
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/ApiProbe.swift b/plugins/livehime/core/Sources/LiveHimeCore/ApiProbe.swift
+index 623f60852..75dd7167b 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/ApiProbe.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/ApiProbe.swift
+@@ -88,12 +88,28 @@ enum ApiProbe {
+             return "\(info.roomID)"
+         }
+         await check("faceAuthState", needs: account != nil, skip: signedOut) {
+-            try await client.isIdentifiedByFaceAuth(roomID: account!.room.roomID, cookieHeader: cookie) ? "verified" : "notVerified"
++            // The field names too, so a changed response shape shows up in the report.
++            let data = try await client.faceAuthData(roomID: account!.room.roomID, cookieHeader: cookie)
++            let fields = (data as? [String: Any]).map { $0.keys.sorted().joined(separator: ",") } ?? String(describing: type(of: data))
++            return (BilibiliLiveClient.identified(data) ? "verified" : "notVerified") + " · " + fields
+         }
+         await check("shieldKeywords", needs: account != nil, skip: signedOut) {
+             let words = try await client.shieldKeywords(roomID: account!.room.roomID, cookieHeader: cookie)
+             return "\(words.count)"
+         }
++        // The room's packs and the account's main-site packs, pack by pack
++        // (type#id name × count, inline, locked), to compare with the official apps.
++        let summary = { (packs: [EmoticonPack]) in
++            "\(packs.count): " + packs.map { pack in
++                "\(pack.type)#\(pack.id) \(pack.name)×\(pack.items.count) inline \(pack.items.filter(\.inline).count) locked \(pack.items.filter { !$0.usable }.count)"
++            }.joined(separator: ", ")
++        }
++        await check("emoticons", needs: account != nil, skip: signedOut) {
++            summary(try await client.emoticons(roomID: account!.room.roomID, cookieHeader: cookie))
++        }
++        await check("mainSiteEmoticons", needs: account != nil, skip: signedOut) {
++            summary(try await client.mainSiteEmoticons(cookieHeader: cookie))
++        }
+     }
+ 
+     /// The identity endpoint answers 0 (signed in) or -101 (signed out), and
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+index 003110d59..44834a7b3 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/BilibiliPageWindow.swift
+@@ -455,9 +455,11 @@ public func livehime_core_open_cover_page() {
+ }
+ 
+ /// Native pre-live face verification, as the Windows client's FaceAuthView:
+-/// show Bilibili's QR code for the phone app, poll whether the account has
+-/// been verified and retry Go live once it has. The verification itself
+-/// happens in the Bilibili app; nothing here completes or bypasses it.
++/// show Bilibili's QR code for the phone app; the user confirms when done
++/// and Go live is retried. There is no automatic check: the status endpoint
++/// can report an earlier verification as done, which would retry into the
++/// same demand again. The verification itself happens in the Bilibili app;
++/// nothing here completes or bypasses it.
+ @MainActor
+ final class FaceAuthQRWindow: NSObject, NSWindowDelegate {
+     private static var current: FaceAuthQRWindow?
+@@ -465,14 +467,13 @@ final class FaceAuthQRWindow: NSObject, NSWindowDelegate {
+     private let window: NSWindow
+     private let status: NSTextField
+     private let onVerified: () -> Void
+-    private var poll: Task<Void, Never>?
+ 
+-    static func present(url: String, isVerified: @escaping () async -> Bool, onVerified: @escaping () -> Void) {
++    static func present(url: String, onVerified: @escaping () -> Void) {
+         current?.window.close()
+-        current = FaceAuthQRWindow(url: url, isVerified: isVerified, onVerified: onVerified)
++        current = FaceAuthQRWindow(url: url, onVerified: onVerified)
+     }
+ 
+-    private init(url: String, isVerified: @escaping () async -> Bool, onVerified: @escaping () -> Void) {
++    private init(url: String, onVerified: @escaping () -> Void) {
+         self.onVerified = onVerified
+         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 460),
+                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+@@ -503,18 +504,6 @@ final class FaceAuthQRWindow: NSObject, NSWindowDelegate {
+         window.center()
+         window.makeKeyAndOrderFront(nil)
+         NSApp.activate(ignoringOtherApps: true)
+-
+-        poll = Task { [weak self] in
+-            while !Task.isCancelled {
+-                try? await Task.sleep(for: .seconds(2))
+-                guard !Task.isCancelled else { return }
+-                if await isVerified() {
+-                    self?.status.stringValue = "认证已通过，正在重试开播…"
+-                    self?.finish()
+-                    return
+-                }
+-            }
+-        }
+     }
+ 
+     private func finish() {
+@@ -527,22 +516,19 @@ final class FaceAuthQRWindow: NSObject, NSWindowDelegate {
+     @objc private func closeTapped() { window.close() }
+ 
+     func windowWillClose(_ notification: Notification) {
+-        poll?.cancel()
+         if Self.current === self { Self.current = nil }
+     }
+ }
+ 
+ /// Shows the native face verification QR code for the ready account and
+-/// emits {"event":"faceAuthRetry"} once it is verified (or confirmed).
++/// emits {"event":"faceAuthRetry"} when the user confirms it is done.
+ @_cdecl("livehime_core_open_face_auth_qr")
+ public func livehime_core_open_face_auth_qr(_ url: UnsafePointer<CChar>?) {
+     guard let url = url.map({ String(cString: $0) }), !url.isEmpty else { return }
+     DispatchQueue.main.async {
+         MainActor.assumeIsolated {
+             guard CoreBridge.shared != nil else { return }
+-            FaceAuthQRWindow.present(url: url, isVerified: {
+-                (try? await CoreBridge.shared?.coordinator.isIdentifiedByFaceAuth()) ?? false
+-            }, onVerified: { CoreBridge.shared?.emit(["event": "faceAuthRetry"]) })
++            FaceAuthQRWindow.present(url: url, onVerified: { CoreBridge.shared?.emit(["event": "faceAuthRetry"]) })
+         }
+     }
+ }
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+index 5cfef04b3..b48d82a2e 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/CBridge.swift
+@@ -73,11 +73,15 @@ final class CoreBridge {
+     static func fields(for event: LiveRoomEvent) -> [String: Any] {
+         var f: [String: Any] = ["event": "room"]
+         switch event {
+-        case let .chat(uid, user, text, medal, id, replyTo):
++        case let .chat(uid, user, text, medal, id, replyTo, emots, sticker):
+             f.merge(["kind": "chat", "uid": uid, "user": user, "text": text]) { $1 }
+             if let medal { f["medal"] = medal }
+             if let id { f["dmid"] = id }
+             if let replyTo { f["replyTo"] = replyTo }
++            if !emots.isEmpty { f["emots"] = emots }
++            if let sticker {
++                f["sticker"] = ["url": sticker.url, "w": sticker.width, "h": sticker.height, "key": sticker.key]
++            }
+         case let .gift(user, name, count, paid, totalCoin):
+             f.merge(["kind": "gift", "user": user, "name": name, "count": count, "paid": paid, "totalCoin": totalCoin]) { $1 }
+         case let .superChat(user, text, price, seconds):
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+index 11131b4ac..7b4d270ec 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuClient.swift
+@@ -125,7 +125,7 @@ public final class DanmakuSpeaker: NSObject, AVSpeechSynthesizerDelegate {
+ 
+     static func line(for event: LiveRoomEvent) -> String? {
+         switch event {
+-        case .chat(_, let user, let text, _, _, _): return "\(user)说：\(text)"
++        case .chat(_, let user, let text, _, _, _, _, _): return "\(user)说：\(text)"
+         case .gift(let user, let name, let count, _, _): return "感谢\(user)送的\(count)个\(name)"
+         case .superChat(let user, let text, _, _): return "\(user)的醒目留言：\(text)"
+         case .guardBought(let user, _, let name, _): return "感谢\(user)开通\(name)"
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+index af2c0b74d..cb0758b65 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/DanmakuProtocol.swift
+@@ -91,8 +91,11 @@ struct DanmakuPacket: Equatable {
+ /// Room activity delivered to the dock.
+ public enum LiveRoomEvent: Equatable, Sendable {
+     /// `id` is the danmaku's own id (what a reply points at); `replyTo` is the
+-    /// name of the viewer this danmaku replies to, if it is a reply.
+-    case chat(uid: Int64, user: String, text: String, medal: String?, id: String? = nil, replyTo: String? = nil)
++    /// name of the viewer this danmaku replies to, if it is a reply. `emots`
++    /// maps inline emoticon codes in `text` ("[dog]") to their pictures; a
++    /// sticker danmaku has `sticker`, and its name as `text`.
++    case chat(uid: Int64, user: String, text: String, medal: String?, id: String? = nil, replyTo: String? = nil,
++              emots: [String: String] = [:], sticker: Sticker? = nil)
+     case gift(user: String, name: String, count: Int, paid: Bool, totalCoin: Int)
+     case superChat(user: String, text: String, price: Int, seconds: Int)
+     case guardBought(user: String, level: Int, name: String, count: Int)
+@@ -104,6 +107,14 @@ public enum LiveRoomEvent: Equatable, Sendable {
+     case liveEnded
+     case roomChanged(title: String)
+ 
++    public struct Sticker: Equatable, Sendable {
++        public let url: String
++        public let width: Int
++        public let height: Int
++        /// Its emoticon_unique, what a sticker danmaku is sent as.
++        public var key: String = ""
++    }
++
+     public enum InteractionKind: Int, Sendable {
+         case enter = 1, follow = 2, share = 3, specialFollow = 4, mutualFollow = 5
+     }
+@@ -129,16 +140,29 @@ enum DanmakuParser {
+             if info.count > 3, let m = info[3] as? [Any], m.count > 1, let name = m[1] as? String, !name.isEmpty {
+                 medal = "\(name) \(int(m[0]))"
+             }
+-            // info[0][15].extra is a JSON string with the danmaku id and reply details.
+-            var id: String?, replyTo: String?
+-            if let meta = info[0] as? [Any], meta.count > 15, let more = meta[15] as? [String: Any],
++            // info[0][15].extra is a JSON string with the danmaku id, reply details and the
++            // inline emoticons ("emots": {"[dog]": {"url"...}}). A sticker has dm_type 1 in
++            // info[0][12] and its picture in info[0][13].
++            var id: String?, replyTo: String?, emots: [String: String] = [:], sticker: LiveRoomEvent.Sticker?
++            let meta = info[0] as? [Any] ?? []
++            if meta.count > 15, let more = meta[15] as? [String: Any],
+                let extra = (more["extra"] as? String)?.data(using: .utf8),
+                let fields = try? JSONSerialization.jsonObject(with: extra) as? [String: Any] {
+                 id = (fields["id_str"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                 replyTo = (fields["reply_uname"] as? String).flatMap { $0.isEmpty ? nil : $0 }
++                for (code, value) in fields["emots"] as? [String: Any] ?? [:] {
++                    if let url = (value as? [String: Any])?["url"] as? String, !url.isEmpty, text.contains(code) {
++                        emots[code] = url
++                    }
++                }
++            }
++            if meta.count > 13, int(meta[12]) == 1, let picture = meta[13] as? [String: Any],
++               let url = picture["url"] as? String, !url.isEmpty {
++                sticker = .init(url: url, width: int(picture["width"]), height: int(picture["height"]),
++                                key: picture["emoticon_unique"] as? String ?? "")
+             }
+             return .chat(uid: int64(user[0]), user: user[1] as? String ?? "", text: text, medal: medal,
+-                         id: id, replyTo: replyTo)
++                         id: id, replyTo: replyTo, emots: emots, sticker: sticker)
+         case "SEND_GIFT", "SEND_GIFT_V2":
+             return .gift(user: data["uname"] as? String ?? "",
+                          name: data["giftName"] as? String ?? data["gift_name"] as? String ?? "",
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/Emoticons.swift b/plugins/livehime/core/Sources/LiveHimeCore/Emoticons.swift
+new file mode 100644
+index 000000000..77a4bb926
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/Emoticons.swift
+@@ -0,0 +1,303 @@
++import CryptoKit
++import Foundation
++import ImageIO
++import UniformTypeIdentifiers
++
++/// One emoticon a live room offers. Inline ones ("[dog]") are typed into the
++/// message as text; the others are stickers, sent on their own by `unique`.
++public struct Emoticon: Equatable, Sendable {
++    public let unique: String
++    public let text: String
++    public let name: String
++    public let url: String
++    public let width: Int
++    public let height: Int
++    /// false when the account has not unlocked it; `hint` says how.
++    public let usable: Bool
++    public let hint: String
++
++    /// Typed into the message as text (the live room's own "[dog]" codes);
++    /// otherwise sent on its own as a sticker by `unique`.
++    public var sentAsText: Bool? = nil
++    public var inline: Bool { sentAsText ?? (text.count > 2 && text.hasPrefix("[") && text.hasSuffix("]")) }
++}
++
++public struct EmoticonPack: Equatable, Sendable {
++    public let id: Int64
++    public let name: String
++    /// Bilibili's pkg_type (1 general, 2 room, 3 streamer, others seen on apps).
++    public var type: Int = 0
++    public let items: [Emoticon]
++    /// Pictures shown large in the picker (stickers, big main-site emotes).
++    public var large: Bool = false
++}
++
++enum EmoticonParser {
++    /// Parses GetEmoticons: data.data[] packs with emoticons[]. Packs and
++    /// items without a usable image are dropped.
++    static func packs(from root: [String: Any]) -> [EmoticonPack] {
++        let packs = (root["data"] as? [String: Any])?["data"] as? [[String: Any]] ?? []
++        return packs.compactMap { pack in
++            let items = (pack["emoticons"] as? [[String: Any]] ?? []).compactMap { item -> Emoticon? in
++                guard let url = item["url"] as? String, !url.isEmpty,
++                      let unique = item["emoticon_unique"] as? String, !unique.isEmpty else { return nil }
++                let name = item["descript"] as? String ?? ""
++                let text = item["emoji"] as? String ?? name
++                let perm = item["perm"].map { DanmakuParser.int($0) } ?? 1
++                let hint = (item["unlock_show_text"] as? String).flatMap { $0.isEmpty ? nil : $0 }
++                    ?? { let level = DanmakuParser.int(item["unlock_need_level"]); return level > 0 ? "Lv\(level)" : "" }()
++                return Emoticon(unique: unique, text: text.isEmpty ? name : text, name: name.isEmpty ? text : name,
++                                url: url, width: DanmakuParser.int(item["width"]), height: DanmakuParser.int(item["height"]),
++                                usable: perm != 0, hint: hint)
++            }
++            guard !items.isEmpty else { return nil }
++            return EmoticonPack(id: DanmakuParser.int64(pack["pkg_id"]), name: pack["pkg_name"] as? String ?? "",
++                                type: DanmakuParser.int(pack["pkg_type"]), items: items,
++                                large: !items.allSatisfy(\.inline))
++        }
++    }
++
++    /// Parses the account's main-site emote panel (x/emote/user/panel/web):
++    /// data.packages[] with emote[] of "[code]" texts, the 小黄脸 set and the
++    /// packs the account owns. The live room does not read these codes as
++    /// text; the apps send them as stickers named "upower_" + code (seen in
++    /// danmaku from the Android app), shown at emoji size. Text-only packs
++    /// (颜文字) are left out.
++    static func mainSitePacks(from root: [String: Any]) -> [EmoticonPack] {
++        let packs = (root["data"] as? [String: Any])?["packages"] as? [[String: Any]] ?? []
++        return packs.compactMap { pack in
++            let id = DanmakuParser.int64(pack["id"])
++            let items = (pack["emote"] as? [[String: Any]] ?? []).compactMap { item -> Emoticon? in
++                guard let url = item["url"] as? String, url.hasPrefix("http") || url.hasPrefix("//"),
++                      let text = item["text"] as? String, text.hasPrefix("["), text.hasSuffix("]") else { return nil }
++                let meta = item["meta"] as? [String: Any]
++                let flags = item["flags"] as? [String: Any]
++                let locked = (flags?["no_access"] as? Bool) == true && (flags?["unlocked"] as? Bool) != true
++                return Emoticon(unique: "upower_" + text, text: text,
++                                name: (meta?["alias"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? text,
++                                url: url, width: 0, height: 0, usable: !locked, hint: "", sentAsText: false)
++            }
++            guard !items.isEmpty else { return nil }
++            let size = DanmakuParser.int((pack["meta"] as? [String: Any])?["size"])
++            return EmoticonPack(id: id, name: pack["text"] as? String ?? "", type: -DanmakuParser.int(pack["type"]),
++                                items: items, large: size == 2)
++        }
++    }
++
++    /// The picker's order, like the apps': 小黄脸 first, then the live room's
++    /// packs, then the account's other main-site packs.
++    static func merged(live: [EmoticonPack], mainSite: [EmoticonPack]) -> [EmoticonPack] {
++        let faces = mainSite.filter { $0.id == 1 }
++        return faces + live + mainSite.filter { $0.id != 1 }
++    }
++}
++
++extension BilibiliLiveClient {
++    /// The live room's own packs (general stickers, room and streamer packs;
++    /// needs sign-in). Every platform value answers the same.
++    public func emoticons(roomID: Int64, cookieHeader: String) async throws -> [EmoticonPack] {
++        let root = try await requestJSON(
++            url: withQuery(URL(string: "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons")!,
++                           [URLQueryItem(name: "platform", value: "pc"), URLQueryItem(name: "room_id", value: String(roomID))]),
++            cookieHeader: cookieHeader, body: nil)
++        return EmoticonParser.packs(from: root)
++    }
++
++    /// The account's main-site emote packs (see EmoticonParser.mainSitePacks).
++    public func mainSiteEmoticons(cookieHeader: String) async throws -> [EmoticonPack] {
++        let root = try await requestJSON(
++            url: withQuery(URL(string: "https://api.bilibili.com/x/emote/user/panel/web")!,
++                           [URLQueryItem(name: "business", value: "reply")]),
++            cookieHeader: cookieHeader, body: nil)
++        return EmoticonParser.mainSitePacks(from: root)
++    }
++
++    /// Everything the picker offers: the room's packs and, when they load, the
++    /// account's main-site packs.
++    public func allEmoticons(roomID: Int64, cookieHeader: String) async throws -> [EmoticonPack] {
++        async let mainSite = try? mainSiteEmoticons(cookieHeader: cookieHeader)
++        let live = try await emoticons(roomID: roomID, cookieHeader: cookieHeader)
++        return EmoticonParser.merged(live: live, mainSite: await mainSite ?? [])
++    }
++
++    /// Sends a sticker: the web room posts its `emoticon_unique` as the
++    /// message with dm_type 1 (and a literal "[object Object]" option field).
++    public func sendEmoticon(roomID: Int64, unique: String, reply: DanmakuReply? = nil, cookieHeader: String) async throws {
++        let csrf = try csrf(from: cookieHeader)
++        let replyDMID = reply?.danmakuID ?? ""
++        let body = form([
++            ("bubble", "0"), ("msg", unique), ("color", "16777215"), ("mode", "1"), ("room_type", "0"),
++            ("jumpfrom", "0"), ("reply_mid", reply.map { String($0.uid) } ?? "0"), ("reply_attr", "0"),
++            ("replay_dmid", replyDMID), ("reply_dmid", replyDMID),
++            ("dm_type", "1"), ("emoticonOptions", "[object Object]"),
++            ("statistics", #"{"appId":100,"platform":5}"#), ("fontsize", "25"),
++            ("rnd", String(Int(Date().timeIntervalSince1970))), ("roomid", String(roomID)),
++            ("csrf", csrf), ("csrf_token", csrf)
++        ])
++        _ = try await requestJSON(url: URL(string: "https://api.live.bilibili.com/msg/send")!,
++                                  cookieHeader: cookieHeader, body: body)
++    }
++}
++
++/// Emoticon pictures, downloaded once and kept small: each is scaled to at
++/// most 160 px and stored as PNG under Caches/LiveHime/emoticons, which is
++/// trimmed to 20 MB when it grows past 30 MB. Only Bilibili's image hosts
++/// are fetched, without cookies.
++@MainActor
++final class EmoticonImages {
++    static let shared = EmoticonImages()
++
++    let folder: URL
++    private var waiting: [String: [(String?) -> Void]] = [:]
++    private var trimmed = false
++    private let session: URLSession = {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.httpCookieStorage = nil
++        configuration.httpShouldSetCookies = false
++        configuration.urlCache = nil
++        configuration.timeoutIntervalForRequest = 12
++        configuration.httpMaximumConnectionsPerHost = 4
++        return URLSession(configuration: configuration)
++    }()
++
++    init(folder: URL? = nil) {
++        self.folder = folder ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
++            .appendingPathComponent("LiveHime/emoticons", isDirectory: true)
++    }
++
++    nonisolated static func allowed(_ address: String) -> URL? {
++        var address = address
++        if address.hasPrefix("//") { address = "https:" + address }
++        if address.hasPrefix("http://") { address = "https://" + address.dropFirst(7) }
++        guard let url = URL(string: address), url.scheme == "https", let host = url.host?.lowercased(),
++              ["hdslb.com", "biliimg.com"].contains(where: { host == $0 || host.hasSuffix("." + $0) }) else { return nil }
++        return url
++    }
++
++    func file(for address: String) -> URL {
++        let digest = SHA256.hash(data: Data(address.utf8)).map { String(format: "%02x", $0) }.joined()
++        return folder.appendingPathComponent(digest + ".png")
++    }
++
++    /// Calls `done` with the local PNG path, or nil when it cannot be had.
++    func fetch(_ address: String, done: @escaping (String?) -> Void) {
++        guard let url = Self.allowed(address) else { return done(nil) }
++        let target = file(for: address)
++        if FileManager.default.fileExists(atPath: target.path) { return done(target.path) }
++        if waiting[address] != nil { waiting[address]!.append(done); return }
++        waiting[address] = [done]
++        trimOnce()
++        Task { @MainActor in
++            var path: String?
++            if let (data, response) = try? await session.data(from: url),
++               (response as? HTTPURLResponse)?.statusCode == 200, data.count < 4_000_000,
++               let png = Self.smallPNG(data) {
++                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
++                if (try? png.write(to: target, options: .atomic)) != nil { path = target.path }
++            }
++            for callback in waiting.removeValue(forKey: address) ?? [] { callback(path) }
++        }
++    }
++
++    /// The first frame, scaled to at most 160 px, as PNG.
++    nonisolated static func smallPNG(_ data: Data) -> Data? {
++        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
++              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
++                  kCGImageSourceCreateThumbnailFromImageAlways: true,
++                  kCGImageSourceCreateThumbnailWithTransform: true,
++                  kCGImageSourceThumbnailMaxPixelSize: 160
++              ] as CFDictionary) else { return nil }
++        let out = NSMutableData()
++        guard let destination = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil) else { return nil }
++        CGImageDestinationAddImage(destination, image, nil)
++        return CGImageDestinationFinalize(destination) ? out as Data : nil
++    }
++
++    private func trimOnce() {
++        guard !trimmed else { return }
++        trimmed = true
++        let folder = folder
++        Task.detached(priority: .background) { Self.trim(folder, above: 30_000_000, to: 20_000_000) }
++    }
++
++    /// Removes the least recently written files until the folder is under `to` bytes.
++    nonisolated static func trim(_ folder: URL, above limit: Int, to target: Int) {
++        let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
++        guard let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys) else { return }
++        var entries = files.compactMap { url -> (URL, Int, Date)? in
++            guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
++            return (url, values.fileSize ?? 0, values.contentModificationDate ?? .distantPast)
++        }
++        var total = entries.reduce(0) { $0 + $1.1 }
++        guard total > limit else { return }
++        entries.sort { $0.2 < $1.2 }
++        for (url, size, _) in entries where total > target {
++            if (try? FileManager.default.removeItem(at: url)) != nil { total -= size }
++        }
++    }
++}
++
++extension CoreBridge {
++    static func fields(for pack: EmoticonPack) -> [String: Any] {
++        ["id": pack.id, "name": pack.name, "large": pack.large, "items": pack.items.map { item in
++            ["key": item.unique, "text": item.text, "name": item.name, "url": item.url, "w": item.width,
++             "h": item.height, "inline": item.inline, "usable": item.usable, "hint": item.hint] as [String: Any]
++        }]
++    }
++}
++
++/// Loads the room's emoticons. Emits {"event":"emoticons","ok":true,"room",
++/// "packs":[{"id","name","large","items":[{"key","text","name","url","w","h",
++/// "inline","usable","hint"}]}]} or {"event":"emoticons","ok":false,...}.
++@_cdecl("livehime_core_emoticons_load")
++public func livehime_core_emoticons_load() {
++    DispatchQueue.main.async {
++        MainActor.assumeIsolated {
++            guard let bridge = CoreBridge.shared else { return }
++            Task { @MainActor in
++                do {
++                    let (room, packs) = try await bridge.coordinator.emoticons()
++                    bridge.emit(["event": "emoticons", "ok": true, "room": room, "packs": packs.map(CoreBridge.fields(for:))])
++                } catch {
++                    bridge.emit(["event": "emoticons", "ok": false].merging(CoreBridge.errorFields(error)) { $1 })
++                }
++            }
++        }
++    }
++}
++
++/// Fetches an emoticon picture. Emits {"event":"emoticonImage","url","path"}
++/// ("path" empty when it could not be fetched).
++@_cdecl("livehime_core_emoticon_image")
++public func livehime_core_emoticon_image(_ url: UnsafePointer<CChar>?) {
++    let address = url.map { String(cString: $0) } ?? ""
++    DispatchQueue.main.async {
++        MainActor.assumeIsolated {
++            EmoticonImages.shared.fetch(address) { path in
++                CoreBridge.shared?.emit(["event": "emoticonImage", "url": address, "path": path ?? ""])
++            }
++        }
++    }
++}
++
++/// Sends the sticker `key` (an emoticon's "key"), optionally as a reply.
++/// Replies with {"event":"danmakuSent","ok",...,"sticker":true}.
++@_cdecl("livehime_core_send_emoticon")
++public func livehime_core_send_emoticon(_ key: UnsafePointer<CChar>?, _ replyUID: Int64,
++                                        _ replyDanmakuID: UnsafePointer<CChar>?) {
++    let unique = key.map { String(cString: $0) } ?? ""
++    let reply = replyUID > 0 ? DanmakuReply(uid: replyUID, danmakuID: replyDanmakuID.map { String(cString: $0) } ?? "") : nil
++    DispatchQueue.main.async {
++        MainActor.assumeIsolated {
++            guard let bridge = CoreBridge.shared else { return }
++            Task { @MainActor in
++                do {
++                    try await bridge.coordinator.sendEmoticon(unique, reply: reply)
++                    bridge.emit(["event": "danmakuSent", "ok": true, "sticker": true])
++                } catch {
++                    bridge.emit(["event": "danmakuSent", "ok": false, "sticker": true].merging(CoreBridge.errorFields(error)) { $1 })
++                }
++            }
++        }
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+index 320f12bcb..9d1dc6028 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/LiveRoomActions.swift
+@@ -104,12 +104,19 @@ extension BilibiliLiveClient {
+     /// Whether the account has passed pre-live face verification. The response
+     /// shape is not documented; any truthy "identified"/"is_face"/"status"
+     /// style field counts, anything else reads as "not yet".
++    /// The endpoint answers POST only (GET has returned 405 since September 2026).
+     public func isIdentifiedByFaceAuth(roomID: Int64, cookieHeader: String) async throws -> Bool {
++        Self.identified(try await faceAuthData(roomID: roomID, cookieHeader: cookieHeader))
++    }
++
++    /// The raw "data" of the face verification status, for the interface check.
++    func faceAuthData(roomID: Int64, cookieHeader: String) async throws -> Any? {
++        let csrf = try csrf(from: cookieHeader)
+         let root = try await requestJSON(
+-            url: withQuery(URL(string: "https://api.live.bilibili.com/xlive/app-blink/v1/preLive/IsUserIdentifiedByFaceAuth")!,
+-                           [URLQueryItem(name: "room_id", value: String(roomID))]),
+-            cookieHeader: cookieHeader, body: nil)
+-        return Self.identified(root["data"])
++            url: URL(string: "https://api.live.bilibili.com/xlive/app-blink/v1/preLive/IsUserIdentifiedByFaceAuth")!,
++            cookieHeader: cookieHeader,
++            body: form([("room_id", String(roomID)), ("csrf", csrf), ("csrf_token", csrf)]))
++        return root["data"]
+     }
+ 
+     static func identified(_ value: Any?) -> Bool {
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+index e03434ff2..8d8278873 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -43,6 +43,8 @@ public protocol BilibiliAccountAPI: Sendable {
+     func stopLive(roomID: Int64, cookieHeader: String) async throws
+     func upstream(roomID: Int64, cookieHeader: String) async throws -> BilibiliStreamConfig
+     func sendDanmaku(roomID: Int64, text: String, reply: DanmakuReply?, cookieHeader: String) async throws
++    func sendEmoticon(roomID: Int64, unique: String, reply: DanmakuReply?, cookieHeader: String) async throws
++    func emoticons(roomID: Int64, cookieHeader: String) async throws -> [EmoticonPack]
+     func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws
+     func refreshSessionIfNeeded(_ current: SessionCredentials) async throws -> SessionCredentials?
+     func confirmRefresh(renewed: SessionCredentials, previousRefreshToken: String) async throws
+@@ -247,6 +249,23 @@ public final class SessionCoordinator {
+         }
+     }
+ 
++    /// Sends a sticker by its `emoticon_unique`.
++    public func sendEmoticon(_ unique: String, reply: DanmakuReply? = nil) async throws {
++        let (saved, account) = try readyAccount()
++        guard !unique.isEmpty else { return }
++        try await guarded {
++            try await self.api.sendEmoticon(roomID: account.room.roomID, unique: unique, reply: reply,
++                                            cookieHeader: saved.cookieHeader)
++        }
++    }
++
++    /// The emoticon packs of the account's room, with that room's id.
++    public func emoticons() async throws -> (room: Int64, packs: [EmoticonPack]) {
++        let (saved, account) = try readyAccount()
++        let packs = try await guarded { try await self.api.emoticons(roomID: account.room.roomID, cookieHeader: saved.cookieHeader) }
++        return (account.room.roomID, packs)
++    }
++
+     public func updateTitle(_ title: String) async throws {
+         let (saved, account) = try readyAccount()
+         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+@@ -462,6 +481,14 @@ public struct LiveBilibiliAccountAPI: BilibiliAccountAPI {
+         try await live(cookieHeader).sendDanmaku(roomID: roomID, text: text, reply: reply, cookieHeader: cookieHeader)
+     }
+ 
++    public func sendEmoticon(roomID: Int64, unique: String, reply: DanmakuReply?, cookieHeader: String) async throws {
++        try await live(cookieHeader).sendEmoticon(roomID: roomID, unique: unique, reply: reply, cookieHeader: cookieHeader)
++    }
++
++    public func emoticons(roomID: Int64, cookieHeader: String) async throws -> [EmoticonPack] {
++        try await live(cookieHeader).allEmoticons(roomID: roomID, cookieHeader: cookieHeader)
++    }
++
+     public func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws {
+         try await live(cookieHeader).updateTitle(roomID: roomID, title: title, cookieHeader: cookieHeader)
+     }
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+index 036e143f4..6a24c1a8e 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/DanmakuProtocolTests.swift
+@@ -1,3 +1,4 @@
++import ImageIO
+ import XCTest
+ @testable import LiveHimeCore
+ 
+@@ -42,6 +43,102 @@ final class DanmakuProtocolTests: XCTestCase {
+         XCTAssertEqual(DanmakuParser.event(from: plain), .chat(uid: 8, user: "观众B", text: "你好", medal: nil))
+     }
+ 
++    func testChatCarriesInlineEmoticonsAndStickers() {
++        let extra = #"{"id_str":"d1","emots":{"[dog]":{"url":"https://i0.hdslb.com/bfs/live/dog.png","width":20},"[花]":{"url":"https://i0.hdslb.com/bfs/live/f.png"}}}"#
++        var meta: [Any] = Array(repeating: 0, count: 15)
++        meta.append(["extra": extra])
++        let inline: [String: Any] = ["cmd": "DANMU_MSG", "info": [meta, "好耶[dog][dog]", [7, "观众"]]]
++        XCTAssertEqual(DanmakuParser.event(from: inline),
++                       .chat(uid: 7, user: "观众", text: "好耶[dog][dog]", medal: nil, id: "d1",
++                             emots: ["[dog]": "https://i0.hdslb.com/bfs/live/dog.png"]))
++        var stickerMeta: [Any] = Array(repeating: 0, count: 12)
++        stickerMeta.append(1)
++        stickerMeta.append(["emoticon_unique": "official_147", "url": "http://i0.hdslb.com/bfs/live/zan.png", "width": 183, "height": 60])
++        let sticker: [String: Any] = ["cmd": "DANMU_MSG:4:0:2:2:2:0", "info": [stickerMeta, "赞", [8, "观众B"]]]
++        guard case .chat(_, _, let text, _, _, _, _, let parsed)? = DanmakuParser.event(from: sticker) else { return XCTFail() }
++        XCTAssertEqual(text, "赞")
++        XCTAssertEqual(parsed?.url, "http://i0.hdslb.com/bfs/live/zan.png")
++        XCTAssertEqual([parsed?.width, parsed?.height], [183, 60])
++        XCTAssertEqual(parsed?.key, "official_147")
++    }
++
++    func testEmoticonPacksParse() {
++        let root: [String: Any] = ["code": 0, "data": ["data": [
++            ["pkg_id": 1, "pkg_name": "通用表情", "pkg_type": 1, "emoticons": [
++                ["emoji": "[dog]", "descript": "dog", "url": "https://i0.hdslb.com/a.png", "emoticon_unique": "emoji_1", "perm": 1, "width": 0, "height": 0],
++                ["emoji": "赞", "descript": "赞", "url": "https://i0.hdslb.com/b.png", "emoticon_unique": "official_147", "perm": 1, "width": 183, "height": 60]
++            ]],
++            ["pkg_id": 9, "pkg_name": "房间专属表情", "pkg_type": 2, "emoticons": [
++                ["emoji": "冲", "descript": "冲", "url": "https://i0.hdslb.com/c.png", "emoticon_unique": "room_1_2", "perm": 0,
++                 "unlock_show_text": "粉丝团3级", "width": 162, "height": 162],
++                ["emoji": "坏", "descript": "坏", "url": "", "emoticon_unique": "room_1_3"]
++            ]],
++            ["pkg_id": 5, "pkg_name": "空", "emoticons": []]
++        ]]]
++        let packs = EmoticonParser.packs(from: root)
++        XCTAssertEqual(packs.map(\.name), ["通用表情", "房间专属表情"])
++        XCTAssertEqual(packs[0].items.map(\.inline), [true, false])
++        XCTAssertEqual(packs[1].items.count, 1)
++        XCTAssertFalse(packs[1].items[0].usable)
++        XCTAssertEqual(packs[1].items[0].hint, "粉丝团3级")
++    }
++
++    func testMainSitePacksParseAndMerge() {
++        let root: [String: Any] = ["code": 0, "data": ["packages": [
++            ["id": 1, "text": "小黄脸", "type": 1, "meta": ["size": 1], "emote": [
++                ["id": 509, "text": "[笑哭]", "url": "https://i0.hdslb.com/a.png", "meta": ["alias": "笑哭"]],
++                ["id": 83964, "text": "[doge_金箍]", "url": "https://i0.hdslb.com/b.png", "flags": ["no_access": true, "unlocked": false]]
++            ]],
++            ["id": 4, "text": "颜文字", "type": 4, "emote": [["id": 1, "text": "(⌒▽⌒)", "url": "(⌒▽⌒)"]]],
++            ["id": 7, "text": "某装扮", "type": 3, "meta": ["size": 2], "emote": [
++                ["id": 70, "text": "[某装扮_好耶]", "url": "https://i0.hdslb.com/c.png"]]]
++        ]]]
++        let main = EmoticonParser.mainSitePacks(from: root)
++        XCTAssertEqual(main.map(\.name), ["小黄脸", "某装扮"])
++        XCTAssertEqual(main[0].items.map(\.usable), [true, false])
++        XCTAssertFalse(main[0].items.contains(where: \.inline))
++        XCTAssertEqual(main[0].items[0].unique, "upower_[笑哭]")
++        XCTAssertEqual(main.map(\.large), [false, true])
++        let live = [EmoticonPack(id: 1, name: "通用表情", type: 1, items: [], large: true)]
++        XCTAssertEqual(EmoticonParser.merged(live: live, mainSite: main).map(\.name), ["小黄脸", "通用表情", "某装扮"])
++    }
++
++    func testEmoticonImagesOnlyFromBilibiliHosts() {
++        XCTAssertNotNil(EmoticonImages.allowed("https://i0.hdslb.com/bfs/live/a.png"))
++        XCTAssertEqual(EmoticonImages.allowed("http://i0.hdslb.com/a.png")?.scheme, "https")
++        XCTAssertEqual(EmoticonImages.allowed("//i1.hdslb.com/a.png")?.host, "i1.hdslb.com")
++        XCTAssertNil(EmoticonImages.allowed("https://evil.example/hdslb.com.png"))
++        XCTAssertNil(EmoticonImages.allowed("https://hdslb.com.evil.example/a.png"))
++        XCTAssertNil(EmoticonImages.allowed("file:///etc/passwd"))
++    }
++
++    func testEmoticonCacheTrimsOldestFiles() throws {
++        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: folder) }
++        for i in 0..<5 {
++            let file = folder.appendingPathComponent("\(i).png")
++            try Data(count: 100).write(to: file)
++            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: Double(i) * 1000)], ofItemAtPath: file.path)
++        }
++        EmoticonImages.trim(folder, above: 450, to: 250)
++        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), ["3.png", "4.png"])
++    }
++
++    func testSmallPNGScalesDown() throws {
++        let context = CGContext(data: nil, width: 400, height: 200, bitsPerComponent: 8, bytesPerRow: 0,
++                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
++        context.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
++        context.fill(CGRect(x: 0, y: 0, width: 400, height: 200))
++        let out = NSMutableData()
++        let destination = CGImageDestinationCreateWithData(out, "public.jpeg" as CFString, 1, nil)!
++        CGImageDestinationAddImage(destination, context.makeImage()!, nil)
++        XCTAssertTrue(CGImageDestinationFinalize(destination))
++        let png = try XCTUnwrap(EmoticonImages.smallPNG(out as Data))
++        let image = CGImageSourceCreateImageAtIndex(CGImageSourceCreateWithData(png as CFData, nil)!, 0, nil)!
++        XCTAssertEqual([image.width, image.height], [160, 80])
++    }
++
+     func testTruncatedFrameIsIgnored() {
+         let frame = DanmakuPacket.encode(.message, body: Data("{}".utf8))
+         XCTAssertEqual(DanmakuPacket.decode(frame.prefix(10)), [])
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+index 5af08ba29..158cc3b54 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/SessionCoordinatorTests.swift
+@@ -73,6 +73,12 @@ private final class StubAPI: BilibiliAccountAPI, @unchecked Sendable {
+         sentDanmaku.append(text)
+         sentReplies.append(reply)
+     }
++    var sentEmoticons: [String] = []
++    func sendEmoticon(roomID: Int64, unique: String, reply: DanmakuReply?, cookieHeader: String) async throws {
++        sentEmoticons.append(unique)
++        sentReplies.append(reply)
++    }
++    func emoticons(roomID: Int64, cookieHeader: String) async throws -> [EmoticonPack] { [] }
+     func updateTitle(roomID: Int64, title: String, cookieHeader: String) async throws {
+         titles.append(title)
+         liveRoom = BilibiliRoomInfo(roomID: roomID, uid: 42, title: title, liveStatus: liveRoom.liveStatus, areaID: liveRoom.areaID)
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index eea9082e4..234e272e4 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -40,8 +40,8 @@ void livehime_core_stop_live(void);
+  * When the user confirms, {"event":"faceAuthRetry"} is emitted. */
+ void livehime_core_open_face_auth(const char *voucher);
+ /* Native face verification: shows the QR code from a "faceAuthQR" liveError
+- * ({"kind":"faceAuthQR","qr":url}), polls the status and emits
+- * {"event":"faceAuthRetry"} when verified. */
++ * ({"kind":"faceAuthQR","qr":url}) and emits {"event":"faceAuthRetry"}
++ * when the user confirms it is done (no automatic status check). */
+ void livehime_core_open_face_auth_qr(const char *url);
+ 
+ /* Opens Bilibili's live cover manager (upload, crop, history, review) for
+@@ -111,9 +111,23 @@ void livehime_core_send_danmaku(const char *text);
+ /* Sends `text` as a reply to viewer `reply_uid`'s danmaku `reply_danmaku_id`
+  * (the "dmid" of a chat event; may be empty). Replies with "danmakuSent". */
+ void livehime_core_send_danmaku_reply(const char *text, long long reply_uid, const char *reply_danmaku_id);
++/* Sends the sticker `key` (an emoticon's "key"; inline emoji are sent as
++ * text), optionally as a reply. Replies with "danmakuSent" and "sticker":true. */
++void livehime_core_send_emoticon(const char *key, long long reply_uid, const char *reply_danmaku_id);
+ void livehime_core_update_title(const char *title);
+ void livehime_core_set_tts(int enabled);
+ 
++/* Emoticons. A chat event may also carry "emots" ({code: picture URL} for
++ * inline codes like "[dog]" in its text) and "sticker" ({"url","w","h"}; its
++ * text is then the sticker's name). load emits {"event":"emoticons","ok":
++ * true,"room","packs":[{"id","name","items":[{"key","text","name","url","w",
++ * "h","inline","usable","hint"}]}]} or "ok":false with error fields.
++ * image fetches a picture (Bilibili image hosts only; kept as a small PNG in
++ * Caches/LiveHime/emoticons) and emits {"event":"emoticonImage","url",
++ * "path"} ("path" empty on failure). */
++void livehime_core_emoticons_load(void);
++void livehime_core_emoticon_image(const char *url);
++
+ /* Moderation. hours: -1 permanent, 0 current live session, otherwise hours.
+  * Replies: {"event":"userMuted","ok","uid"} and
+  * {"event":"shieldKeywords","ok","keywords":[...]}. */
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index 62addd8a2..e4584567b 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -273,3 +273,16 @@ LiveHime.Probe.Detail.notVerified="not verified"
+ LiveHime.Probe.Detail.connected="connected"
+ LiveHime.Probe.Detail.reconnecting="failed, retrying"
+ LiveHime.Probe.Detail.timeout="timed out"
++LiveHime.Probe.Check.emoticons="Room emoticons"
++LiveHime.Emoji.Button="Emoticons"
++LiveHime.Emoji.Loading="Loading emoticons…"
++LiveHime.Emoji.Failed="Couldn't load emoticons"
++LiveHime.Emoji.Retry="Retry"
++LiveHime.Emoji.Empty="No emoticons available in this room yet"
++LiveHime.Emoji.SignedOut="Sign in to use emoticons"
++LiveHime.Emoji.Pick="Hover for names; click to send (the room's own small emoji go into the message)"
++LiveHime.Emoji.Insert="%1 · click to insert"
++LiveHime.Emoji.Send="%1 · click to send"
++LiveHime.Emoji.Locked="%1 · locked: %2"
++LiveHime.Emoji.LockedPlain="%1 · not unlocked yet"
++LiveHime.Probe.Check.mainSiteEmoticons="Main-site emotes (faces, personal packs)"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 6ee1c7310..1a20640b7 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -273,3 +273,16 @@ LiveHime.Probe.Detail.notVerified="未认证"
+ LiveHime.Probe.Detail.connected="已连接"
+ LiveHime.Probe.Detail.reconnecting="连接失败，正在重试"
+ LiveHime.Probe.Detail.timeout="超时"
++LiveHime.Probe.Check.emoticons="直播间表情"
++LiveHime.Emoji.Button="表情"
++LiveHime.Emoji.Loading="正在加载表情…"
++LiveHime.Emoji.Failed="表情加载失败"
++LiveHime.Emoji.Retry="重试"
++LiveHime.Emoji.Empty="这个直播间暂时没有可用的表情"
++LiveHime.Emoji.SignedOut="登录后可以使用表情"
++LiveHime.Emoji.Pick="悬停查看名称；点击直接发送（直播间小表情插入输入框）"
++LiveHime.Emoji.Insert="%1 · 点击插入"
++LiveHime.Emoji.Send="%1 · 点击发送"
++LiveHime.Emoji.Locked="%1 · 未解锁：%2"
++LiveHime.Emoji.LockedPlain="%1 · 尚未解锁"
++LiveHime.Probe.Check.mainSiteEmoticons="主站表情（小黄脸、个性化表情）"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index e1df11e29..c1f619ba0 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -7,6 +7,8 @@
+ #include "feature-panel.hpp"
+ #include "floating-chat.hpp"
+ #include "danmaku-feed.hpp"
++#include "emoji-picker.hpp"
++#include "emoticon-store.hpp"
+ #include "update-page.hpp"
+ #include "probe-dialog.hpp"
+ #include "livehime-dock.hpp"
+@@ -185,6 +187,58 @@ void floatingChat(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
++/* Emoticons for tests, on the floating chat's feed or ("dock": true) the
++ * dock's: optional "ready" (bool; lets the feed act as signed in, while the
++ * core itself stays signed out so nothing reaches Bilibili), "inject" (an
++ * "emoticons" core event, as if loaded), "reset" (forget the list), "draft"
++ * (send box text), "scroll" (chat list position), "picker" (bool: show or hide the
++ * panel), "pack" (tab index) and "click" (row in the current pack). Replies
++ * with the panel and store state and the send box's draft. */
++void emoticons(obs_data_t *request, obs_data_t *response, void *)
++{
++	onUiThread([&] {
++		FeaturePanel *features = target->features();
++		DanmakuFeed *feed = obs_data_get_bool(request, "dock") ? features->feed() : features->floatingChat()->feed();
++		EmojiPicker *picker = feed->picker();
++		EmoticonStore *store = EmoticonStore::instance();
++		if (obs_data_has_user_value(request, "ready"))
++			feed->setReady(obs_data_get_bool(request, "ready"));
++		if (obs_data_get_bool(request, "reset"))
++			store->reset();
++		if (obs_data_has_user_value(request, "draft"))
++			feed->setDraft(QString::fromUtf8(obs_data_get_string(request, "draft")));
++		if (obs_data_has_user_value(request, "scroll"))
++			feed->setScrollValue(static_cast<int>(obs_data_get_int(request, "scroll")));
++		if (OBSDataAutoRelease inject = obs_data_get_obj(request, "inject"))
++			store->handleEvent(QJsonDocument::fromJson(QByteArray(obs_data_get_json(inject))).object());
++		if (obs_data_has_user_value(request, "picker"))
++			feed->setPickerVisible(obs_data_get_bool(request, "picker"));
++		if (obs_data_has_user_value(request, "pack"))
++			picker->setCurrentPack(static_cast<int>(obs_data_get_int(request, "pack")));
++		if (obs_data_has_user_value(request, "click"))
++			picker->activate(static_cast<int>(obs_data_get_int(request, "click")));
++		QApplication::processEvents();
++		static const char *statuses[] = {"idle", "loading", "ready", "failed"};
++		obs_data_set_string(response, "status", statuses[static_cast<int>(store->status())]);
++		obs_data_set_bool(response, "picker_visible", picker->isVisible());
++		obs_data_set_int(response, "packs", picker->packCount());
++		obs_data_set_int(response, "pack", picker->currentPack());
++		obs_data_set_int(response, "items", picker->itemCount());
++		obs_data_set_int(response, "pictures", picker->shownPictures());
++		obs_data_set_string(response, "hint", picker->hintText().toUtf8().constData());
++		obs_data_set_string(response, "draft", feed->draft().toUtf8().constData());
++		obs_data_set_int(response, "lines", feed->lineCount());
++		obs_data_set_bool(response, "list_enabled", feed->listEnabled());
++		obs_data_set_int(response, "scroll", feed->scrollValue());
++		obs_data_set_int(response, "scroll_max", feed->scrollMaximum());
++		const QRect area(picker->mapToGlobal(QPoint(0, 0)), picker->size());
++		obs_data_set_int(response, "picker_x", area.x());
++		obs_data_set_int(response, "picker_y", area.y());
++		obs_data_set_int(response, "picker_w", area.width());
++		obs_data_set_int(response, "picker_h", area.height());
++	});
++}
++
+ /* Interface check for tests: optional "room" (number), "action":"run" starts it;
+  * replies with whether it is running and the copyable report so far. */
+ void probe(obs_data_t *request, obs_data_t *response, void *)
+@@ -370,6 +424,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "Update", update, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Snapshot", snapshot, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Probe", probe, nullptr);
++	obs_websocket_vendor_register_request(vendor, "Emoticons", emoticons, nullptr);
+ }
+ 
+ void UnregisterAutomation()
+@@ -389,6 +444,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "OverlayState");
+ 		obs_websocket_vendor_unregister_request(vendor, "Update");
+ 		obs_websocket_vendor_unregister_request(vendor, "Snapshot");
++		obs_websocket_vendor_unregister_request(vendor, "Emoticons");
+ 		obs_websocket_vendor_unregister_request(vendor, "Probe");
+ 		vendor = nullptr;
+ 	}
+diff --git a/plugins/livehime/src/danmaku-feed.cpp b/plugins/livehime/src/danmaku-feed.cpp
+index b95383105..4b63b9547 100644
+--- a/plugins/livehime/src/danmaku-feed.cpp
++++ b/plugins/livehime/src/danmaku-feed.cpp
+@@ -1,5 +1,7 @@
+ #include "danmaku-feed.hpp"
+ 
++#include "emoji-picker.hpp"
++#include "emoticon-store.hpp"
+ #include "window-native.hpp"
+ 
+ #include <livehime-core.h>
+@@ -12,9 +14,12 @@
+ #include <QLineEdit>
+ #include <QListWidget>
+ #include <QMenu>
++#include <QPainter>
+ #include <QPushButton>
+ #include <QScrollBar>
+ #include <QShortcut>
++#include <QStyledItemDelegate>
++#include <QTextDocument>
+ #include <QTimer>
+ #include <QToolButton>
+ #include <QVBoxLayout>
+@@ -33,6 +38,132 @@ constexpr int kMaxFeedItems = 300;
+ constexpr int kUidRole = Qt::UserRole;
+ constexpr int kUserRole = Qt::UserRole + 1;
+ constexpr int kDanmakuIdRole = Qt::UserRole + 2;
++/* Emoticons in a chat line: code -> picture URL, and a sticker's picture URL. */
++constexpr int kEmotsRole = Qt::UserRole + 3;
++constexpr int kStickerRole = Qt::UserRole + 4;
++/* A sticker line's text before the sticker's name ("user："): drawn instead of the whole line. */
++constexpr int kStickerPrefixRole = Qt::UserRole + 5;
++/* A sticker's own height: emoji-sized ones (main-site packs, 20 px) stay small. */
++constexpr int kStickerSizeRole = Qt::UserRole + 6;
++
++constexpr int kStickerHeight = 48;
++constexpr int kPadding = 3;
++
++/* Draws chat lines that carry emoticons: inline codes as pictures in the
++ * text, a sticker as a picture in place of its name (right after "user：",
++ * or under it when the line is too narrow). A picture still being fetched
++ * shows as its code (inline) or as empty space of the final size (sticker),
++ * so only inline pictures can change a line's height when they arrive.
++ * Lines without emoticons are drawn as usual. */
++class ChatDelegate : public QStyledItemDelegate {
++public:
++	using QStyledItemDelegate::QStyledItemDelegate;
++
++	void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
++	{
++		if (!hasEmoticons(index))
++			return QStyledItemDelegate::paint(painter, option, index);
++		QStyleOptionViewItem panel = option;
++		initStyleOption(&panel, index);
++		panel.text.clear();
++		const QWidget *widget = option.widget;
++		QStyle *style = widget ? widget->style() : QApplication::style();
++		style->drawControl(QStyle::CE_ItemViewItem, &panel, painter, widget);
++
++		const QRect area = option.rect.adjusted(kPadding, kPadding, -kPadding, -kPadding);
++		QTextDocument document;
++		layout(document, option, index, area.width());
++		painter->save();
++		painter->translate(area.topLeft());
++		document.drawContents(painter);
++		painter->restore();
++
++		const QString sticker = index.data(kStickerRole).toString();
++		if (sticker.isEmpty())
++			return;
++		const QPixmap picture = EmoticonStore::instance()->pixmap(sticker);
++		if (picture.isNull())
++			return;
++		const QRect place = stickerRect(document, area.width(), picture.size(), stickerHeight(option, index));
++		painter->save();
++		painter->setRenderHint(QPainter::SmoothPixmapTransform);
++		painter->drawPixmap(place.translated(area.topLeft()), picture);
++		painter->restore();
++	}
++
++	QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
++	{
++		if (!hasEmoticons(index))
++			return QStyledItemDelegate::sizeHint(option, index);
++		const auto *view = qobject_cast<const QAbstractItemView *>(option.widget);
++		const int width = std::max(40, (view ? view->viewport()->width() : option.rect.width()) - 2 * kPadding);
++		QTextDocument document;
++		layout(document, option, index, width);
++		int height = int(document.size().height());
++		if (!index.data(kStickerRole).toString().isEmpty()) {
++			const QPixmap picture = EmoticonStore::instance()->pixmap(index.data(kStickerRole).toString());
++			const int own = stickerHeight(option, index);
++			const QSize size = picture.isNull() ? QSize(own, own) : picture.size();
++			height = std::max(height, stickerRect(document, width, size, stickerHeight(option, index)).bottom() + 1);
++		}
++		return QSize(width + 2 * kPadding, height + 2 * kPadding);
++	}
++
++private:
++	static bool hasEmoticons(const QModelIndex &index)
++	{
++		return !index.data(kStickerRole).toString().isEmpty() || !index.data(kEmotsRole).toMap().isEmpty();
++	}
++
++	/* Stickers are drawn 48 px high, emoji-sized ones at text height. */
++	static int stickerHeight(const QStyleOptionViewItem &option, const QModelIndex &index)
++	{
++		const int own = index.data(kStickerSizeRole).toInt();
++		const int line = QFontMetrics(option.font).height();
++		return own > 0 && own <= 32 ? std::max(own, line + 2) : kStickerHeight;
++	}
++
++	/* Where a sticker of `size` goes, relative to the text's top left. */
++	static QRect stickerRect(const QTextDocument &document, int width, QSize size, int height)
++	{
++		size = size.scaled(QSize(std::min(width, 4 * height), height), Qt::KeepAspectRatio);
++		const int text = int(document.idealWidth()) + 4;
++		if (document.lineCount() <= 1 && text + size.width() <= width)
++			return QRect(QPoint(text, 0), size);
++		return QRect(QPoint(0, int(document.size().height()) + 2), size);
++	}
++
++	static void layout(QTextDocument &document, const QStyleOptionViewItem &option, const QModelIndex &index, int width)
++	{
++		document.setDocumentMargin(0);
++		document.setDefaultFont(option.font);
++		QColor color = option.palette.color((option.state & QStyle::State_Selected) ? QPalette::HighlightedText
++											    : QPalette::Text);
++		const QVariant foreground = index.data(Qt::ForegroundRole);
++		if (foreground.canConvert<QBrush>() && !(option.state & QStyle::State_Selected))
++			color = foreground.value<QBrush>().color();
++		const bool sticker = !index.data(kStickerRole).toString().isEmpty();
++		QString html = (sticker ? index.data(kStickerPrefixRole) : index.data(Qt::DisplayRole)).toString().toHtmlEscaped();
++		const QVariantMap emots = index.data(kEmotsRole).toMap();
++		const int line = QFontMetrics(option.font).height();
++		int n = 0;
++		for (auto it = emots.begin(); it != emots.end(); ++it) {
++			const QPixmap picture = EmoticonStore::instance()->pixmap(it.value().toString());
++			if (picture.isNull())
++				continue;
++			const QString name = QStringLiteral("emot:%1").arg(n++);
++			document.addResource(QTextDocument::ImageResource, QUrl(name), picture);
++			const int w = picture.height() > 0 ? line * picture.width() / picture.height() : line;
++			html.replace(it.key().toHtmlEscaped(),
++				     QStringLiteral("<img src=\"%1\" width=\"%2\" height=\"%3\" style=\"vertical-align: middle\">")
++					     .arg(name)
++					     .arg(w)
++					     .arg(line));
++		}
++		document.setHtml(QStringLiteral("<span style=\"color: %1; white-space: pre-wrap\">%2</span>").arg(color.name(), html));
++		document.setTextWidth(width);
++	}
++};
+ } // namespace
+ 
+ DanmakuFeed::DanmakuFeed(bool compact, QWidget *parent) : QWidget(parent)
+@@ -59,6 +190,22 @@ DanmakuFeed::DanmakuFeed(bool compact, QWidget *parent) : QWidget(parent)
+ 	});
+ 	if (compact)
+ 		list_->setFrameShape(QFrame::NoFrame);
++	list_->setItemDelegate(new ChatDelegate(list_));
++	/* Pictures arriving for chat lines: redraw, and re-measure once for a burst. */
++	relayout_ = new QTimer(this);
++	relayout_->setSingleShot(true);
++	relayout_->setInterval(150);
++	connect(relayout_, &QTimer::timeout, this, [this] {
++		QScrollBar *bar = list_->verticalScrollBar();
++		const bool atBottom = bar->value() >= bar->maximum() - 4;
++		list_->doItemsLayout();
++		if (atBottom)
++			list_->scrollToBottom();
++	});
++	connect(EmoticonStore::instance(), &EmoticonStore::imageReady, this, [this] {
++		list_->viewport()->update();
++		relayoutSoon();
++	});
+ 
+ 	message_ = new QLineEdit(this);
+ 	message_->setPlaceholderText(text("LiveHime.Feature.MessagePlaceholder"));
+@@ -66,10 +213,33 @@ DanmakuFeed::DanmakuFeed(bool compact, QWidget *parent) : QWidget(parent)
+ 	send_ = new QPushButton(text("LiveHime.Feature.Send"), this);
+ 	connect(send_, &QPushButton::clicked, this, &DanmakuFeed::send);
+ 	connect(message_, &QLineEdit::returnPressed, this, &DanmakuFeed::send);
++	emojiButton_ = new QToolButton(this);
++	emojiButton_->setText(QStringLiteral("☺"));
++	emojiButton_->setToolTip(text("LiveHime.Emoji.Button"));
++	emojiButton_->setAccessibleName(text("LiveHime.Emoji.Button"));
++	emojiButton_->setCheckable(true);
++	emojiButton_->setAutoRaise(true);
++	emojiButton_->setFocusPolicy(Qt::NoFocus);
++	connect(emojiButton_, &QToolButton::toggled, this, &DanmakuFeed::setPickerVisible);
+ 	auto *sendRow = new QHBoxLayout;
+ 	sendRow->addWidget(message_, 1);
++	sendRow->addWidget(emojiButton_);
+ 	sendRow->addWidget(send_);
+-	new QShortcut(QKeySequence(Qt::Key_Escape), message_, this, &DanmakuFeed::clearReply, Qt::WidgetShortcut);
++	/* Esc closes the emoticon panel first, then cancels a reply. */
++	new QShortcut(QKeySequence(Qt::Key_Escape), message_, this, [this] {
++		if (picker_->isVisible())
++			setPickerVisible(false);
++		else
++			clearReply();
++	}, Qt::WidgetShortcut);
++
++	picker_ = new EmojiPicker(compact, this);
++	picker_->hide();
++	connect(picker_, &EmojiPicker::insertText, this, [this](const QString &code) {
++		message_->insert(code);
++		message_->setFocus();
++	});
++	connect(picker_, &EmojiPicker::sendSticker, this, &DanmakuFeed::sendSticker);
+ 
+ 	/* "Replying to @name ×" above the send box while a reply target is set. */
+ 	replyBar_ = new QWidget(this);
+@@ -92,6 +262,7 @@ DanmakuFeed::DanmakuFeed(bool compact, QWidget *parent) : QWidget(parent)
+ 	layout->addWidget(pinned_);
+ 	layout->addWidget(list_, 1);
+ 	layout->addWidget(replyBar_);
++	layout->addWidget(picker_);
+ 	layout->addLayout(sendRow);
+ 	setReady(false);
+ }
+@@ -108,10 +279,13 @@ void DanmakuFeed::setReady(bool ready)
+ 		list_->clear();
+ 		pinned_->hide();
+ 		clearReply();
++		setPickerVisible(false);
+ 	}
+ 	ready_ = ready;
+ 	message_->setEnabled(ready);
++	emojiButton_->setEnabled(ready);
+ 	send_->setEnabled(ready && !sending_);
++	picker_->setReady(ready);
+ }
+ 
+ void DanmakuFeed::handleEvent(const QJsonObject &event)
+@@ -123,8 +297,12 @@ void DanmakuFeed::handleEvent(const QJsonObject &event)
+ 			return;
+ 		sending_ = false;
+ 		send_->setEnabled(ready_);
++		/* A sticker goes on its own; the typed draft stays. */
++		const bool sticker = sendingSticker_;
++		sendingSticker_ = false;
+ 		if (event.value("ok").toBool()) {
+-			message_->clear();
++			if (!sticker)
++				message_->clear();
+ 			clearReply();
+ 		} else {
+ 			const QString detail = event.value("message").toString();
+@@ -155,8 +333,19 @@ void DanmakuFeed::handleEvent(const QJsonObject &event)
+ 			       (replyTo.isEmpty() ? QString() : QStringLiteral("@%1 ").arg(replyTo)) +
+ 			       event.value("text").toString(),
+ 		       QString(), event.value("uid").toVariant().toLongLong(), user);
+-		if (QListWidgetItem *item = list_->item(list_->count() - 1))
++		if (QListWidgetItem *item = list_->item(list_->count() - 1)) {
+ 			item->setData(kDanmakuIdRole, event.value("dmid").toString());
++			const QVariantMap emots = event.value("emots").toObject().toVariantMap();
++			const QString sticker = event.value("sticker").toObject().value("url").toString();
++			if (!emots.isEmpty())
++				item->setData(kEmotsRole, emots);
++			if (!sticker.isEmpty()) {
++				item->setData(kStickerRole, sticker);
++				item->setData(kStickerSizeRole, event.value("sticker").toObject().value("h").toInt());
++				const QString line = item->text();
++				item->setData(kStickerPrefixRole, line.left(line.size() - event.value("text").toString().size()));
++			}
++		}
+ 	} else if (kind == "gift") {
+ 		append(text("LiveHime.Feature.Gift").arg(user, event.value("name").toString()).arg(event.value("count").toInt()),
+ 		       QStringLiteral("#e0a040"));
+@@ -264,3 +453,63 @@ void DanmakuFeed::send()
+ 	send_->setEnabled(false);
+ 	livehime_core_send_danmaku_reply(message.constData(), replyUid_, replyDanmakuId_.toUtf8().constData());
+ }
++
++void DanmakuFeed::sendSticker(const QString &key)
++{
++	if (!ready_ || sending_ || key.isEmpty())
++		return;
++	sending_ = true;
++	sendingSticker_ = true;
++	send_->setEnabled(false);
++	livehime_core_send_emoticon(key.toUtf8().constData(), replyUid_, replyDanmakuId_.toUtf8().constData());
++}
++
++void DanmakuFeed::setPickerVisible(bool visible)
++{
++	visible = visible && ready_;
++	/* The panel takes room from the list: keep following the newest lines. */
++	QScrollBar *bar = list_->verticalScrollBar();
++	if (bar->value() >= bar->maximum() - 4)
++		QTimer::singleShot(0, list_, &QListWidget::scrollToBottom);
++	picker_->setVisible(visible);
++	const QSignalBlocker block(emojiButton_);
++	emojiButton_->setChecked(visible);
++	if (visible)
++		message_->setFocus();
++}
++
++QString DanmakuFeed::draft() const
++{
++	return message_->text();
++}
++
++void DanmakuFeed::setDraft(const QString &text)
++{
++	message_->setText(text);
++}
++
++bool DanmakuFeed::listEnabled() const
++{
++	return list_->isEnabled() && list_->verticalScrollBar()->isEnabled();
++}
++
++int DanmakuFeed::scrollValue() const
++{
++	return list_->verticalScrollBar()->value();
++}
++
++int DanmakuFeed::scrollMaximum() const
++{
++	return list_->verticalScrollBar()->maximum();
++}
++
++void DanmakuFeed::setScrollValue(int value)
++{
++	list_->verticalScrollBar()->setValue(value);
++}
++
++void DanmakuFeed::relayoutSoon()
++{
++	if (!relayout_->isActive())
++		relayout_->start();
++}
+diff --git a/plugins/livehime/src/danmaku-feed.hpp b/plugins/livehime/src/danmaku-feed.hpp
+index 1bfca0fad..b6ba6d080 100644
+--- a/plugins/livehime/src/danmaku-feed.hpp
++++ b/plugins/livehime/src/danmaku-feed.hpp
+@@ -8,12 +8,15 @@ class QLineEdit;
+ class QListWidget;
+ class QPushButton;
+ class QTimer;
++class QToolButton;
++class EmojiPicker;
+ 
+ /* The live danmaku feed with its send box: chat, gifts, Super Chats (the
+  * latest one pinned for its paid duration), guards and entries, a right-
+  * click menu to reply, copy or mute, and sending (optionally as a reply,
+- * shown as "@name"). Used by the dock's danmaku tab and by the floating chat
+- * window, both fed from the same core events. */
++ * shown as "@name"), and an emoticon panel; emoticons in chat are drawn as
++ * pictures. Used by the dock's danmaku tab and by the floating chat window,
++ * both fed from the same core events. */
+ class DanmakuFeed : public QWidget {
+ 	Q_OBJECT
+ 
+@@ -26,6 +29,16 @@ public:
+ 	 * ("danmakuSent", "userMuted"). */
+ 	void handleEvent(const QJsonObject &event);
+ 	int lineCount() const;
++	EmojiPicker *picker() const { return picker_; }
++	/* Shows or hides the emoticon panel. */
++	void setPickerVisible(bool visible);
++	QString draft() const;
++	void setDraft(const QString &text);
++	/* The chat list, for tests: whether it takes input, and its scroll position. */
++	bool listEnabled() const;
++	int scrollValue() const;
++	int scrollMaximum() const;
++	void setScrollValue(int value);
+ 
+ private:
+ 	void append(const QString &line, const QString &color = QString(), qint64 uid = 0,
+@@ -35,11 +48,14 @@ private:
+ 	void replyTo(qint64 uid, const QString &user, const QString &danmakuId);
+ 	void clearReply();
+ 	void send();
++	void sendSticker(const QString &key);
++	void relayoutSoon();
+ 
+ 	bool showEntries_ = false;
+ 	bool giftsOnly_ = false;
+ 	bool ready_ = false;
+ 	bool sending_ = false;
++	bool sendingSticker_ = false;
+ 
+ 	QLabel *pinned_;
+ 	QTimer *pinnedTimer_;
+@@ -49,5 +65,8 @@ private:
+ 	qint64 replyUid_ = 0;
+ 	QString replyDanmakuId_;
+ 	QLineEdit *message_;
++	QToolButton *emojiButton_;
+ 	QPushButton *send_;
++	EmojiPicker *picker_;
++	QTimer *relayout_;
+ };
+diff --git a/plugins/livehime/src/emoji-picker.cpp b/plugins/livehime/src/emoji-picker.cpp
+new file mode 100644
+index 000000000..c107f0300
+--- /dev/null
++++ b/plugins/livehime/src/emoji-picker.cpp
+@@ -0,0 +1,260 @@
++#include "emoji-picker.hpp"
++#include "emoticon-store.hpp"
++
++#include <obs-module.h>
++
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QListWidget>
++#include <QStyle>
++#include <QStyleOption>
++#include <QTabBar>
++#include <QToolButton>
++#include <QVBoxLayout>
++
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++
++constexpr int kKeyRole = Qt::UserRole;
++constexpr int kUrlRole = Qt::UserRole + 1;
++constexpr int kTextRole = Qt::UserRole + 2;
++constexpr int kNameRole = Qt::UserRole + 3;
++constexpr int kInlineRole = Qt::UserRole + 4;
++constexpr int kUsableRole = Qt::UserRole + 5;
++constexpr int kHintRole = Qt::UserRole + 6;
++} // namespace
++
++EmojiPicker::EmojiPicker(bool compact, QWidget *parent) : QWidget(parent), compact_(compact)
++{
++	tabs_ = new QTabBar(this);
++	tabs_->setFocusPolicy(Qt::NoFocus);
++	tabs_->setExpanding(false);
++	tabs_->setDrawBase(false);
++	tabs_->setUsesScrollButtons(true);
++	tabs_->setElideMode(Qt::ElideRight);
++	connect(tabs_, &QTabBar::currentChanged, this, &EmojiPicker::showPack);
++
++	grid_ = new QListWidget(this);
++	grid_->setFocusPolicy(Qt::NoFocus);
++	grid_->setViewMode(QListView::IconMode);
++	grid_->setMovement(QListView::Static);
++	grid_->setResizeMode(QListView::Adjust);
++	grid_->setWrapping(true);
++	grid_->setUniformItemSizes(true);
++	grid_->setSelectionMode(QAbstractItemView::NoSelection);
++	grid_->setMouseTracking(true);
++	grid_->setFrameShape(QFrame::NoFrame);
++	grid_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
++	connect(grid_, &QListWidget::itemEntered, this, &EmojiPicker::hover);
++	connect(grid_, &QListWidget::itemClicked, this, &EmojiPicker::clicked);
++
++	hint_ = new QLabel(this);
++	hint_->setStyleSheet(QStringLiteral("QLabel { color: #9aa0ab; }"));
++	hint_->setMinimumWidth(1);
++	retry_ = new QToolButton(this);
++	retry_->setText(text("LiveHime.Emoji.Retry"));
++	retry_->setFocusPolicy(Qt::NoFocus);
++	retry_->hide();
++	connect(retry_, &QToolButton::clicked, this, [] { EmoticonStore::instance()->load(true); });
++	auto *hintRow = new QHBoxLayout;
++	hintRow->setContentsMargins(4, 0, 4, 0);
++	hintRow->addWidget(hint_, 1);
++	hintRow->addWidget(retry_);
++
++	auto *layout = new QVBoxLayout(this);
++	layout->setContentsMargins(0, 0, 0, 0);
++	layout->setSpacing(2);
++	layout->addWidget(tabs_);
++	layout->addWidget(grid_, 1);
++	layout->addLayout(hintRow);
++	setFixedHeight(compact ? 150 : 180);
++
++	EmoticonStore *store = EmoticonStore::instance();
++	connect(store, &EmoticonStore::packsChanged, this, &EmojiPicker::rebuild);
++	connect(store, &EmoticonStore::imageReady, this, &EmojiPicker::pictureReady);
++	rebuild();
++}
++
++void EmojiPicker::setReady(bool ready)
++{
++	ready_ = ready;
++	if (ready && isVisible())
++		EmoticonStore::instance()->load();
++	showStatus();
++}
++
++void EmojiPicker::showEvent(QShowEvent *event)
++{
++	QWidget::showEvent(event);
++	if (ready_)
++		EmoticonStore::instance()->load();
++	/* Pictures are only fetched for a visible grid. */
++	showPack(tabs_->currentIndex());
++}
++
++void EmojiPicker::rebuild()
++{
++	const QVector<EmoticonStore::Pack> &packs = EmoticonStore::instance()->packs();
++	const QString current = tabs_->currentIndex() >= 0 ? tabs_->tabText(tabs_->currentIndex()) : QString();
++	const QSignalBlocker block(tabs_);
++	while (tabs_->count())
++		tabs_->removeTab(0);
++	int select = 0;
++	for (int i = 0; i < packs.size(); ++i) {
++		tabs_->addTab(packs[i].name);
++		if (packs[i].name == current)
++			select = i;
++	}
++	tabs_->setVisible(packs.size() > 1);
++	if (!packs.isEmpty())
++		tabs_->setCurrentIndex(select);
++	showPack(packs.isEmpty() ? -1 : select);
++}
++
++void EmojiPicker::showPack(int index)
++{
++	grid_->clear();
++	const QVector<EmoticonStore::Pack> &packs = EmoticonStore::instance()->packs();
++	if (index >= 0 && index < packs.size()) {
++		/* Small emoji in small cells; stickers and big emotes larger. */
++		const EmoticonStore::Pack &pack = packs[index];
++		const int icon = pack.large ? (compact_ ? 40 : 48) : 28;
++		grid_->setIconSize(QSize(icon, icon));
++		grid_->setGridSize(QSize(icon + 10, icon + 10));
++		for (const EmoticonStore::Item &entry : pack.items) {
++			auto *item = new QListWidgetItem(grid_);
++			item->setData(kKeyRole, entry.key);
++			item->setData(kUrlRole, entry.url);
++			item->setData(kTextRole, entry.text);
++			item->setData(kNameRole, entry.name);
++			item->setData(kInlineRole, entry.inlineEmoji);
++			item->setData(kUsableRole, entry.usable);
++			item->setData(kHintRole, entry.hint);
++			item->setSizeHint(grid_->gridSize());
++			if (isVisible())
++				setIcon(item);
++		}
++	}
++	showStatus();
++}
++
++void EmojiPicker::setIcon(QListWidgetItem *item)
++{
++	QPixmap picture = EmoticonStore::instance()->pixmap(item->data(kUrlRole).toString());
++	if (picture.isNull())
++		return;
++	if (!item->data(kUsableRole).toBool()) {
++		QStyleOption option;
++		option.initFrom(grid_);
++		picture = style()->generatedIconPixmap(QIcon::Disabled, picture, &option);
++	}
++	item->setIcon(QIcon(picture));
++}
++
++void EmojiPicker::pictureReady(const QString &url)
++{
++	if (!isVisible())
++		return;
++	for (int i = 0; i < grid_->count(); ++i) {
++		QListWidgetItem *item = grid_->item(i);
++		if (item->data(kUrlRole).toString() == url)
++			setIcon(item);
++	}
++}
++
++void EmojiPicker::hover(QListWidgetItem *item)
++{
++	if (!item)
++		return;
++	const QString name = item->data(kInlineRole).toBool() ? item->data(kTextRole).toString()
++							       : item->data(kNameRole).toString();
++	QString line;
++	if (!item->data(kUsableRole).toBool()) {
++		const QString hint = item->data(kHintRole).toString();
++		line = hint.isEmpty() ? text("LiveHime.Emoji.LockedPlain").arg(name)
++				      : text("LiveHime.Emoji.Locked").arg(name, hint);
++	} else {
++		line = text(item->data(kInlineRole).toBool() ? "LiveHime.Emoji.Insert" : "LiveHime.Emoji.Send").arg(name);
++	}
++	hint_->setText(line);
++}
++
++void EmojiPicker::clicked(QListWidgetItem *item)
++{
++	if (!item || !ready_)
++		return;
++	hover(item);
++	if (!item->data(kUsableRole).toBool())
++		return;
++	if (item->data(kInlineRole).toBool())
++		emit insertText(item->data(kTextRole).toString());
++	else
++		emit sendSticker(item->data(kKeyRole).toString());
++}
++
++void EmojiPicker::showStatus()
++{
++	EmoticonStore *store = EmoticonStore::instance();
++	retry_->setVisible(ready_ && store->status() == EmoticonStore::Status::Failed);
++	if (!ready_) {
++		hint_->setText(text("LiveHime.Emoji.SignedOut"));
++		return;
++	}
++	switch (store->status()) {
++	case EmoticonStore::Status::Loading:
++		hint_->setText(text("LiveHime.Emoji.Loading"));
++		break;
++	case EmoticonStore::Status::Failed:
++		hint_->setText(text("LiveHime.Emoji.Failed") +
++			       (store->error().isEmpty() ? QString() : QStringLiteral("：") + store->error()));
++		break;
++	case EmoticonStore::Status::Ready:
++		hint_->setText(store->packs().isEmpty() ? text("LiveHime.Emoji.Empty") : text("LiveHime.Emoji.Pick"));
++		break;
++	case EmoticonStore::Status::Idle:
++		hint_->clear();
++		break;
++	}
++}
++
++int EmojiPicker::packCount() const
++{
++	return tabs_->count();
++}
++
++int EmojiPicker::currentPack() const
++{
++	return tabs_->currentIndex();
++}
++
++void EmojiPicker::setCurrentPack(int index)
++{
++	tabs_->setCurrentIndex(index);
++}
++
++int EmojiPicker::itemCount() const
++{
++	return grid_->count();
++}
++
++int EmojiPicker::shownPictures() const
++{
++	int shown = 0;
++	for (int i = 0; i < grid_->count(); ++i)
++		shown += grid_->item(i)->icon().isNull() ? 0 : 1;
++	return shown;
++}
++
++QString EmojiPicker::hintText() const
++{
++	return hint_->text();
++}
++
++void EmojiPicker::activate(int row)
++{
++	clicked(grid_->item(row));
++}
+diff --git a/plugins/livehime/src/emoji-picker.hpp b/plugins/livehime/src/emoji-picker.hpp
+new file mode 100644
+index 000000000..57d758c34
+--- /dev/null
++++ b/plugins/livehime/src/emoji-picker.hpp
+@@ -0,0 +1,55 @@
++#pragma once
++
++#include <QWidget>
++
++class QLabel;
++class QListWidget;
++class QListWidgetItem;
++class QTabBar;
++class QToolButton;
++
++/* The emoticon panel under a chat feed: one tab per pack, a grid of
++ * emoticons, and a line that names the one under the pointer (tooltips
++ * would be separate windows, which cannot show over another app's full-
++ * screen Space). It lives inside the chat window rather than in a pop-up
++ * for the same reason. Nothing in it takes keyboard focus, so typing in the
++ * send box goes on. Inline emoji are inserted as text; stickers are sent. */
++class EmojiPicker : public QWidget {
++	Q_OBJECT
++
++public:
++	explicit EmojiPicker(bool compact, QWidget *parent = nullptr);
++
++	void setReady(bool ready);
++	int packCount() const;
++	int currentPack() const;
++	void setCurrentPack(int index);
++	int itemCount() const;
++	int shownPictures() const;
++	QString hintText() const;
++	/* Acts as if the `row`th emoticon of the current pack were clicked. */
++	void activate(int row);
++
++signals:
++	void insertText(const QString &text);
++	void sendSticker(const QString &key);
++
++protected:
++	void showEvent(QShowEvent *event) override;
++
++private:
++	void rebuild();
++	void showPack(int index);
++	void setIcon(QListWidgetItem *item);
++	void pictureReady(const QString &url);
++	void hover(QListWidgetItem *item);
++	void clicked(QListWidgetItem *item);
++	void showStatus();
++
++	bool compact_;
++	bool ready_ = false;
++	QTabBar *tabs_;
++	QListWidget *grid_;
++	QLabel *hint_;
++	QToolButton *retry_;
++};
+diff --git a/plugins/livehime/src/emoticon-store.cpp b/plugins/livehime/src/emoticon-store.cpp
+new file mode 100644
+index 000000000..7ca2501d9
+--- /dev/null
++++ b/plugins/livehime/src/emoticon-store.cpp
+@@ -0,0 +1,88 @@
++#include "emoticon-store.hpp"
++
++#include <livehime-core.h>
++
++#include <QJsonArray>
++
++EmoticonStore *EmoticonStore::instance()
++{
++	static EmoticonStore *store = new EmoticonStore;
++	return store;
++}
++
++void EmoticonStore::load(bool retry)
++{
++	if (status_ == Status::Loading || status_ == Status::Ready || (status_ == Status::Failed && !retry))
++		return;
++	status_ = Status::Loading;
++	error_.clear();
++	emit packsChanged();
++	livehime_core_emoticons_load();
++}
++
++void EmoticonStore::reset()
++{
++	if (status_ == Status::Idle && packs_.isEmpty())
++		return;
++	status_ = Status::Idle;
++	error_.clear();
++	packs_.clear();
++	emit packsChanged();
++}
++
++QPixmap EmoticonStore::pixmap(const QString &url)
++{
++	if (url.isEmpty())
++		return {};
++	if (const QPixmap *cached = images_.object(url))
++		return *cached;
++	if (!pending_.contains(url) && !missing_.contains(url)) {
++		pending_.insert(url);
++		livehime_core_emoticon_image(url.toUtf8().constData());
++	}
++	return {};
++}
++
++void EmoticonStore::handleEvent(const QJsonObject &event)
++{
++	const QString name = event.value("event").toString();
++	if (name == "emoticonImage") {
++		const QString url = event.value("url").toString();
++		pending_.remove(url);
++		QPixmap picture(event.value("path").toString());
++		if (picture.isNull()) {
++			missing_.insert(url);
++			return;
++		}
++		const qint64 cost = qint64(picture.width()) * picture.height() * 4 / 1024 + 1;
++		images_.insert(url, new QPixmap(picture), cost);
++		emit imageReady(url);
++		return;
++	}
++	if (name != "emoticons")
++		return;
++	packs_.clear();
++	if (!event.value("ok").toBool()) {
++		status_ = Status::Failed;
++		error_ = event.value("message").toString();
++		emit packsChanged();
++		return;
++	}
++	for (const QJsonValue packValue : event.value("packs").toArray()) {
++		const QJsonObject pack = packValue.toObject();
++		Pack entry;
++		entry.name = pack.value("name").toString();
++		entry.large = pack.value("large").toBool();
++		for (const QJsonValue itemValue : pack.value("items").toArray()) {
++			const QJsonObject item = itemValue.toObject();
++			entry.items.append({item.value("key").toString(), item.value("text").toString(),
++					    item.value("name").toString(), item.value("url").toString(),
++					    item.value("hint").toString(), item.value("inline").toBool(),
++					    item.value("usable").toBool(true)});
++		}
++		if (!entry.items.isEmpty())
++			packs_.append(entry);
++	}
++	status_ = Status::Ready;
++	emit packsChanged();
++}
+diff --git a/plugins/livehime/src/emoticon-store.hpp b/plugins/livehime/src/emoticon-store.hpp
+new file mode 100644
+index 000000000..c55447089
+--- /dev/null
++++ b/plugins/livehime/src/emoticon-store.hpp
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include <QCache>
++#include <QJsonObject>
++#include <QObject>
++#include <QPixmap>
++#include <QSet>
++#include <QVector>
++
++/* The room's emoticon packs and the pictures of emoticons on screen, shared
++ * by every chat feed and picker. The list is loaded the first time a picker
++ * opens; pictures are fetched when first needed (the core keeps them small
++ * on disk) and at most 16 MB of them stay in memory. */
++class EmoticonStore : public QObject {
++	Q_OBJECT
++
++public:
++	struct Item {
++		QString key; /* what a sticker is sent as */
++		QString text; /* "[dog]" for inline emoji */
++		QString name;
++		QString url;
++		QString hint; /* how to unlock it */
++		bool inlineEmoji = false;
++		bool usable = true;
++	};
++	struct Pack {
++		QString name;
++		bool large = false;
++		QVector<Item> items;
++	};
++	enum class Status { Idle, Loading, Ready, Failed };
++
++	static EmoticonStore *instance();
++
++	/* Loads the list unless it is loaded or loading (`retry`: also after a failure). */
++	void load(bool retry = false);
++	/* Forgets the list (signed out or another room). */
++	void reset();
++	Status status() const { return status_; }
++	QString error() const { return error_; }
++	const QVector<Pack> &packs() const { return packs_; }
++
++	/* The picture for `url`, or a null pixmap while it is fetched (imageReady
++	 * follows) or when it cannot be had. */
++	QPixmap pixmap(const QString &url);
++
++	/* Core events "emoticons" and "emoticonImage". */
++	void handleEvent(const QJsonObject &event);
++
++signals:
++	void packsChanged();
++	void imageReady(const QString &url);
++
++private:
++	EmoticonStore() = default;
++
++	Status status_ = Status::Idle;
++	QString error_;
++	QVector<Pack> packs_;
++	QCache<QString, QPixmap> images_{16 * 1024}; /* cost in KB */
++	QSet<QString> pending_;
++	QSet<QString> missing_;
++};
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 46748db74..b60dffd57 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -1,4 +1,5 @@
+ #include "feature-panel.hpp"
++#include "emoticon-store.hpp"
+ #include "update-page.hpp"
+ #include "captions-page.hpp"
+ #include "danmaku-feed.hpp"
+@@ -233,8 +234,11 @@ void FeaturePanel::applyState(const QJsonObject &state)
+ 			keywordsLoaded_ = false;
+ 		}
+ 	}
+-	danmakuPage_->setEnabled(ready);
++	/* The danmaku page stays enabled: a disabled parent would also stop the
++	 * chat list from scrolling. The feed disables its own send box. */
+ 	roomPage_->setEnabled(ready);
++	if (!ready)
++		EmoticonStore::instance()->reset();
+ 	feed_->setReady(ready);
+ 	floating_->feed()->setReady(ready);
+ 	if (ready && !keywordsLoaded_) {
+@@ -260,6 +264,10 @@ void FeaturePanel::applyEvent(const QJsonObject &event)
+ 		updates_->handleProbeEvent(event);
+ 		return;
+ 	}
++	if (name == "emoticons" || name == "emoticonImage") {
++		EmoticonStore::instance()->handleEvent(event);
++		return;
++	}
+ 	feed_->handleEvent(event);
+ 	floating_->feed()->handleEvent(event);
+ 	if (name == "room") {
+diff --git a/plugins/livehime/src/feature-panel.hpp b/plugins/livehime/src/feature-panel.hpp
+index 21108ad34..47f15c7a9 100644
+--- a/plugins/livehime/src/feature-panel.hpp
++++ b/plugins/livehime/src/feature-panel.hpp
+@@ -26,6 +26,7 @@ public:
+ 	explicit FeaturePanel(QWidget *parent = nullptr);
+ 
+ 	FloatingChat *floatingChat() { return floating_; }
++	DanmakuFeed *feed() { return feed_; }
+ 	CaptionsPage *captions() { return captions_; }
+ 	UpdatePage *updates() { return updates_; }
+ 	QTabWidget *tabs() { return tabs_; }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,7 +1,7 @@
 From 390b01c29541aa3d8286fccb244fd53449e245a7 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 03:09:37 +0800
-Subject: [PATCH 22/49] Use a separate bundle identifier for development builds
+Subject: [PATCH 22/51] Use a separate bundle identifier for development builds
 
 Permission grants relaunch the app by bundle identifier, which picked the
 installed v0.1.2 that shares local.livehime.macos. Development builds now

@@ -1,0 +1,16 @@
+name: 功能建议 / Feature request
+description: 希望 LiveHime 能做的事 / Something LiveHime could do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: 想要什么 / What you would like
+      description: 在什么场景下用、现在怎么凑合 / When you would use it and how you manage now
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        LiveHime 的目标是轻量、稳定，不会什么都加；已有计划见 [计划书](https://github.com/greyoak111/livehime-macos/blob/main/docs/ROADMAP.md)。
+        LiveHime aims to stay light and stable, so not everything will be added; see the roadmap.

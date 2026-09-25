@@ -1,7 +1,7 @@
 From b26cd4b413c74d77443230a6462d8c24a08a3ffc Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 16:33:16 +0800
-Subject: [PATCH 33/49] Captions: show a muted source, keep status, one start
+Subject: [PATCH 33/51] Captions: show a muted source, keep status, one start
  at launch
 
 - The Captions tab says when the audio source is muted (silence is sent
