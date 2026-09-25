@@ -1,7 +1,7 @@
 From 1c991c049cd1e197af31ab2c817c1ded71d855f8 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 23:14:21 +0800
-Subject: [PATCH 06/51] Add Bilibili QR login and session core to LiveHime
+Subject: [PATCH 06/53] Add Bilibili QR login and session core to LiveHime
  plugin
 
 plugins/livehime/core is a Swift package (unit-tested with `swift test`)

@@ -1,7 +1,7 @@
 From 83baab0d086cf1e3d9fdd8ce73262c99ce9f218d Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 00:07:25 +0800
-Subject: [PATCH 11/51] Make the LiveHime dock a resizable top/bottom split
+Subject: [PATCH 11/53] Make the LiveHime dock a resizable top/bottom split
 
 The account and go-live section sits above a draggable splitter and only
 takes the height of its visible page (the stacked widget no longer

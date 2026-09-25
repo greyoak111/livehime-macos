@@ -1,4 +1,4 @@
-# OBS component used by LiveHime macOS v0.2.9
+# OBS component used by LiveHime macOS v0.2.10
 
 Since v0.2.0 the app itself is a modified OBS Studio build (not a nested
 OBS.app as in v0.1.x).
@@ -10,12 +10,12 @@ OBS.app as in v0.1.x).
 - License: GNU GPL v2 or any later version (see `COPYING`)
 - Build: `BUNDLE_ID=local.livehime.macos build-aux/livehime/build-macos.sh`
   (Xcode generator, RelWithDebInfo, arm64, `ENABLE_BROWSER=OFF`,
-  `OBS_VERSION_OVERRIDE=32.2.2`, `LIVEHIME_APP_VERSION=0.2.9`,
+  `OBS_VERSION_OVERRIDE=32.2.2`, `LIVEHIME_APP_VERSION=0.2.10`,
   `OBS_USER_CONFIG_SUBDIR=LiveHime`); the Intel app adds `ARCH=x86_64`
   (cross-built on Apple silicon from the universal obs-deps)
-- Bundled files: [`DEPENDENCY-INVENTORY-v0.2.9.txt`](DEPENDENCY-INVENTORY-v0.2.9.txt) (arm64),
-  [`DEPENDENCY-INVENTORY-v0.2.9-x86_64.txt`](DEPENDENCY-INVENTORY-v0.2.9-x86_64.txt) (Intel)
-- Both apps were built from the series through patch 0051.
+- Bundled files: [`DEPENDENCY-INVENTORY-v0.2.10.txt`](DEPENDENCY-INVENTORY-v0.2.10.txt) (arm64),
+  [`DEPENDENCY-INVENTORY-v0.2.10-x86_64.txt`](DEPENDENCY-INVENTORY-v0.2.10-x86_64.txt) (Intel)
+- Both apps were built from the series through patch 0053.
 
 Rebuild steps are in [`obs-fork/README.md`](../../obs-fork/README.md). The
 repository does not contain generated app bundles, prebuilt dependency

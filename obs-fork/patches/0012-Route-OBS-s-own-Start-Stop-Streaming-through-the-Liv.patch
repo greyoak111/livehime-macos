@@ -1,7 +1,7 @@
 From fb1686e2a753c164da9c432a0d3c52f6defe70a9 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 00:18:28 +0800
-Subject: [PATCH 12/51] Route OBS's own Start/Stop Streaming through the
+Subject: [PATCH 12/53] Route OBS's own Start/Stop Streaming through the
  LiveHime session
 
 Add obs_frontend_set_start_streaming_override(): a plugin may take over

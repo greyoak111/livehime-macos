@@ -1,7 +1,7 @@
 From 08053d3ed258b6c6394672a6b6bce13e502dacb4 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 16:50:26 +0800
-Subject: [PATCH 34/51] Draw captions ourselves: box size, alignment, outline,
+Subject: [PATCH 34/53] Draw captions ourselves: box size, alignment, outline,
  plate
 
 The captions source wrapped OBS's FreeType text source, which only lays

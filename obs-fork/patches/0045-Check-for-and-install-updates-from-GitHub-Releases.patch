@@ -1,7 +1,7 @@
 From f285b76e7d455d7ecfde67a58c3d59f166f99720 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 12:33:04 +0800
-Subject: [PATCH 45/51] Check for and install updates from GitHub Releases
+Subject: [PATCH 45/53] Check for and install updates from GitHub Releases
 
 A new Updates tab: automatic mode (default) checks shortly after launch
 and every six hours, downloads a newer release in the background and

@@ -1,7 +1,7 @@
 From 181c60c2d8c668ee423d1435e5fe40f3ba7573b0 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 22:08:46 +0800
-Subject: [PATCH 50/51] Emoticons in the danmaku chat; chat list scrolls when
+Subject: [PATCH 50/53] Emoticons in the danmaku chat; chat list scrolls when
  signed out; face verification status over POST
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

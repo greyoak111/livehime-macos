@@ -1,7 +1,7 @@
 From 678d52d890bc9e4bd17f00cf87f413f7ed0bf606 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 17:01:43 +0800
-Subject: [PATCH 35/51] Let OBS's transform controls size the caption box
+Subject: [PATCH 35/53] Let OBS's transform controls size the caption box
 
 Scene items showing a captions source now use a bounding box (max size
 only), and the source takes that box as its width and height, so

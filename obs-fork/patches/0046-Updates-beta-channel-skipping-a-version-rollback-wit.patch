@@ -1,7 +1,7 @@
 From 556dfe36d52ee06b15588b3bce39a6ceae481f33 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 12:52:10 +0800
-Subject: [PATCH 46/51] Updates: beta channel, skipping a version, rollback
+Subject: [PATCH 46/53] Updates: beta channel, skipping a version, rollback
  with settings backups
 
 - Beta: an opt-in option also offers pre-releases (the release list instead

@@ -1,7 +1,7 @@
 From f74d5331f479290d2a5d6e9fb152b7c67fe0ad18 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 12:14:57 +0800
-Subject: [PATCH 44/51] Save live captions as SRT with each recording and
+Subject: [PATCH 44/53] Save live captions as SRT with each recording and
  stream
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

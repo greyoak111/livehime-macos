@@ -1,7 +1,7 @@
 From 19b3f286c614d599774f0583f414cf276cca1926 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 18:24:02 +0800
-Subject: [PATCH 40/51] Add a scripted demo recording of the canvas overlays
+Subject: [PATCH 40/53] Add a scripted demo recording of the canvas overlays
 
 record.sh renders the demo images and a TTS narration, prepares a
 1920x1080 60 fps MP4 profile, launches a test instance and runs

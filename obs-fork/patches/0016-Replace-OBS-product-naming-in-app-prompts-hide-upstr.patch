@@ -1,7 +1,7 @@
 From 7a5891e6561e720e735103deb35c17e4b2d9fbfe Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 00:38:05 +0800
-Subject: [PATCH 16/51] Replace OBS product naming in app prompts; hide
+Subject: [PATCH 16/53] Replace OBS product naming in app prompts; hide
  upstream-only menu items
 
 Load optional locale/overrides/<lang>.ini files after the regular locale

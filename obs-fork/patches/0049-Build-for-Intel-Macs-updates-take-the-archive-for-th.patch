@@ -1,7 +1,7 @@
 From e1f2c2ed3290e8d0aec65b96dc45efa792cd5f69 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 16:54:04 +0800
-Subject: [PATCH 49/51] Build for Intel Macs; updates take the archive for
+Subject: [PATCH 49/53] Build for Intel Macs; updates take the archive for
  their architecture
 
 build-macos.sh takes ARCH=x86_64 to cross-build an Intel app on Apple

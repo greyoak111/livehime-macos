@@ -7,7 +7,7 @@ upstream OBS Studio, so the released app can be rebuilt from public sources
 
 - Upstream: https://github.com/obsproject/obs-studio
 - Base: tag `32.2.2`, commit `ba2f32bdf791005443988a4955e963663e16b1ed`
-- Patches: `patches/0001-…` to `patches/0051-…` (`git format-patch --binary`)
+- Patches: `patches/0001-…` to `patches/0053-…` (`git format-patch --binary`)
 
 The plugin lives in `plugins/livehime` after applying: a Qt C++ dock and a
 Swift core (`plugins/livehime/core`, SwiftPM, `swift test`). The series also
