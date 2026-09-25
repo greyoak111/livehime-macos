@@ -1,0 +1,271 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "LiveHime macOS 架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "go-live",
+        "label": "开播路径",
+        "focus": [
+          "streamer",
+          "dock",
+          "core",
+          "biliapi",
+          "obs",
+          "rtmp"
+        ],
+        "note": "面板让核心开播，拿到推流地址后交给 OBS，OBS 推流到 B 站。"
+      },
+      {
+        "id": "danmaku",
+        "label": "弹幕与表情",
+        "focus": [
+          "danmaku",
+          "core",
+          "dock"
+        ],
+        "note": "弹幕从 WebSocket 进核心，以 JSON 事件送到面板和悬浮聊天。"
+      },
+      {
+        "id": "local",
+        "label": "本机",
+        "focus": [
+          "keychain",
+          "dock",
+          "core",
+          "overlays",
+          "obs"
+        ],
+        "note": "登录凭据只存在钥匙串；弹幕和字幕作为 OBS 画面来源。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "keychain",
+      "type": "security",
+      "label": "钥匙串",
+      "sublabel": "登录凭据",
+      "pos": [
+        250,
+        100
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "danmaku",
+      "type": "messagebus",
+      "label": "弹幕 WebSocket",
+      "sublabel": "弹幕 · 礼物 · 表情",
+      "pos": [
+        730,
+        100
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "streamer",
+      "type": "external",
+      "label": "主播",
+      "sublabel": "Mac",
+      "pos": [
+        40,
+        250
+      ],
+      "size": [
+        130,
+        64
+      ]
+    },
+    {
+      "id": "dock",
+      "type": "frontend",
+      "label": "直播姬面板",
+      "sublabel": "Qt 插件 · 悬浮聊天",
+      "pos": [
+        250,
+        250
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "Swift 核心",
+      "sublabel": "登录 · 开播 · 字幕",
+      "pos": [
+        480,
+        250
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "biliapi",
+      "type": "external",
+      "label": "B 站接口",
+      "sublabel": "HTTPS · WBI 签名",
+      "pos": [
+        730,
+        250
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "overlays",
+      "type": "frontend",
+      "label": "画面来源",
+      "sublabel": "直播姬弹幕 / 字幕",
+      "pos": [
+        250,
+        400
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "obs",
+      "type": "frontend",
+      "label": "OBS Studio 分支",
+      "sublabel": "32.2.2 · 场景与编码",
+      "pos": [
+        480,
+        400
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "rtmp",
+      "type": "external",
+      "label": "B 站推流服务器",
+      "sublabel": "RTMP",
+      "pos": [
+        730,
+        400
+      ],
+      "size": [
+        160,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "本机 · LiveHime.app",
+      "wraps": [
+        "keychain",
+        "dock",
+        "core",
+        "overlays",
+        "obs"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "operate",
+      "from": "streamer",
+      "to": "dock",
+      "label": "操作",
+      "variant": "emphasis"
+    },
+    {
+      "id": "bridge",
+      "from": "dock",
+      "to": "core",
+      "label": "C API",
+      "variant": "emphasis"
+    },
+    {
+      "id": "api",
+      "from": "core",
+      "to": "biliapi",
+      "label": "开播 · 发弹幕",
+      "variant": "emphasis"
+    },
+    {
+      "id": "credentials",
+      "from": "core",
+      "to": "keychain",
+      "label": "读写凭据",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "right"
+    },
+    {
+      "id": "live-chat",
+      "from": "danmaku",
+      "to": "core",
+      "label": "实时推送",
+      "fromSide": "left",
+      "toSide": "top"
+    },
+    {
+      "id": "stream-setup",
+      "from": "dock",
+      "to": "obs",
+      "label": "推流地址"
+    },
+    {
+      "id": "sources",
+      "from": "overlays",
+      "to": "obs"
+    },
+    {
+      "id": "push",
+      "from": "obs",
+      "to": "rtmp",
+      "label": "RTMP 推流",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "本机",
+      "items": [
+        "OBS 分支 + 树内插件，场景和编码沿用 OBS",
+        "Swift 核心：登录、弹幕、表情、字幕、更新器"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "B 站",
+      "items": [
+        "HTTPS 接口、弹幕 WebSocket、RTMP 推流",
+        "接口巡检（只读）定位接口变化"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "信任",
+      "items": [
+        "凭据只在钥匙串",
+        "更新包核对校验值和签名证书"
+      ]
+    }
+  ]
+}

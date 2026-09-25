@@ -43,6 +43,16 @@ OBS Studio：OBS 怎么用它就怎么用，登录、开播、弹幕和直播间
 
 接下来要做的（双路字幕、浏览器来源等）见 [计划书](docs/ROADMAP.md)。
 
+## 架构 / Architecture
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/livehime-architecture-dark.png">
+  <img alt="LiveHime macOS 架构：主播操作直播姬面板，面板经 C API 调用 Swift 核心；核心读写钥匙串、调用 B 站接口、接收弹幕 WebSocket；面板把推流地址交给 OBS，OBS 连同画面来源推流到 B 站 RTMP 服务器" src="docs/diagrams/livehime-architecture-light.png">
+</picture>
+
+可交互版本（引导视图、深浅色、导出）：下载 [`docs/diagrams/livehime-architecture.html`](docs/diagrams/livehime-architecture.html) 用浏览器打开；
+图的源文件是同目录的 `livehime-architecture.json`。图由 [Archify](https://github.com/tt-a1i/archify) 生成。
+
 ## 常见问题 / FAQ
 
 - **怎么更新：** v0.2.8 起应用会自己检查更新（“直播姬”面板 → 更新）。从 v0.2.7 或更早的版本升级，需要手动下载一次 DMG。
@@ -58,6 +68,20 @@ OBS Studio：OBS 怎么用它就怎么用，登录、开播、弹幕和直播间
 在打过补丁的源码里进入 `plugins/livehime/core` 运行 `swift test`。
 
 `macos-livehime-adapter/` 是 v0.1.x 的旧实现（原生外壳 + 内置 OBS），仅作参考保留。
+
+## 特别鸣谢 / Special thanks
+
+- **[Archify](https://github.com/tt-a1i/archify)**（tt-a1i，MIT）：上面的架构图用它生成，经过它的布局校验和视觉检查。
+  The architecture diagram above was made with Archify and passed its layout and visual checks.
+- **[OBS Studio](https://github.com/obsproject/obs-studio)**（OBS Project，GPL-2.0-or-later）：LiveHime 就建立在 OBS 之上。
+  LiveHime is built on OBS Studio.
+- **Claude**（Anthropic，通过 Claude Code）：参与了 v0.2 起的开发——OBS 分支与直播姬插件、Swift 核心、语音字幕、应用内更新、
+  表情、端到端测试和发布流程。
+  Co-developed v0.2 onward: the OBS fork and plugin, the Swift core, captions, in-app updates, emoticons, the
+  end-to-end tests and the release process.
+- **Codex**（OpenAI）：完成了早期的接口逆向、登录和 v0.1；**dsh desktop** 为它提供外部状态机和背靠背审计。
+  Did the early interface reverse-engineering, login and v0.1, with dsh desktop providing an external state
+  machine and back-to-back audits.
 
 ## 许可证 / License
 
