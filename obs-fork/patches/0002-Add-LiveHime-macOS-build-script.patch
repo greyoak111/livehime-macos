@@ -1,7 +1,7 @@
 From 8139c54142a8b06467dc53b182faededc378f95f Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 22:28:58 +0800
-Subject: [PATCH 02/48] Add LiveHime macOS build script
+Subject: [PATCH 02/49] Add LiveHime macOS build script
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

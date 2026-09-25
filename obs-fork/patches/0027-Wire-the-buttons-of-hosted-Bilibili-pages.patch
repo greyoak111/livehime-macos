@@ -1,7 +1,7 @@
 From 8d07bd1d022d6e8a5d843f98795da61cdf19ed67 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 05:19:17 +0800
-Subject: [PATCH 27/48] Wire the buttons of hosted Bilibili pages
+Subject: [PATCH 27/49] Wire the buttons of hosted Bilibili pages
 
 The cover manager, outside the Windows client, reports Cancel and
 Confirm to the page that embeds it; opened on its own it had no parent,

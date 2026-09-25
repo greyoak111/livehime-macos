@@ -1,7 +1,7 @@
 From 4beb69c8a67d8efbd5fa183bf60fd43f2590c682 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 22:43:23 +0800
-Subject: [PATCH 03/48] Rebuild LiveHime app icon as vector artwork
+Subject: [PATCH 03/49] Rebuild LiveHime app icon as vector artwork
 
 The previous raster was cropped off-center from the concept board. Trace
 the approved middle concept into fitted vector geometry, center it on the

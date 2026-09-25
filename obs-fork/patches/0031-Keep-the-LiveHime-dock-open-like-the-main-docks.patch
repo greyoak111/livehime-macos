@@ -1,7 +1,7 @@
 From 8b64c41b9edfdd6b3303661dff999d6becee91bc Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 16:08:32 +0800
-Subject: [PATCH 31/48] Keep the LiveHime dock open like the main docks
+Subject: [PATCH 31/49] Keep the LiveHime dock open like the main docks
 
 Scenes, Sources and the other main docks cannot be closed; the LiveHime
 control dock is part of that layout, so drop its close button too while

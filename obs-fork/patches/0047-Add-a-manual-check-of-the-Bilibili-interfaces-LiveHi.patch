@@ -1,7 +1,7 @@
 From 8ff8c211034954b759e50488bfab7125123df202 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 12:58:03 +0800
-Subject: [PATCH 47/48] Add a manual check of the Bilibili interfaces LiveHime
+Subject: [PATCH 47/49] Add a manual check of the Bilibili interfaces LiveHime
  uses
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

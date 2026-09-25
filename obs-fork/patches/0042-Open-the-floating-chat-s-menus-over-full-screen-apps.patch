@@ -1,7 +1,7 @@
 From 35a488ba889d4e77017a578063907986625a31b4 Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 23:29:06 +0800
-Subject: [PATCH 42/48] Open the floating chat's menus over full-screen apps
+Subject: [PATCH 42/49] Open the floating chat's menus over full-screen apps
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

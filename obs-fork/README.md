@@ -7,7 +7,7 @@ upstream OBS Studio, so the released app can be rebuilt from public sources
 
 - Upstream: https://github.com/obsproject/obs-studio
 - Base: tag `32.2.2`, commit `ba2f32bdf791005443988a4955e963663e16b1ed`
-- Patches: `patches/0001-…` to `patches/0048-…` (`git format-patch --binary`)
+- Patches: `patches/0001-…` to `patches/0049-…` (`git format-patch --binary`)
 
 The plugin lives in `plugins/livehime` after applying: a Qt C++ dock and a
 Swift core (`plugins/livehime/core`, SwiftPM, `swift test`). The series also
@@ -17,7 +17,7 @@ keep or hide individual LiveHime windows (floating chat).
 
 ## Rebuild
 
-Apple Silicon, Xcode, CMake 3.28+:
+Apple silicon Mac, Xcode, CMake 3.28+ (Intel apps are cross-built there too):
 
 ```sh
 git clone https://github.com/obsproject/obs-studio.git obs-livehime
@@ -30,6 +30,8 @@ git am /path/to/livehime-macos/obs-fork/patches/*.patch
 ./build-aux/livehime/build-macos.sh
 # Release build (same identity as the published app):
 BUNDLE_ID=local.livehime.macos ./build-aux/livehime/build-macos.sh
+# Intel release build (into build_macos_x86_64):
+ARCH=x86_64 BUNDLE_ID=local.livehime.macos ./build-aux/livehime/build-macos.sh
 ```
 
 The app is written to `build_macos/frontend/RelWithDebInfo/LiveHime.app`;

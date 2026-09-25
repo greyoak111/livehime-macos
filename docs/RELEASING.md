@@ -12,8 +12,13 @@
   Bundle ID 相同（`local.livehime.macos`）、版本号和 Release 一致、签名有效且由同一张证书签名。
   The app installs an update only when the zip matches GitHub's SHA-256 digest and the app inside has
   the same bundle id, the release's version and a valid signature by the same certificate.
-- 发布的附件名必须是 `LiveHimeMacApp-v<版本>-arm64.zip`（更新器认这个名字），DMG 给手动下载用。
-  The update archive must be named `LiveHimeMacApp-v<version>-arm64.zip`; the DMG is for manual downloads.
+- 每个版本要同时发 Apple 芯片和 Intel 两份，附件名必须是 `LiveHimeMacApp-v<版本>-arm64.zip` 和
+  `LiveHimeMacApp-v<版本>-x86_64.zip`（更新器按自己的架构找对应的包），DMG 给手动下载用。Intel 版在
+  Apple 芯片的 Mac 上交叉编译：`ARCH=x86_64 BUNDLE_ID=local.livehime.macos build-aux/livehime/build-macos.sh`，
+  并在 Rosetta 下启动检查。
+  Every release ships both `LiveHimeMacApp-v<version>-arm64.zip` and `-x86_64.zip` (each build's updater
+  looks for its own architecture), plus DMGs for manual downloads. Intel apps are cross-built with
+  `ARCH=x86_64` and checked under Rosetta.
 
 ## 什么时候发、走哪个通道 / What goes where
 
@@ -39,8 +44,8 @@
    悬浮聊天、全屏置顶和更新（`e2e-update.mjs`）。/ The end-to-end tests pass, including streaming,
    captions, SRT, floating chat, full screen and updates.
 3. 维护者用真实账号开播一次：登录、开播、弹幕、下播。/ One real stream by the maintainer.
-4. 签名、arm64、Bundle ID 检查；应用包里没有账号数据、Cookie、推流码或签名密钥。
-   Signature, arm64 and bundle id checks; no account data or keys in the bundle.
+4. 签名、架构（arm64 / x86_64）、Bundle ID 检查；应用包里没有账号数据、Cookie、推流码或签名密钥。
+   Signature, architecture and bundle id checks; no account data or keys in the bundle.
 5. 补丁系列在干净的上游 tag 上 `git am` 后和发布用的代码树一致；更新依赖清单和 BUILD-INFO。
    The patch series reproduces the released tree on a clean upstream tag; inventory and BUILD-INFO updated.
 6. 发布说明写清改了什么、是否升级 OBS、是否会迁移设置。/ Release notes say what changed, whether

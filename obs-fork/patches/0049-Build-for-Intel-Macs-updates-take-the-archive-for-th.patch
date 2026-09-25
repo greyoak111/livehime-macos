@@ -1,0 +1,136 @@
+From e1f2c2ed3290e8d0aec65b96dc45efa792cd5f69 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 16:54:04 +0800
+Subject: [PATCH 49/49] Build for Intel Macs; updates take the archive for
+ their architecture
+
+build-macos.sh takes ARCH=x86_64 to cross-build an Intel app on Apple
+silicon from the universal obs-deps, in build_macos_x86_64. The updater
+now looks for LiveHimeMacApp-v<version>-<arch>.zip for the architecture it
+was built for, so an Intel build never installs an Apple silicon archive
+(Apple silicon builds keep taking the -arm64.zip they always did).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/build-macos.sh             | 18 +++++++++++++----
+ .../Sources/LiveHimeCore/AppUpdater.swift     | 20 ++++++++++++++-----
+ .../LiveHimeCoreTests/AppUpdaterTests.swift   | 13 ++++++++++++
+ 3 files changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
+index 224d03eb1..dbfe5dad5 100755
+--- a/build-aux/livehime/build-macos.sh
++++ b/build-aux/livehime/build-macos.sh
+@@ -1,6 +1,9 @@
+ #!/bin/zsh
+-# Configure and build the LiveHime-branded OBS bundle (Apple Silicon).
++# Configure and build the LiveHime-branded OBS bundle.
++# ARCH=arm64 (default, Apple silicon) or ARCH=x86_64 (Intel; cross-built on
++# Apple silicon from the universal obs-deps, into its own build directory).
+ # Output: build_macos/frontend/${CONFIG}/LiveHime.app
++#         build_macos_x86_64/frontend/${CONFIG}/LiveHime.app for ARCH=x86_64
+ set -euo pipefail
+ 
+ source_dir=${0:A:h:h:h}
+@@ -10,8 +13,15 @@ config=${CONFIG:-RelWithDebInfo}
+ # local.livehime.macos. Release packaging passes BUNDLE_ID=local.livehime.macos
+ # to replace v0.1.x in place. The login Keychain item does not depend on it.
+ bundle_id=${BUNDLE_ID:-local.livehime.macos.dev}
++arch=${ARCH:-arm64}
++case $arch in
++  arm64) build_dir="$source_dir/build_macos" ;;
++  x86_64) build_dir="$source_dir/build_macos_x86_64" ;;
++  *) print -u2 -- "ARCH must be arm64 or x86_64"; exit 1 ;;
++esac
+ 
+-cmake -S "$source_dir" --preset macos \
++cmake -S "$source_dir" -B "$build_dir" --preset macos \
++  -DCMAKE_OSX_ARCHITECTURES="$arch" \
+   -DENABLE_BROWSER=OFF \
+   -DOBS_VERSION_OVERRIDE=32.2.2 \
+   -DOBS_CODESIGN_IDENTITY=- \
+@@ -23,8 +33,8 @@ cmake -S "$source_dir" --preset macos \
+   -DLIVEHIME_APP_VERSION=0.2.8 \
+   -DOBS_USER_CONFIG_SUBDIR=LiveHime
+ 
+-cmake --build "$source_dir/build_macos" --config "$config" --target obs-studio -- -quiet
+-app="$source_dir/build_macos/frontend/$config/LiveHime.app"
++cmake --build "$build_dir" --config "$config" --target obs-studio -- -quiet
++app="$build_dir/frontend/$config/LiveHime.app"
+ 
+ # Sign with the persistent local development certificate (as v0.1.2 did).
+ # Ad-hoc signatures change with every build and macOS does not keep screen
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+index f9ebc106d..24f23af23 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+@@ -89,29 +89,39 @@ public enum AppUpdater {
+         return false
+     }
+ 
++    /// This build's architecture; each release has one archive per architecture
++    /// ("LiveHimeMacApp-v<version>-arm64.zip", "...-x86_64.zip").
++    static var architecture: String {
++        #if arch(x86_64)
++        return "x86_64"
++        #else
++        return "arm64"
++        #endif
++    }
++
+     /// The newest release in a feed: a GitHub release object or a list of
+     /// them. Drafts are skipped, and pre-releases unless `beta` is set.
+-    static func release(from data: Data, beta: Bool = false) throws -> AppRelease {
++    static func release(from data: Data, beta: Bool = false, architecture: String = architecture) throws -> AppRelease {
+         let json = try JSONSerialization.jsonObject(with: data)
+         if let object = json as? [String: Any] {
+-            return try release(from: object)
++            return try release(from: object, architecture: architecture)
+         }
+         guard let list = json as? [[String: Any]] else { throw AppUpdateError.network("invalid release feed") }
+         let candidates = list.filter { ($0["draft"] as? Bool) != true && (beta || ($0["prerelease"] as? Bool) != true) }
+-            .compactMap { try? release(from: $0) }
++            .compactMap { try? release(from: $0, architecture: architecture) }
+         guard let newest = candidates.max(by: { isNewer($1.version, than: $0.version) }) else {
+             throw AppUpdateError.noArchive
+         }
+         return newest
+     }
+ 
+-    static func release(from root: [String: Any]) throws -> AppRelease {
++    static func release(from root: [String: Any], architecture: String = architecture) throws -> AppRelease {
+         guard let tag = root["tag_name"] as? String else { throw AppUpdateError.network("invalid release feed") }
+         let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+         let assets = root["assets"] as? [[String: Any]] ?? []
+         guard let asset = assets.first(where: {
+             let name = $0["name"] as? String ?? ""
+-            return name.hasPrefix("LiveHimeMacApp-") && name.hasSuffix("-arm64.zip")
++            return name.hasPrefix("LiveHimeMacApp-") && name.hasSuffix("-\(architecture).zip")
+         }), let archive = (asset["browser_download_url"] as? String).flatMap(URL.init(string:)) else {
+             throw AppUpdateError.noArchive
+         }
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
+index 4f9b86d4f..b0914bbfa 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/AppUpdaterTests.swift
+@@ -69,4 +69,17 @@ final class AppUpdaterTests: XCTestCase {
+         XCTAssertEqual(AppUpdater.obsMajor("32.2.2"), "32")
+         XCTAssertNil(AppUpdater.obsMajor(nil))
+     }
++
++    func testPicksTheArchiveForThisArchitecture() throws {
++        let json = #"""
++        {"tag_name":"v0.2.9","assets":[
++          {"name":"LiveHimeMacApp-v0.2.9-arm64.zip","browser_download_url":"https://e.invalid/arm.zip","digest":"sha256:aa"},
++          {"name":"LiveHimeMacApp-v0.2.9-x86_64.zip","browser_download_url":"https://e.invalid/intel.zip","digest":"sha256:bb"}]}
++        """#
++        XCTAssertEqual(try AppUpdater.release(from: Data(json.utf8), architecture: "arm64").archive.lastPathComponent, "arm.zip")
++        XCTAssertEqual(try AppUpdater.release(from: Data(json.utf8), architecture: "x86_64").archive.lastPathComponent, "intel.zip")
++        // An Intel build never takes an Apple silicon archive (and vice versa).
++        let armOnly = #"{"tag_name":"v0.2.9","assets":[{"name":"LiveHimeMacApp-v0.2.9-arm64.zip","browser_download_url":"https://e.invalid/a.zip","digest":"sha256:aa"}]}"#
++        XCTAssertThrowsError(try AppUpdater.release(from: Data(armOnly.utf8), architecture: "x86_64"))
++    }
+ }
+-- 
+2.54.0 (Apple Git-157)
+

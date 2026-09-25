@@ -19,6 +19,16 @@
   接口、弹幕连接和官方页面（只读，登录后也检查账号的只读接口），报告可以直接贴到 Issue，不含账号信息。
   A read-only check of the Bilibili interfaces LiveHime uses; the report can go into an issue.
 
+## Intel Mac 版 / Intel Macs
+
+从 v0.2.8 起同时提供 Intel 版（`LiveHimeMacApp-v0.2.8-x86_64.dmg`），功能和 Apple 芯片版相同，以后也能在
+应用里自动更新（Intel 版只会下载 Intel 的安装包）。语音字幕需要 macOS 26 或更高版本；Intel Mac 上能否使用
+取决于系统是否提供本机语音识别，不支持时字幕页会提示。Intel 版在 Apple 芯片的 Mac 上交叉编译，在 Rosetta 下
+检查过启动、插件加载和更新器，建议在真实的 Intel Mac 上也试一试，有问题欢迎反馈。
+From v0.2.8 there is also an Intel build, with the same features and in-app updates (it only takes Intel
+archives). Captions need macOS 26 and on-device speech recognition from the system. It was cross-built and
+checked under Rosetta (launch, plugin, updater); reports from real Intel Macs are welcome.
+
 ## 升级 / Upgrade
 
 **这一次需要手动升级：** 打开 DMG，把 LiveHime 拖到“应用程序”，选择“替换”。登录和设置都会保留。
@@ -41,5 +51,8 @@ on, later versions update from inside the app.
 
 ## 源码 / Source
 
-基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)（共 48 个）。
-The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/) (48 patches).
+基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)：Apple 芯片版对应补丁 0001–0048，
+Intel 版对应 0001–0049（0049 只增加构建架构选项，并让更新器按架构选择安装包）。
+The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/): patches
+0001–0048 for the Apple silicon app, 0001–0049 for the Intel app (0049 only adds the architecture option and
+makes the updater pick the archive for its architecture).

@@ -10,10 +10,14 @@ OBS Studio：OBS 怎么用它就怎么用，登录、开播、弹幕和直播间
 
 ## 下载 / Download
 
-到 [Releases](https://github.com/greyoak111/livehime-macos/releases) 下载最新的
-`LiveHimeMacApp-<版本>-arm64.dmg`，打开后把 LiveHime 拖到“应用程序”。
+到 [Releases](https://github.com/greyoak111/livehime-macos/releases) 下载最新版，打开 DMG 后把 LiveHime 拖到“应用程序”：
 
-- 要求：Apple Silicon（M 系列芯片），macOS 13 或更高版本。
+- Apple 芯片（M 系列）的 Mac：`LiveHimeMacApp-<版本>-arm64.dmg`
+- Intel 芯片的 Mac：`LiveHimeMacApp-<版本>-x86_64.dmg`（从 v0.2.8 起提供）
+
+不确定是哪种：点屏幕左上角  → 关于本机，“芯片”一栏写 Apple M… 的选 arm64，“处理器”一栏写 Intel 的选 x86_64。
+
+- 要求：macOS 13 或更高版本。语音字幕需要 macOS 26 或更高版本（Intel Mac 上能否使用取决于系统是否提供本机语音识别，不支持时字幕页会提示）。
 - 应用用本地证书签名，没有经过 Apple 公证。第一次打开如果被系统拦下，到
   **系统设置 → 隐私与安全性**，点“仍要打开”。
 - 第一次开播前，按提示授予屏幕录制、麦克风和摄像头权限。授权后如果提示重新打开应用，照做即可。
