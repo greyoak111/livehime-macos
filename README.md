@@ -8,19 +8,48 @@ OBS Studio：OBS 怎么用它就怎么用，登录、开播、弹幕和直播间
 > 风控规则可能随时变化；应用不会自动完成或绕过任何验证。使用者需要自己确认账号资格和内容是否合规，并对
 > 自己的直播负责。
 
-## 下载 / Download
+## 下载与安装 / Download and install
 
-到 [Releases](https://github.com/greyoak111/livehime-macos/releases) 下载最新版，打开 DMG 后把 LiveHime 拖到“应用程序”：
+> **只想装上用？** 打开 [最新版本](https://github.com/greyoak111/livehime-macos/releases/latest)，下载
+> **`LiveHime-v<版本>-Installer.pkg`**，双击后一路点“继续”。不用管自己的 Mac 是什么芯片，安装器会自动选。
+>
+> ⚠️ 页面最下面的 **Source code (zip)** 和 **Source code (tar.gz)** 是源代码，不是软件，解压出来只有一堆代码文件夹。
+> 装软件不要下载它们。
+>
+> Just want to use it? Download **`LiveHime-v<version>-Installer.pkg`** from the
+> [latest release](https://github.com/greyoak111/livehime-macos/releases/latest) and keep clicking Continue; it picks
+> the right build for your Mac. **Source code (zip / tar.gz)** at the bottom of the page is source code, not the app.
 
-- Apple 芯片（M 系列）的 Mac：`LiveHimeMacApp-<版本>-arm64.dmg`
-- Intel 芯片的 Mac：`LiveHimeMacApp-<版本>-x86_64.dmg`（从 v0.2.8 起提供）
+### 三步装好 / Three steps
 
-不确定是哪种：点屏幕左上角  → 关于本机，“芯片”一栏写 Apple M… 的选 arm64，“处理器”一栏写 Intel 的选 x86_64。
+1. **下载**上面说的 pkg 安装包。
+2. **双击打开。** 如果弹出“无法打开”或者“Apple 无法验证”：先点“完成”，然后打开 **系统设置 → 隐私与安全性**，
+   往下翻到“安全性”，点安装包名字旁边的 **“仍要打开”**，再输入开机密码。这是因为本项目没有 Apple 的付费开发者证书，
+   不是安装包有问题。
+3. **一路点“继续”**，输入开机密码，装好后在“启动台”或者“访达 → 应用程序”里打开 **LiveHimeMacApp**。
+   第一次打开 LiveHimeMacApp 时如果也被拦下，同样到“隐私与安全性”点“仍要打开”，只需要一次。
+
+装好后在右侧“直播姬”面板用哔哩哔哩 App 扫码登录。第一次开播前，按提示允许屏幕录制、麦克风和摄像头；
+授权后如果提示重新打开应用，照做即可。以后有新版本，应用会自己提示更新，不用再来下载。
+
+Unsigned by Apple (no paid developer certificate): if macOS blocks the installer or the app, open **System Settings →
+Privacy & Security** and click **Open Anyway**, once.
+
+### 所有下载文件 / Every file on the release page
+
+| 文件 / File | 给谁用 / For |
+|---|---|
+| `LiveHime-v<版本>-Installer.pkg` | **推荐。** 所有 Mac，自动选择芯片 / Recommended, any Mac |
+| `LiveHimeMacApp-v<版本>-arm64.dmg` | 习惯把应用拖进“应用程序”的 Apple 芯片（M 系列）Mac / drag-to-install, Apple silicon |
+| `LiveHimeMacApp-v<版本>-x86_64.dmg` | 同上，Intel 芯片的 Mac / drag-to-install, Intel |
+| `LiveHimeMacApp-v<版本>-*.zip` | 应用内更新用的，不用手动下载 / used by the in-app updater |
+| Source code (zip / tar.gz) | 开发者看源码用，**不是软件** / source code, **not the app** |
+
+pkg 和 DMG 装的是同一个软件，用哪个都行，后装的会替换先装的，登录和设置都保留。
+想知道自己是哪种芯片：点屏幕左上角  → 关于本机，“芯片”一栏写 Apple M… 的是 Apple 芯片，“处理器”一栏写 Intel 的是 Intel。
 
 - 要求：macOS 13 或更高版本。语音字幕需要 macOS 26 或更高版本（Intel Mac 上能否使用取决于系统是否提供本机语音识别，不支持时字幕页会提示）。
-- 应用用本地证书签名，没有经过 Apple 公证。第一次打开如果被系统拦下，到
-  **系统设置 → 隐私与安全性**，点“仍要打开”。
-- 第一次开播前，按提示授予屏幕录制、麦克风和摄像头权限。授权后如果提示重新打开应用，照做即可。
+- 应用用本地证书签名，没有经过 Apple 公证，所以会有上面说的“仍要打开”这一步。
 - 从 v0.1.x 升级前请先看 [升级说明](docs/UPGRADING.md)：登录通常会自动沿用，但场景要重新搭建。
 
 ## 功能 / Features
@@ -55,7 +84,10 @@ OBS Studio：OBS 怎么用它就怎么用，登录、开播、弹幕和直播间
 
 ## 常见问题 / FAQ
 
-- **怎么更新：** v0.2.8 起应用会自己检查更新（“直播姬”面板 → 更新）。从 v0.2.7 或更早的版本升级，需要手动下载一次 DMG。
+- **解压出一个满是代码的文件夹，找不到软件：** 你下载的是 Source code（源代码）。回到
+  [最新版本](https://github.com/greyoak111/livehime-macos/releases/latest) 下载 `LiveHime-v<版本>-Installer.pkg`。
+- **装好了找不到：** 打开“启动台”搜索 LiveHime，或者在“访达 → 应用程序”里找 **LiveHimeMacApp**。
+- **怎么更新：** v0.2.8 起应用会自己检查更新（“直播姬”面板 → 更新）。从 v0.2.7 或更早的版本升级，需要手动下载一次安装包。
 
 - **直播画面黑屏：** 到 系统设置 → 隐私与安全性 → 屏幕与系统录音，确认 LiveHime 已勾选，然后重新打开应用。
 - **悬浮聊天出现在直播画面里：** 在悬浮窗的 ⋯ 菜单里关掉“允许被屏幕采集”。

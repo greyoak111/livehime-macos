@@ -1,7 +1,7 @@
 From 58ffa3a4604878cba5c2d175971c73e06d6c6aea Mon Sep 17 00:00:00 2001
 From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 22:32:46 +0800
-Subject: [PATCH 52/53] Scroll the Captions and Updates tabs instead of
+Subject: [PATCH 52/54] Scroll the Captions and Updates tabs instead of
  squashing them
 
 In a short dock their text was squeezed; they now scroll like the Room tab.

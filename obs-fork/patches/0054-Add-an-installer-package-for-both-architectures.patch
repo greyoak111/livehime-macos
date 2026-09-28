@@ -1,0 +1,194 @@
+From 8a52254d999c2a0fae36b07e116f93bdcade3fcc Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 21:06:07 +0800
+Subject: [PATCH 54/54] Add an installer package for both architectures
+
+package-pkg.sh wraps the arm64 and x86_64 release apps in one .pkg.
+Installer picks the build for the Mac's chip and installs it into
+/Applications as LiveHimeMacApp.app, where the DMG puts it. The app is
+not relocated to another copy of the same bundle, an earlier LiveHime
+there is removed first, the installed app is given to the signed-in
+user so the in-app updater can replace it, and Installer asks to quit
+LiveHime before it starts. Welcome and conclusion pages explain what
+happens and how to open the app. The package is unsigned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/package-pkg.sh      | 100 +++++++++++++++++++++++++
+ build-aux/livehime/pkg/conclusion.html |  26 +++++++
+ build-aux/livehime/pkg/welcome.html    |  23 ++++++
+ 3 files changed, 149 insertions(+)
+ create mode 100755 build-aux/livehime/package-pkg.sh
+ create mode 100644 build-aux/livehime/pkg/conclusion.html
+ create mode 100644 build-aux/livehime/pkg/welcome.html
+
+diff --git a/build-aux/livehime/package-pkg.sh b/build-aux/livehime/package-pkg.sh
+new file mode 100755
+index 000000000..e675d10bc
+--- /dev/null
++++ b/build-aux/livehime/package-pkg.sh
+@@ -0,0 +1,100 @@
++#!/bin/zsh
++# Packages the two release builds of LiveHime.app as one installer package.
++# Installer puts the build for this Mac's chip into /Applications as
++# LiveHimeMacApp.app, the name and place the DMG uses, so either way of
++# installing replaces the other.
++# - Installer asks to quit LiveHime before it starts.
++# - The app always goes to /Applications, never to another copy with the same
++#   bundle identifier that Installer finds elsewhere (Downloads, say).
++# - An earlier LiveHimeMacApp.app there is removed first, only if it is
++#   LiveHime: files left over from an older version would break the signature.
++# - The installed app belongs to the signed-in user, as a dragged-in copy does,
++#   so the in-app updater can replace it (it needs write access to the app).
++# The package is not signed: that takes a Developer ID Installer certificate.
++# Usage: package-pkg.sh <arm64 LiveHime.app> <x86_64 LiveHime.app> <version> <out.pkg>
++set -euo pipefail
++
++arm=${1:A} intel=${2:A} version=$3 out=${4:A}
++here=${0:A:h}
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++plist() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist"; }
++fail() { print -u2 -- "package-pkg: $*"; exit 1; }
++
++id=$(plist "$arm" CFBundleIdentifier)
++[[ $(plist "$intel" CFBundleIdentifier) == "$id" ]] || fail "the two apps have different bundle identifiers"
++for app arch in "$arm" arm64 "$intel" x86_64; do
++  [[ $(plist "$app" CFBundleShortVersionString) == "$version" ]] || fail "$app is not version $version"
++  [[ $(lipo -archs "$app/Contents/MacOS/$(plist "$app" CFBundleExecutable)") == "$arch" ]] || fail "$app is not $arch"
++done
++
++# Both component packages share these scripts; @ID@ is the app's bundle identifier.
++mkdir -p "$work/scripts" "$work/pkgs" "$work/resources"
++cat > "$work/scripts/preinstall" <<'SH'
++#!/bin/sh
++# $2 is the install location (/Applications).
++app="${2:-/Applications}/LiveHimeMacApp.app"
++[ -d "$app" ] || exit 0
++id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)
++if [ "$id" = "@ID@" ]; then /bin/rm -rf "$app"; fi
++exit 0
++SH
++cat > "$work/scripts/postinstall" <<'SH'
++#!/bin/sh
++app="${2:-/Applications}/LiveHimeMacApp.app"
++user=$(/usr/bin/stat -f%Su /dev/console)
++case "$user" in ""|root|loginwindow|_mbsetupuser) exit 0 ;; esac
++/usr/sbin/chown -R "$user:$(/usr/bin/id -gn "$user")" "$app"
++exit 0
++SH
++sed -i '' "s/@ID@/$id/" "$work/scripts/preinstall"
++chmod 755 "$work/scripts/preinstall" "$work/scripts/postinstall"
++
++for app arch in "$arm" arm64 "$intel" x86_64; do
++  root="$work/root-$arch"
++  mkdir -p "$root"
++  ditto --norsrc --noextattr "$app" "$root/LiveHimeMacApp.app"
++  pkgbuild --quiet --analyze --root "$root" "$work/$arch.plist"
++  /usr/libexec/PlistBuddy -c 'Add :0:BundleIsRelocatable bool false' "$work/$arch.plist"
++  pkgbuild --quiet --root "$root" --component-plist "$work/$arch.plist" --scripts "$work/scripts" \
++    --identifier "$id.$arch" --version "$version" --install-location /Applications "$work/pkgs/$arch.pkg"
++done
++
++for page in welcome conclusion; do
++  sed "s/@VERSION@/$version/g" "$here/pkg/$page.html" > "$work/resources/$page.html"
++done
++
++cat > "$work/distribution.xml" <<XML
++<?xml version="1.0" encoding="utf-8"?>
++<installer-gui-script minSpecVersion="2">
++    <title>LiveHime $version</title>
++    <welcome file="welcome.html" mime-type="text/html"/>
++    <conclusion file="conclusion.html" mime-type="text/html"/>
++    <options customize="never" require-scripts="false" rootVolumeOnly="true" hostArchitectures="arm64,x86_64"/>
++    <domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
++    <allowed-os-versions><os-version min="13.0"/></allowed-os-versions>
++    <script><![CDATA[
++    function appleSilicon() { return system.sysctl('hw.optional.arm64') == 1; }
++    ]]></script>
++    <choices-outline>
++        <line choice="arm64"/>
++        <line choice="x86_64"/>
++    </choices-outline>
++    <choice id="arm64" title="LiveHime (Apple silicon)" visible="false" selected="appleSilicon()">
++        <pkg-ref id="$id.arm64"/>
++    </choice>
++    <choice id="x86_64" title="LiveHime (Intel)" visible="false" selected="!appleSilicon()">
++        <pkg-ref id="$id.x86_64"/>
++    </choice>
++    <pkg-ref id="$id.arm64" version="$version" onConclusion="none">arm64.pkg</pkg-ref>
++    <pkg-ref id="$id.arm64"><must-close><app id="$id"/></must-close></pkg-ref>
++    <pkg-ref id="$id.x86_64" version="$version" onConclusion="none">x86_64.pkg</pkg-ref>
++    <pkg-ref id="$id.x86_64"><must-close><app id="$id"/></must-close></pkg-ref>
++</installer-gui-script>
++XML
++
++rm -f "$out"
++productbuild --quiet --distribution "$work/distribution.xml" --resources "$work/resources" \
++  --package-path "$work/pkgs" "$out"
++print -- "$out"
+diff --git a/build-aux/livehime/pkg/conclusion.html b/build-aux/livehime/pkg/conclusion.html
+new file mode 100644
+index 000000000..b7ea2a801
+--- /dev/null
++++ b/build-aux/livehime/pkg/conclusion.html
+@@ -0,0 +1,26 @@
++<!DOCTYPE html>
++<html lang="zh-CN">
++<head>
++<meta charset="utf-8">
++<style>
++  body { font: 13px -apple-system, "PingFang SC", sans-serif; line-height: 1.6; color: CanvasText; }
++  h2 { font-size: 15px; margin: 0 0 8px; }
++  p, ol { margin: 0 0 10px; }
++  ol { padding-left: 20px; }
++  .en { color: GrayText; }
++</style>
++</head>
++<body>
++<h2>装好了</h2>
++<ol>
++  <li>打开“启动台”或者“访达 → 应用程序”，找到 <b>LiveHimeMacApp</b>，双击打开。</li>
++  <li>如果提示“无法打开”或者“无法验证开发者”：打开 <b>系统设置 → 隐私与安全性</b>，
++      往下翻，点 LiveHimeMacApp 旁边的 <b>“仍要打开”</b>。只需要做一次。</li>
++  <li>在右侧“直播姬”面板用哔哩哔哩 App 扫码登录。第一次开播前，按提示允许屏幕录制和麦克风。</li>
++</ol>
++<p>这个安装包用完可以删掉。以后有新版本，应用会自己提示更新，不用再下载安装包。</p>
++<p class="en">Open <b>LiveHimeMacApp</b> from Launchpad or Applications. If macOS says it can't be opened, go to
++<b>System Settings → Privacy &amp; Security</b> and click <b>Open Anyway</b> next to LiveHimeMacApp (once only).
++Sign in by scanning the QR code with the Bilibili app. You can delete this installer; the app updates itself.</p>
++</body>
++</html>
+diff --git a/build-aux/livehime/pkg/welcome.html b/build-aux/livehime/pkg/welcome.html
+new file mode 100644
+index 000000000..8ec0c6332
+--- /dev/null
++++ b/build-aux/livehime/pkg/welcome.html
+@@ -0,0 +1,23 @@
++<!DOCTYPE html>
++<html lang="zh-CN">
++<head>
++<meta charset="utf-8">
++<style>
++  body { font: 13px -apple-system, "PingFang SC", sans-serif; line-height: 1.6; color: CanvasText; }
++  h2 { font-size: 15px; margin: 0 0 8px; }
++  p { margin: 0 0 10px; }
++  .en { color: GrayText; }
++</style>
++</head>
++<body>
++<h2>欢迎安装 LiveHime @VERSION@</h2>
++<p>LiveHime 是带“直播姬”面板的 OBS Studio：在 Mac 上登录哔哩哔哩、开播、看弹幕。</p>
++<p>一路点“继续”就好。安装器会自动选择适合这台 Mac 的版本（Apple 芯片或 Intel），
++装到“应用程序”文件夹，名字是 <b>LiveHimeMacApp</b>。已经装过的话会直接替换，登录、场景和设置都会保留。</p>
++<p>安装时会要求输入这台 Mac 的开机密码，这是 macOS 往“应用程序”里装软件的正常步骤。</p>
++<p class="en">Keep clicking Continue. The installer picks the build for this Mac (Apple silicon or Intel) and puts
++<b>LiveHimeMacApp</b> in Applications, replacing an earlier copy; your sign-in, scenes and settings stay.
++macOS asks for your login password to install into Applications.</p>
++<p class="en">LiveHime is a third-party community project, not an official product of Bilibili or the OBS Project.</p>
++</body>
++</html>
+-- 
+2.54.0 (Apple Git-157)
+
