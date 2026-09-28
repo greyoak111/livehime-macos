@@ -19,6 +19,42 @@
   Every release ships both `LiveHimeMacApp-v<version>-arm64.zip` and `-x86_64.zip` (each build's updater
   looks for its own architecture), plus DMGs for manual downloads. Intel apps are cross-built with
   `ARCH=x86_64` and checked under Rosetta.
+- 另外发一个装两个架构的安装包 `LiveHime-v<版本>-Installer.pkg`，这是给普通用户的**首选下载**：双击后一路“继续”，
+  自动按芯片安装到“应用程序”，不用分辨芯片。它的名字不能以 `LiveHimeMacApp-` 开头、以 `.zip` 结尾，免得更新器误认。
+  Also ship `LiveHime-v<version>-Installer.pkg` with both architectures, the **recommended download**: it
+  installs the right build into Applications. Its name must never look like an updater zip.
+
+## 打包 / Packaging
+
+每个版本的附件（`dist/v<版本>/`），都从同一次构建出来：/ Every release's files, from the same builds:
+
+| 附件 / File | 做法 / How |
+|---|---|
+| `LiveHimeMacApp-v<版本>-arm64.zip`、`-x86_64.zip` | `ditto -c -k --keepParent`，app 改名为 `LiveHimeMacApp.app` / the renamed app, zipped |
+| `LiveHimeMacApp-v<版本>-arm64.dmg`、`-x86_64.dmg` | `build-aux/livehime/package-dmg.sh <app> <版本> <out.dmg>` |
+| `LiveHime-v<版本>-Installer.pkg` | 见下 / below |
+| `DEPENDENCY-INVENTORY-v<版本>.txt`、`-x86_64.txt` | `scripts/generate-bundle-inventory.py <app> <out>` |
+
+安装包**从刚打好的两个 zip 里解出来的 app 打**，保证 pkg 里的和更新器下载的是同一份：
+Build the pkg **from the apps unpacked from the two zips**, so it holds exactly what the updater installs:
+
+```sh
+v=<版本>; w=$(mktemp -d)
+ditto -x -k dist/v$v/LiveHimeMacApp-v$v-arm64.zip  $w/arm64
+ditto -x -k dist/v$v/LiveHimeMacApp-v$v-x86_64.zip $w/x86_64
+obs-studio-clean/build-aux/livehime/package-pkg.sh $w/arm64/LiveHimeMacApp.app $w/x86_64/LiveHimeMacApp.app \
+  $v dist/v$v/LiveHime-v$v-Installer.pkg
+scripts/verify-installer-pkg.sh dist/v$v/LiveHime-v$v-Installer.pkg $w/arm64/LiveHimeMacApp.app $w/x86_64/LiveHimeMacApp.app
+```
+
+pkgbuild 会打印几行 `write: Permission denied`：它想复制系统保护的 `com.apple.provenance` 属性，不影响结果，
+以检查脚本为准。/ pkgbuild prints a few `write: Permission denied` lines while copying the protected
+`com.apple.provenance` attribute; harmless, the check script is what counts.
+
+安装包没有签名（需要 Apple 的 Developer ID Installer 证书），所以用户第一次打开会被 Gatekeeper 拦下，
+要在“隐私与安全性”点“仍要打开”；README 和发布说明里要一直写着这一步。
+The pkg is unsigned (that needs a Developer ID Installer certificate), so Gatekeeper blocks the first open;
+README and release notes must keep explaining Open Anyway.
 
 ## 什么时候发、走哪个通道 / What goes where
 
@@ -46,10 +82,16 @@
 3. 维护者用真实账号开播一次：登录、开播、弹幕、下播。/ One real stream by the maintainer.
 4. 签名、架构（arm64 / x86_64）、Bundle ID 检查；应用包里没有账号数据、Cookie、推流码或签名密钥。
    Signature, architecture and bundle id checks; no account data or keys in the bundle.
-5. 补丁系列在干净的上游 tag 上 `git am` 后和发布用的代码树一致；更新依赖清单和 BUILD-INFO。
+5. `scripts/verify-installer-pkg.sh` 全部 PASS；维护者双击安装一次，确认装进“应用程序”、应用归当前用户所有
+   （`find /Applications/LiveHimeMacApp.app -not -user $USER` 没有输出），能正常打开。
+   The pkg check passes; the maintainer installs it once and confirms the app is in Applications, owned by
+   the user, and opens.
+6. 补丁系列在干净的上游 tag 上 `git am` 后和发布用的代码树一致；更新依赖清单和 BUILD-INFO。
    The patch series reproduces the released tree on a clean upstream tag; inventory and BUILD-INFO updated.
-6. 发布说明写清改了什么、是否升级 OBS、是否会迁移设置。/ Release notes say what changed, whether
-   OBS was upgraded and whether settings migrate.
+7. 发布说明写清改了什么、是否升级 OBS、是否会迁移设置；**开头先放“下载哪个文件”的表**（pkg 推荐、DMG、
+   更新用的 zip、Source code 不是软件），照 [v0.2.10 的发布说明](RELEASE_NOTES_v0.2.10.md) 的格式。
+   Release notes say what changed, whether OBS was upgraded and whether settings migrate, and **open with
+   the “which file to download” table**, as in the v0.2.10 notes.
 
 ## 出问题时 / When a release is bad
 
