@@ -58,8 +58,9 @@ v0.2 起放弃“原生宿主 + 隐藏 OBS 后台”的 v0.1.x 结构，改为 *
 
 ### 2. 浏览器来源 / Browser source
 
-v0.2.0 构建时关闭了 `ENABLE_BROWSER`（CEF 体积大、签名复杂）。之后单独评估：CEF 打包、
-签名与体积，或用 WKWebView 实现一个精简版本。
+v0.2.0 构建时关闭了 `ENABLE_BROWSER`（CEF 体积大、签名复杂）。2026-09-29 决定做成**可选、可拔插的组件**：
+主程序体积不变，需要的人在应用里一键安装。计划见 [浏览器来源可选组件计划书](BROWSER_ADDON_PLAN.md)，尚未开工。
+Decided on 2026-09-29: an optional add-on installed from inside the app; see the plan. Not started.
 
 ### 3. 其他 / Other
 
