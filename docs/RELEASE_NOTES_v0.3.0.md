@@ -50,6 +50,16 @@ OBS is not upgraded; no settings migrate; your login and settings are kept.
 With the browser add-on installed, it keeps about 150 MB of memory in the background even without a browser
 source; remove it if you do not need it.
 
+## 使用提示 / Tips
+
+- **在浏览器来源里登录或点击网页**：画面里的浏览器来源只负责显示，不接受点击和输入。在“来源”列表里右键它 → **交互**，
+  会打开一个可以操作的窗口，在里面登录、点按钮都行；登录会被记住，所有浏览器来源共用。
+  交互窗口里的操作会同时出现在画面上，登录前先点“眼睛”把来源隐藏（隐藏时交互窗口照样能用），或者在没开播时登录。
+  **Logging in or clicking in a browser source**: the source in your scene only displays the page. Right-click it in
+  Sources → **Interact** to open a window you can click and type in; logins are remembered and shared by all browser
+  sources. What you do there also shows in the scene, so hide the source first (the eye icon; Interact still works)
+  or log in while not streaming.
+
 ## 验证 / Validation
 
 - 维护者用真实账号开播正常；用 pkg 把 0.2.10 升级到 0.3.0，登录、设置和屏幕录制授权都保留，更新说明弹窗正常出现。
