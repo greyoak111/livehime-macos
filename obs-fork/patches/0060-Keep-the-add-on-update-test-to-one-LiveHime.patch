@@ -1,0 +1,65 @@
+From 0c8a5b110ad134bb1dbe6f7733dfee5c17672bb6 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 20:30:46 +0800
+Subject: [PATCH] Keep the add-on update test to one LiveHime
+
+It quit LiveHime by the development bundle id, so with a release build
+the app kept running and the next test talked to it. It now quits by
+the app's own bundle id, refuses to start next to another LiveHime and
+fails when LiveHime does not quit. The tests README says to run the
+update tests on a development build, since a release build shares the
+installed app's update cache.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            | 5 +++++
+ build-aux/livehime/tests/e2e-addon-update.mjs | 8 +++++++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index fb1f87006..bd70ee91e 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -130,6 +130,11 @@ downloading the update also stages that add-on; then, with the add-on zip
+ gone, that the update stays ready, reports the problem and stages nothing.
+ Quitting installs 9.9.9 into the work copy.
+ 
++Run the update and add-on update tests on a development build (bundle id
++ending in `.dev`): a release build shares the installed LiveHime's update
++cache (`~/Library/Caches/local.livehime.macos/Updates`), where installing
++an update replaces the kept previous version used for rolling back.
++
+ Both share LiveHime's settings folder: back up `basic`, `plugin_config`,
+ `plugin_manager`, `user.ini` and `global.ini` first and put them back after;
+ move `obs-studio/plugins`, `obs-studio/addons-pending`, the backups the update
+diff --git a/build-aux/livehime/tests/e2e-addon-update.mjs b/build-aux/livehime/tests/e2e-addon-update.mjs
+index 4dd1c7fc1..4fdf25011 100644
+--- a/build-aux/livehime/tests/e2e-addon-update.mjs
++++ b/build-aux/livehime/tests/e2e-addon-update.mjs
+@@ -106,7 +106,12 @@ async function waitUpdate(want, action) {
+   return r;
+ }
+ 
++const bundleId = sh('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleIdentifier', `${builtApp}/Contents/Info.plist`]).trim();
++const anyRunning = () => { try { return sh('/usr/bin/pgrep', ['-f', `/Contents/MacOS/LiveHime`]).trim(); } catch { return ''; } };
++
+ async function run() {
++  // Never next to another LiveHime: it could answer instead of the one under test.
++  if (anyRunning()) throw new Error('another LiveHime is running');
+   sh('/usr/bin/open', ['-n', '--env', 'LIVEHIME_KEYCHAIN_SERVICE=local.livehime.macos.e2e-test',
+     '--env', `LIVEHIME_UPDATE_FEED=file://${path.join(feed, 'feed.json')}`, install]);
+   await connect();
+@@ -132,8 +137,9 @@ async function run() {
+   check('...and the installed add-on is kept', manifest(path.join(plugins, 'obs-browser.plugin')).obs === current.obs);
+ 
+   // Quitting installs the update into the work copy; wait for the swap to finish.
+-  try { execFileSync('/usr/bin/osascript', ['-e', 'tell application id "local.livehime.macos.dev" to quit'], { stdio: 'ignore' }); } catch {}
++  try { execFileSync('/usr/bin/osascript', ['-e', `tell application id "${bundleId}" to quit`], { stdio: 'ignore' }); } catch {}
+   for (let i = 0; i < 120 && running(); i++) await sleep(500);
++  if (running()) throw new Error('LiveHime did not quit');
+   const version = () => { try { return JSON.stringify(execFileSync('/usr/bin/plutil', ['-extract', 'CFBundleShortVersionString', 'raw', `${install}/Contents/Info.plist`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()); } catch { return ''; } };
+   for (let i = 0; i < 60 && version() !== '"9.9.9"'; i++) await sleep(500);
+ }
+-- 
+2.54.0 (Apple Git-157)
+

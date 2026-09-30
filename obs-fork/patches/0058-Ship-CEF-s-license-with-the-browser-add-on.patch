@@ -1,0 +1,35 @@
+From 20844e0c46e7bdf67b3b45360173b5471ea122f2 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 20:10:00 +0800
+Subject: [PATCH] Ship CEF's license with the browser add-on
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/package-browser-addon.sh | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/build-aux/livehime/package-browser-addon.sh b/build-aux/livehime/package-browser-addon.sh
+index 570c19fe5..4f577c971 100755
+--- a/build-aux/livehime/package-browser-addon.sh
++++ b/build-aux/livehime/package-browser-addon.sh
+@@ -10,6 +10,8 @@
+ #   against, and LiveHime loads it only on that OBS.
+ # - Only English and Chinese CEF locales are kept (the patch falls back to
+ #   English for other interface languages).
++# - Carries CEF's license (Contents/Resources/LICENSE-CEF.txt); Chromium's own
++#   third-party notices are inside CEF (chrome://credits).
+ # - Signed with the same local certificate as the app.
+ # CEF must already be in .deps (the OBS configure step fetches it; ask the
+ # maintainer before downloading: about 90 MB for arm64, 100 MB for x86_64).
+@@ -57,6 +59,8 @@ for helper in "$frameworks"/OBS\ Helper*.app; do
+   strip -S -x "$helper/Contents/MacOS/${helper:t:r}" 2>/dev/null
+ done
+ 
++cp "${cef_dirs[1]}/LICENSE.txt" "$plugin/Contents/Resources/LICENSE-CEF.txt"
++
+ libobs_plist="${built:h:h:h}/libobs/$config/libobs.framework/Resources/Info.plist"
+ [[ -f $libobs_plist ]] || fail "cannot find the libobs this build used"
+ obs_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$libobs_plist")
+-- 
+2.54.0 (Apple Git-157)
+

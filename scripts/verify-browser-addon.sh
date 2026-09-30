@@ -4,7 +4,8 @@
 # matches the file name and the OBS base of the app it is for, every binary is
 # built for the right architecture, the plugin loads CEF from its own bundle and
 # the app's libobs, nothing points into a build folder, only the kept CEF
-# locales are there, and it is signed by the same certificate as the app.
+# locales are there, CEF's license is included, and it is signed by the same
+# certificate as the app.
 # Usage: verify-browser-addon.sh <LiveHime-BrowserAddon-v<version>-<arch>.zip> <LiveHime.app of that arch>
 set -uo pipefail
 
@@ -57,6 +58,7 @@ expect "no path into a build folder" sh -c "! otool -l '$binary' '$frameworks'/O
 locales=("$cef"/Resources/*.lproj(N:t))
 expect "only en, zh_CN, zh_TW locales" test "${(o)locales}" = "en.lproj zh_CN.lproj zh_TW.lproj"
 
+expect "carries CEF's license" test -s "$plugin/Contents/Resources/LICENSE-CEF.txt"
 expect "signature valid" codesign --verify --deep --strict "$plugin"
 expect "signed by the app's certificate" test "$(leaf "$plugin")" = "$(leaf "$app")"
 

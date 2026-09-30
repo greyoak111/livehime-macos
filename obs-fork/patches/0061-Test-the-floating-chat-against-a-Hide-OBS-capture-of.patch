@@ -1,0 +1,246 @@
+From 7ca857f7c46da3ec06ae2d9741b49e8fa1edc7a0 Mon Sep 17 00:00:00 2001
+From: greyoak111 <suny96636@gmail.com>
+Date: Wed, 30 Sep 2026 20:46:56 +0800
+Subject: [PATCH] Test the floating chat against a "Hide OBS" capture of its
+ own
+
+The floating chat test used the profile's screen capture as the "Hide OBS"
+case, but that source may not hide OBS at all, and it compared brightness,
+which a dark desktop behind the dark chat cannot tell apart. Test both modes
+with temporary captures that set "Hide OBS" explicitly, compare pixels, and
+also check that LiveHime's other windows, and one opened afterwards, stay
+out of a "Hide OBS" capture while the chat is allowed in.
+
+The test README now asks for development builds only: a build sharing the
+installed app's bundle id takes over its screen recording grant, and every
+copy of such a build left on disk can end up holding it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md        |  22 +++-
+ build-aux/livehime/tests/e2e-floating.mjs | 129 ++++++++++++----------
+ 2 files changed, 89 insertions(+), 62 deletions(-)
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index bd70ee91e..ee6d144c4 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -26,6 +26,20 @@ node e2e-account.mjs <websocket password>
+ 
+ ## Running safely
+ 
++- Launch only a development build (bundle id ending in `.dev`, built with
++  `build-macos.sh` without `BUNDLE_ID`). macOS keeps one screen recording,
++  camera and microphone grant per bundle id: launching a build that shares
++  `local.livehime.macos` with the installed LiveHime takes that grant over,
++  and the installed app takes it back, so each one loses screen capture.
++  Check release builds without launching them (the `scripts/verify-*`
++  checks); test the same sources under the `.dev` id.
++  Every copy of a release build left on disk (unpacked zips, mounted DMGs,
++  build folders) is registered under that id too, and a grant can end up on
++  any of them: afterwards move them to the Trash and unregister them
++  (`lsregister -u <path>`) so only the installed app remains.
++- Build with `build-macos.sh`, not `cmake --build` alone: only the script
++  signs with the local certificate. An ad hoc signature changes with every
++  build, and macOS drops the grants of an ad hoc app it has seen before.
+ - Do not run while a normal LiveHime is open: `open --env` reuses the running
+   instance instead of starting an isolated one.
+ - The unreachable-server case leaves OBS's modal "failed to connect" dialog
+@@ -130,10 +144,10 @@ downloading the update also stages that add-on; then, with the add-on zip
+ gone, that the update stays ready, reports the problem and stages nothing.
+ Quitting installs 9.9.9 into the work copy.
+ 
+-Run the update and add-on update tests on a development build (bundle id
+-ending in `.dev`): a release build shares the installed LiveHime's update
+-cache (`~/Library/Caches/local.livehime.macos/Updates`), where installing
+-an update replaces the kept previous version used for rolling back.
++Like every test here, run these on a development build: a release build
++would also share the installed LiveHime's update cache
++(`~/Library/Caches/local.livehime.macos/Updates`), where installing an
++update replaces the kept previous version used for rolling back.
+ 
+ Both share LiveHime's settings folder: back up `basic`, `plugin_config`,
+ `plugin_manager`, `user.ini` and `global.ini` first and put them back after;
+diff --git a/build-aux/livehime/tests/e2e-floating.mjs b/build-aux/livehime/tests/e2e-floating.mjs
+index 20f5b3307..5da88e91a 100644
+--- a/build-aux/livehime/tests/e2e-floating.mjs
++++ b/build-aux/livehime/tests/e2e-floating.mjs
+@@ -1,9 +1,10 @@
+ // Floating chat: options, feed, and whether screen capture sees the window.
+ // Usage: node e2e-floating.mjs <ws password> <screen width pt> <screen height pt> <crop dir>
+-// Needs an active "macOS 屏幕采集" source in the program scene.
++// Needs a screen capture source in the profile (its display is reused).
+ import { createHash } from 'node:crypto';
+ import zlib from 'node:zlib';
+ import { writeFileSync } from 'node:fs';
++import { execFileSync } from 'node:child_process';
+ 
+ const [password, screenW, screenH] = [process.argv[2], Number(process.argv[3]), Number(process.argv[4])];
+ const sha = (s) => createHash('sha256').update(s).digest('base64');
+@@ -46,21 +47,33 @@ function pixdiff(a, b, x, y, w, h) {
+     }
+   return sum / n;
+ }
+-// Mean luminance of a rectangle given in screen points.
+-function luma(img, x, y, w, h) {
+-  const sx = img.w / screenW, sy = img.h / screenH; let sum = 0, n = 0;
+-  for (let py = Math.round(y * sy); py < Math.round((y + h) * sy); py += 2)
+-    for (let px = Math.round(x * sx); px < Math.round((x + w) * sx); px += 2) {
+-      const i = (py * img.w + px) * 4; sum += 0.2126 * img.px[i] + 0.7152 * img.px[i + 1] + 0.0722 * img.px[i + 2]; n++;
++// LiveHime's on-screen windows (screen points), found by the websocket port's owner.
++function ownWindows() {
++  const pid = Number(execFileSync('lsof', ['-ti', 'tcp:4466', '-sTCP:LISTEN']).toString().trim().split('\n')[0]);
++  const js = `ObjC.import('CoreGraphics'); JSON.stringify(ObjC.deepUnwrap(ObjC.castRefToObject(
++    $.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly, 0))).filter((w) => w.kCGWindowOwnerPID === ${pid})
++    .map((w) => ({ id: w.kCGWindowNumber, x: w.kCGWindowBounds.X, y: w.kCGWindowBounds.Y, w: w.kCGWindowBounds.Width, h: w.kCGWindowBounds.Height })))`;
++  return JSON.parse(execFileSync('osascript', ['-l', 'JavaScript', '-e', js]).toString());
++}
++// Mean pixel difference over a window, clipped to the screen, leaving out
++// the area of `skip` (the floating chat, which may be in front of it).
++function windowDiff(a, b, r, skip) {
++  const x0 = Math.max(0, r.x), y0 = Math.max(0, r.y), x1 = Math.min(screenW, r.x + r.w), y1 = Math.min(screenH, r.y + r.h);
++  const sx = a.w / screenW, sy = a.h / screenH; let sum = 0, n = 0;
++  for (let y = y0; y < y1; y += 2)
++    for (let x = x0; x < x1; x += 2) {
++      if (skip && x >= skip.x && x < skip.x + skip.w && y >= skip.y && y < skip.y + skip.h) continue;
++      const i = (Math.round(y * sy) * a.w + Math.round(x * sx)) * 4;
++      sum += (Math.abs(a.px[i] - b.px[i]) + Math.abs(a.px[i + 1] - b.px[i + 1]) + Math.abs(a.px[i + 2] - b.px[i + 2])) / 3; n++;
+     }
+-  return sum / n;
++  return n > 64 ? sum / n : 0;
+ }
+ async function capture(input) {
+   // Screen capture needs a moment to deliver its first frame.
+   let last;
+   for (let i = 0; i < 20; i++) {
+     const r = await req('GetSourceScreenshot', { sourceName: input, imageFormat: 'png' });
+-    if (r.requestStatus.result) return decode(Buffer.from(r.responseData.imageData.split(',')[1], 'base64'));
++    if (r.requestStatus.result) { const png = Buffer.from(r.responseData.imageData.split(',')[1], 'base64'); return { ...decode(png), png }; }
+     last = r.requestStatus.comment; await sleep(500);
+   }
+   throw new Error('screenshot failed: ' + last);
+@@ -87,72 +100,72 @@ ws.onmessage = async (ev) => {
+     s = await vendor('FloatingChat', {});
+     check('floating feed receives room events', s.lines - before === 3, `${s.lines - before} new lines`);
+ 
+-    // Screen capture only delivers frames while active, so use the program
+-    // scene's existing screen capture source (read-only screenshots).
++    // Screen capture only delivers frames while active, so each mode gets a
++    // temporary capture in the program scene (settings copied from the
++    // profile's screen capture, "Hide OBS" set explicitly), always removed.
++    // Whatever lies behind the window differs from it pixel by pixel, so
++    // compare pixels, not brightness (a dark desktop looks like the chat).
+     const inputs = (await req('GetInputList', { inputKind: 'screen_capture' })).responseData.inputs;
+     const inner = { x: win.x + 20, y: win.y + 60, w: win.w - 40, h: win.h - 120 };
+-    const L = (img) => luma(img, inner.x, inner.y, inner.w, inner.h);
+-    try {
+-    if (!inputs.length) throw new Error('no screen capture source in the profile');
+-    const input = inputs[0].inputName;
+-    check('using active screen capture source', true, input);
+-
+-    const shots = {};
+-    const settle = () => sleep(2500);
+-    await vendor('FloatingChat', { visible: false }); await settle();
+-    shots.A_closed = await capture(input);
+-    await vendor('FloatingChat', { visible: true, capturable: false }); await settle();
+-    shots.B_hidden = await capture(input);
+-    await vendor('FloatingChat', { capturable: true }); await settle();
+-    shots.C_shown = await capture(input);
+-    await vendor('FloatingChat', { capturable: false }); await settle();
+-    shots.D_hidden = await capture(input);
+-    for (const [k, img] of Object.entries(shots)) {
+-      // Save the window area (raw RGBA) for inspection.
++    const scene = (await req('GetCurrentProgramScene')).responseData.currentProgramSceneName;
++    const probes = [];
++    const isChat = (r) => Math.abs(r.x - win.x) <= 2 && Math.abs(r.w - win.w) <= 2;
++    const saveCrop = (name, img) => {
+       const sx = img.w / screenW, x0 = Math.round(win.x * sx), y0 = Math.round(win.y * sx), w = Math.round(win.w * sx), h = Math.round(win.h * sx);
+       const crop = Buffer.alloc(w * h * 4);
+       for (let y = 0; y < h; y++) img.px.copy(crop, y * w * 4, ((y0 + y) * img.w + x0) * 4, ((y0 + y) * img.w + x0 + w) * 4);
+-      writeFileSync(process.argv[5] + '/' + k + '.rgba', crop); writeFileSync(process.argv[5] + '/' + k + '.size', `${w}x${h}`);
+-      console.log(k, 'window-area luminance', L(img).toFixed(1));
+-    }
+-    const d = (a, b) => Math.abs(L(a) - L(b));
+-    check('hidden: capture shows the desktop, not the window', d(shots.B_hidden, shots.A_closed) < 12, d(shots.B_hidden, shots.A_closed).toFixed(1));
+-    check('allowed: capture shows the window', d(shots.C_shown, shots.A_closed) > 30, d(shots.C_shown, shots.A_closed).toFixed(1));
+-    check('hidden again after toggling back', d(shots.D_hidden, shots.A_closed) < 12, d(shots.D_hidden, shots.A_closed).toFixed(1));
+-    } catch (e) { check('capture comparison', false, e.message); }
+-    finally {}
+-
+-    // Same check through a capture that does NOT hide LiveHime: the
+-    // per-window override must still leave the window out unless allowed.
+-    // Temporary source in the program scene, always removed. Whatever lies
+-    // behind the window differs from it pixel by pixel, so compare pixels.
+-    const scene = (await req('GetCurrentProgramScene')).responseData.currentProgramSceneName;
+-    const probe = 'livehime-e2e-nohide';
+-    const template = (await req('GetInputSettings', { inputName: inputs[0].inputName })).responseData.inputSettings;
+-    try {
+-      const made = await req('CreateInput', { sceneName: scene, inputName: probe, inputKind: 'screen_capture', inputSettings: { ...template, hide_obs: false } });
+-      check('temporary no-hide capture created', made.requestStatus.result, made.requestStatus.comment);
++      writeFileSync(process.argv[5] + '/' + name + '.rgba', crop); writeFileSync(process.argv[5] + '/' + name + '.size', `${w}x${h}`);
++    };
++    const runMode = async (hideObs) => {
++      const tag = hideObs ? 'hide-OBS capture' : 'no-hide capture';
++      const probe = hideObs ? 'livehime-e2e-hide' : 'livehime-e2e-nohide';
++      const template = (await req('GetInputSettings', { inputName: inputs[0].inputName })).responseData.inputSettings;
++      const made = await req('CreateInput', { sceneName: scene, inputName: probe, inputKind: 'screen_capture', inputSettings: { ...template, hide_obs: hideObs } });
++      probes.push(probe);
++      check(`${tag}: temporary source created`, made.requestStatus.result, made.requestStatus.comment);
+       await vendor('FloatingChat', { visible: false }); await sleep(2500);
+       const a = await capture(probe);
+       await vendor('FloatingChat', { visible: true, capturable: false }); await sleep(2500);
+       const b = await capture(probe);
+       await vendor('FloatingChat', { capturable: true }); await sleep(2500);
+       const c = await capture(probe);
++      const P = (x, y) => pixdiff(x, y, inner.x, inner.y, inner.w, inner.h);
++      if (hideObs) {
++        // Allowing the floating chat must not bring back LiveHime's other
++        // windows, nor ones opened afterwards (here the source's filters
++        // window, which stays open until LiveHime quits).
++        const worst = (img, list) => Math.max(0, ...list.map((r) => windowDiff(img, a, r, win)));
++        const others = ownWindows().filter((r) => r.w > 100 && r.h > 100 && !isChat(r));
++        check(`${tag}: LiveHime's other windows stay hidden while the chat is allowed`, others.length > 0 && worst(c, others) < 8,
++          `${others.length} windows, worst diff ${worst(c, others).toFixed(1)}`);
++        await req('OpenInputFiltersDialog', { inputName: probe }); await sleep(2500);
++        const opened = ownWindows().filter((r) => r.w > 100 && r.h > 100 && !isChat(r) && !others.some((o) => o.id === r.id));
++        const e = await capture(probe);
++        writeFileSync(process.argv[5] + '/hide-allowed.png', c.png); writeFileSync(process.argv[5] + '/hide-opened.png', e.png);
++        console.log('LiveHime windows', JSON.stringify(others), 'opened', JSON.stringify(opened));
++        check(`${tag}: a window opened afterwards stays hidden`, opened.length > 0 && worst(e, opened) < 8,
++          `${opened.length} new windows, diff ${worst(e, opened).toFixed(1)}`);
++      }
+       await vendor('FloatingChat', { capturable: false }); await sleep(2500);
+       const d = await capture(probe);
+-      const P = (x, y) => pixdiff(x, y, inner.x, inner.y, inner.w, inner.h);
+-      console.log(`no-hide capture pixel diff vs closed: notAllowed=${P(b, a).toFixed(1)} allowed=${P(c, a).toFixed(1)} notAllowedAgain=${P(d, a).toFixed(1)}`);
+-      check('no-hide capture: window hidden when not allowed', P(b, a) < 4, P(b, a).toFixed(1));
+-      check('no-hide capture: window shown when allowed', P(c, a) > 10, P(c, a).toFixed(1));
+-      check('no-hide capture: hidden again after toggling back', P(d, a) < 4, P(d, a).toFixed(1));
+-    } catch (e) { check('no-hide capture comparison', false, e.message); }
+-    finally { await req('RemoveInput', { inputName: probe }); }
++      for (const [k, img] of Object.entries({ A_closed: a, B_hidden: b, C_shown: c, D_hidden: d })) saveCrop(`${probe}-${k}`, img);
++      console.log(`${tag} pixel diff vs closed: notAllowed=${P(b, a).toFixed(1)} allowed=${P(c, a).toFixed(1)} notAllowedAgain=${P(d, a).toFixed(1)}`);
++      check(`${tag}: window hidden when not allowed`, P(b, a) < 4, P(b, a).toFixed(1));
++      check(`${tag}: window shown when allowed`, P(c, a) > 10, P(c, a).toFixed(1));
++      check(`${tag}: hidden again after toggling back`, P(d, a) < 4, P(d, a).toFixed(1));
++    };
++    try {
++      if (!inputs.length) throw new Error('no screen capture source in the profile');
++      await runMode(true);
++      await runMode(false);
++    } catch (e) { check('capture comparison', false, e.message); }
++    finally { for (const probe of probes) await req('RemoveInput', { inputName: probe }); }
+     let left = [];
+     for (let i = 0; i < 20; i++) { // removal completes asynchronously
+       left = (await req('GetInputList', { inputKind: 'screen_capture' })).responseData.inputs.map((i) => i.inputName);
+-      if (!left.includes(probe)) break; await sleep(250);
++      if (!probes.some((p) => left.includes(p))) break; await sleep(250);
+     }
+-    check('temporary source removed', !left.includes(probe), left.join(','));
++    check('temporary sources removed', !probes.some((p) => left.includes(p)), left.join(','));
+     s = await vendor('FloatingChat', { visible: false });
+     check('floating chat closes', !s.visible);
+     console.log(fails ? `${fails} failed` : 'all passed'); process.exit(fails ? 1 : 0);
+-- 
+2.54.0 (Apple Git-157)
+

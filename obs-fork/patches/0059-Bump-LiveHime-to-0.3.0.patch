@@ -1,0 +1,95 @@
+From a3085488544bb30cbb48c7d1a122618adf9b1e69 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 20:10:58 +0800
+Subject: [PATCH] Bump LiveHime to 0.3.0
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/build-macos.sh             |  2 +-
+ .../release-notes/RELEASE_NOTES_v0.3.0.md     | 61 +++++++++++++++++++
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+ create mode 100644 plugins/livehime/data/release-notes/RELEASE_NOTES_v0.3.0.md
+
+diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
+index 14eb2f155..06d77d78a 100755
+--- a/build-aux/livehime/build-macos.sh
++++ b/build-aux/livehime/build-macos.sh
+@@ -39,7 +39,7 @@ cmake -S "$source_dir" -B "$build_dir" --preset macos \
+   -DLIVEHIME_APP_BUNDLE_ID="$bundle_id" \
+   -DLIVEHIME_APP_NAME=LiveHime \
+   -DLIVEHIME_APP_DISPLAY_NAME=LiveHime \
+-  -DLIVEHIME_APP_VERSION=0.2.10 \
++  -DLIVEHIME_APP_VERSION=0.3.0 \
+   -DOBS_USER_CONFIG_SUBDIR=LiveHime
+ 
+ if [[ $browser == ON ]]; then
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.3.0.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.3.0.md
+new file mode 100644
+index 000000000..c0ff46ead
+--- /dev/null
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.3.0.md
+@@ -0,0 +1,61 @@
++# LiveHime macOS v0.3.0
++
++测试版（beta）：打开“参与测试版”的用户会在应用里收到；几天内没有问题反馈后转为正式版。
++A beta: offered in the app to those who opted into betas; promoted to stable after a few quiet days.
++
++## 下载哪个文件 / Which file to download
++
++| 文件 / File | 给谁用 / For |
++|---|---|
++| **`LiveHime-v0.3.0-Installer.pkg`** | **不知道选哪个就下载这个。** 所有 Mac，双击后一路“继续”，自动选芯片 / Not sure? This one. Any Mac |
++| `LiveHimeMacApp-v0.3.0-arm64.dmg` | Apple 芯片（M 系列），打开后拖进“应用程序” / Apple silicon, drag to install |
++| `LiveHimeMacApp-v0.3.0-x86_64.dmg` | Intel 芯片，打开后拖进“应用程序” / Intel, drag to install |
++| `LiveHimeMacApp-v0.3.0-*.zip` | 应用内更新用的，不用手动下载 / for the in-app updater |
++| `LiveHime-BrowserAddon-v1.0.0-*.zip`、`addons.json` | 浏览器组件，在应用里安装，不用手动下载 / the browser add-on, installed from inside the app |
++| Source code (zip / tar.gz) | 源代码，**不是软件**，装软件不要下载 / source code, **not the app** |
++
++安装包没有 Apple 的付费开发者签名。双击时如果提示“无法打开”，到 **系统设置 → 隐私与安全性** 点“仍要打开”，
++第一次打开应用时如果被拦也一样。详细步骤见 [README](../README.md#下载与安装--download-and-install)。
++Not signed by Apple: if macOS blocks the installer or the app, click **Open Anyway** in System Settings → Privacy & Security.
++
++## 新功能 / What's new
++
++- **浏览器来源（可选组件）/ Browser source (optional add-on)**：在画面里显示网页，比如弹幕、礼物特效这类网页工具。
++  主程序不变，需要的人在“直播姬”面板 → 更新 → **可选组件** 里一键下载（约 100 MB），装在你的用户目录里；
++  重启 LiveHime 后，在“添加来源”里选“浏览器”。随时可以移除（移到废纸篓）。
++  下载前会核对校验值，并确认组件和应用由同一张证书签名；组件和当前 OBS 版本对不上、或文件被改动过时不会加载。
++  以后更新 LiveHime 时如果换了 OBS 底座，对应的组件会随更新一起下载好。
++  Shows web pages in your scenes, such as danmaku or gift-effect web tools. The app is unchanged; install it from
++  Updates → **Optional add-ons** (about 100 MB, into your user folder), restart, then choose Browser in Add Source.
++  It can be removed at any time (to the Trash). Downloads are checked against their checksum and must be signed by the
++  app's certificate; an add-on that does not match this OBS or was changed is not loaded. When a later update moves to
++  another OBS base, the matching add-on comes with it.
++- **更新说明 / What's new**：更新后第一次打开时，在主窗口正中显示这次更新了什么（最多最近三个版本，内容多时可以滚动）。
++  全新安装不显示。
++  After an update, the first start shows what changed (up to the three newest versions, scrolling when long),
++  centered on the main window. Not shown on a fresh install.
++
++## 升级 / Upgrade
++
++v0.2.8 及以后的版本打开“参与测试版”后会在应用里收到这次更新，也可以手动下载安装包或 DMG 替换。
++没有升级 OBS，不迁移设置，登录和设置都会保留。
++From v0.2.8 on, turn on the beta option to get this in the app, or install the pkg or DMG by hand.
++OBS is not upgraded; no settings migrate; your login and settings are kept.
++
++装了浏览器组件后，即使画面里没有浏览器来源，它也会在后台常驻约 150 MB 内存；不需要时可以移除。
++With the browser add-on installed, it keeps about 150 MB of memory in the background even without a browser
++source; remove it if you do not need it.
++
++## 验证 / Validation
++
++（构建和测试后填写 / filled in after the builds and tests）
++
++## 源码 / Source
++
++基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)：两个架构都对应补丁 0001–0059。
++浏览器组件另外对 `plugins/obs-browser` 子模块打了 [`obs-fork/browser-addon`](../obs-fork/browser-addon/) 里的补丁，
++组件内含的 Chromium Embedded Framework 的许可见 [`ThirdPartyLicenses/CEF`](../ThirdPartyLicenses/CEF/)。
++The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/): patches 0001–0059
++for both architectures. The browser add-on also patches the `plugins/obs-browser` submodule (see
++[`obs-fork/browser-addon`](../obs-fork/browser-addon/)); the license of the Chromium Embedded Framework it contains is
++in [`ThirdPartyLicenses/CEF`](../ThirdPartyLicenses/CEF/).
+-- 
+2.54.0 (Apple Git-157)
+

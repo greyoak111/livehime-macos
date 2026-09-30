@@ -9,6 +9,9 @@ notices are copied here, and the exact source commit is recorded in
 when a distributable app bundle is produced, its complete dependency inventory
 must be generated from the actual bundle before release.
 
+The optional browser source add-on (not the app itself) contains the Chromium
+Embedded Framework; its license and provenance are in `CEF/`.
+
 The architecture diagram in `docs/diagrams/` was generated with
 [Archify](https://github.com/tt-a1i/archify) (MIT, commit `9e35d2b`); its
 license is in `Archify/LICENSE`. The generated HTML also embeds the fonts'
