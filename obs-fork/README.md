@@ -7,7 +7,7 @@ upstream OBS Studio, so the released app can be rebuilt from public sources
 
 - Upstream: https://github.com/obsproject/obs-studio
 - Base: tag `32.2.2`, commit `ba2f32bdf791005443988a4955e963663e16b1ed`
-- Patches: `patches/0001-…` to `patches/0054-…` (`git format-patch --binary`)
+- Patches: `patches/0001-…` to `patches/0055-…` (`git format-patch --binary`)
 
 The plugin lives in `plugins/livehime` after applying: a Qt C++ dock and a
 Swift core (`plugins/livehime/core`, SwiftPM, `swift test`). The series also
@@ -41,3 +41,8 @@ together in one installer package with
 `build-aux/livehime/package-pkg.sh <arm64 app> <x86_64 app> <version> <out.pkg>`. The build script signs with
 a local self-signed development identity it creates on first use; `SIGN=0`
 skips signing.
+
+The optional browser add-on is built from the same settings with the browser
+turned on: apply `browser-addon/0001-…` inside `plugins/obs-browser` (see
+`browser-addon/README.md`), then
+`build-aux/livehime/package-browser-addon.sh <arm64|x86_64> <add-on version> <out dir>`.

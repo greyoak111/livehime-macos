@@ -1,0 +1,225 @@
+From a632c943c7109dc486baea2f49f77b5a14144853 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 18:55:05 +0800
+Subject: [PATCH] Package the browser source as an optional add-on
+
+build-macos.sh gains BROWSER_ADDON=1, which builds only obs-browser and
+its four helper apps with the same settings plus the browser, into a
+build directory of its own. package-browser-addon.sh turns that into
+LiveHime-BrowserAddon-v<version>-<arch>.zip: the plugin with CEF and the
+helpers in its own Frameworks, only English and Chinese CEF locales,
+stripped, a manifest naming the OBS base, signed with the app's local
+certificate. addons-manifest.py writes addons.json for a release.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/addons-manifest.py       | 59 +++++++++++++++
+ build-aux/livehime/build-macos.sh           | 19 ++++-
+ build-aux/livehime/package-browser-addon.sh | 82 +++++++++++++++++++++
+ 3 files changed, 159 insertions(+), 1 deletion(-)
+ create mode 100755 build-aux/livehime/addons-manifest.py
+ create mode 100755 build-aux/livehime/package-browser-addon.sh
+
+diff --git a/build-aux/livehime/addons-manifest.py b/build-aux/livehime/addons-manifest.py
+new file mode 100755
+index 000000000..415561ac1
+--- /dev/null
++++ b/build-aux/livehime/addons-manifest.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""Writes addons.json, the list of optional add-ons a LiveHime release offers.
++
++The in-app updater reads it from the release to learn which add-on version fits
++the new app (by OBS base), where to download it and what its SHA-256 is. An
++add-on is only rebuilt when the OBS base changes, so a release without new
++add-on zips publishes the previous release's addons.json unchanged; its URLs
++keep pointing at the release that first carried the zips.
++
++Usage: addons-manifest.py <release tag> <out addons.json> <add-on zip>...
++"""
++import hashlib
++import json
++import os
++import re
++import sys
++import zipfile
++
++REPO = "greyoak111/livehime-macos"
++NAME = re.compile(r"^LiveHime-BrowserAddon-v(\d+\.\d+\.\d+)-(arm64|x86_64)\.zip$")
++
++
++def fail(message):
++    sys.exit(f"addons-manifest: {message}")
++
++
++def main():
++    if len(sys.argv) < 4:
++        fail(__doc__.strip().splitlines()[-1])
++    tag, out, zips = sys.argv[1], sys.argv[2], sys.argv[3:]
++    addons = {}
++    for path in zips:
++        name = os.path.basename(path)
++        if not NAME.match(name):
++            fail(f"{name} is not LiveHime-BrowserAddon-v<version>-<arch>.zip")
++        with zipfile.ZipFile(path) as z:
++            manifest = json.loads(z.read("obs-browser.plugin/Contents/Resources/addon.json"))
++        with open(path, "rb") as f:
++            digest = hashlib.sha256(f.read()).hexdigest()
++        entry = addons.setdefault(manifest["id"], {k: manifest[k] for k in ("id", "version", "obs", "cef")})
++        for key in ("version", "obs", "cef"):
++            if entry[key] != manifest[key]:
++                fail(f"{name} has {key} {manifest[key]}, the other zips have {entry[key]}")
++        if manifest["arch"] in entry.setdefault("assets", {}):
++            fail(f"two zips for {manifest['arch']}")
++        entry["assets"][manifest["arch"]] = {
++            "name": name,
++            "url": f"https://github.com/{REPO}/releases/download/{tag}/{name}",
++            "size": os.path.getsize(path),
++            "sha256": digest,
++        }
++    with open(out, "w") as f:
++        json.dump({"schema": 1, "addons": list(addons.values())}, f, indent=2)
++        f.write("\n")
++    print(out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
+index 7ff971a2d..14eb2f155 100755
+--- a/build-aux/livehime/build-macos.sh
++++ b/build-aux/livehime/build-macos.sh
+@@ -4,6 +4,10 @@
+ # Apple silicon from the universal obs-deps, into its own build directory).
+ # Output: build_macos/frontend/${CONFIG}/LiveHime.app
+ #         build_macos_x86_64/frontend/${CONFIG}/LiveHime.app for ARCH=x86_64
++# BROWSER_ADDON=1 builds only obs-browser and its helper apps, with the same
++# settings plus the browser, into build_macos_browser (build_macos_x86_64_browser)
++# and prints plugins/obs-browser/${CONFIG} there; package-browser-addon.sh
++# turns that into the optional browser add-on.
+ set -euo pipefail
+ 
+ source_dir=${0:A:h:h:h}
+@@ -19,10 +23,15 @@ case $arch in
+   x86_64) build_dir="$source_dir/build_macos_x86_64" ;;
+   *) print -u2 -- "ARCH must be arm64 or x86_64"; exit 1 ;;
+ esac
++browser=OFF
++if [[ "${BROWSER_ADDON:-0}" == "1" ]]; then
++  build_dir="${build_dir}_browser"
++  browser=ON
++fi
+ 
+ cmake -S "$source_dir" -B "$build_dir" --preset macos \
+   -DCMAKE_OSX_ARCHITECTURES="$arch" \
+-  -DENABLE_BROWSER=OFF \
++  -DENABLE_BROWSER=$browser \
+   -DOBS_VERSION_OVERRIDE=32.2.2 \
+   -DOBS_CODESIGN_IDENTITY=- \
+   -DSPARKLE_APPCAST_URL= -DSPARKLE_PUBLIC_KEY= \
+@@ -33,6 +42,14 @@ cmake -S "$source_dir" -B "$build_dir" --preset macos \
+   -DLIVEHIME_APP_VERSION=0.2.10 \
+   -DOBS_USER_CONFIG_SUBDIR=LiveHime
+ 
++if [[ $browser == ON ]]; then
++  for target in obs-browser browser-helper browser-helper_gpu browser-helper_plugin browser-helper_renderer; do
++    cmake --build "$build_dir" --config "$config" --target "$target" -- -quiet
++  done
++  print -- "$build_dir/plugins/obs-browser/$config"
++  exit 0
++fi
++
+ cmake --build "$build_dir" --config "$config" --target obs-studio -- -quiet
+ app="$build_dir/frontend/$config/LiveHime.app"
+ 
+diff --git a/build-aux/livehime/package-browser-addon.sh b/build-aux/livehime/package-browser-addon.sh
+new file mode 100755
+index 000000000..570c19fe5
+--- /dev/null
++++ b/build-aux/livehime/package-browser-addon.sh
+@@ -0,0 +1,82 @@
++#!/bin/zsh
++# Builds and packages the optional browser add-on for one architecture: an
++# obs-browser.plugin that carries CEF and the four OBS Helper apps in its own
++# Contents/Frameworks, installed by LiveHime into
++# ~/Library/Application Support/LiveHime/obs-studio/plugins.
++# - obs-browser must carry obs-fork/browser-addon/0001 (it makes the plugin
++#   load CEF from its own bundle); the build stops otherwise.
++# - The add-on follows the OBS base, not LiveHime: its manifest
++#   (Contents/Resources/addon.json) names the OBS major.minor it was built
++#   against, and LiveHime loads it only on that OBS.
++# - Only English and Chinese CEF locales are kept (the patch falls back to
++#   English for other interface languages).
++# - Signed with the same local certificate as the app.
++# CEF must already be in .deps (the OBS configure step fetches it; ask the
++# maintainer before downloading: about 90 MB for arm64, 100 MB for x86_64).
++# Usage: package-browser-addon.sh <arm64|x86_64> <add-on version> <out dir>
++# Output: <out dir>/LiveHime-BrowserAddon-v<version>-<arch>.zip
++set -euo pipefail
++
++arch=$1 version=$2 out=${3:A}
++here=${0:A:h}
++source_dir=${here:h:h}
++config=${CONFIG:-RelWithDebInfo}
++keep_locales=(en zh_CN zh_TW)
++fail() { print -u2 -- "package-browser-addon: $*"; exit 1; }
++
++[[ $arch == arm64 || $arch == x86_64 ]] || fail "architecture must be arm64 or x86_64"
++[[ $version =~ '^[0-9]+\.[0-9]+\.[0-9]+$' ]] || fail "version must look like 1.0.0"
++grep -q "Loading CEF from the plugin bundle" "$source_dir/plugins/obs-browser/obs-browser-plugin.cpp" ||
++  fail "obs-browser lacks obs-fork/browser-addon/0001; apply it inside plugins/obs-browser first"
++cef_dirs=("$source_dir"/.deps/cef_binary_*_macos_${arch}(N/))
++(( ${#cef_dirs} == 1 )) || fail "expected exactly one CEF for $arch in .deps, found ${#cef_dirs}"
++cef_framework="${cef_dirs[1]}/Release/Chromium Embedded Framework.framework"
++cef_build=${${cef_dirs[1]:t}#cef_binary_}; cef_build=${cef_build%%_*}
++
++built=$(BROWSER_ADDON=1 ARCH=$arch CONFIG=$config "$here/build-macos.sh" | tail -1)
++[[ -d "$built/obs-browser.plugin" ]] || fail "build did not produce $built/obs-browser.plugin"
++
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++plugin="$work/obs-browser.plugin"
++ditto "$built/obs-browser.plugin" "$plugin"
++frameworks="$plugin/Contents/Frameworks"
++mkdir -p "$frameworks"
++ditto "$cef_framework" "$frameworks/Chromium Embedded Framework.framework"
++for helper in "OBS Helper" "OBS Helper (GPU)" "OBS Helper (Plugin)" "OBS Helper (Renderer)"; do
++  ditto "$built/$helper.app" "$frameworks/$helper.app"
++done
++
++for lproj in "$frameworks/Chromium Embedded Framework.framework/Resources/"*.lproj(N/); do
++  (( ${keep_locales[(Ie)${lproj:t:r}]} )) || rm -rf "$lproj"
++done
++
++# strip warns that it invalidates the signatures; the bundle is re-signed below.
++strip -S -x "$plugin/Contents/MacOS/obs-browser" 2>/dev/null
++for helper in "$frameworks"/OBS\ Helper*.app; do
++  strip -S -x "$helper/Contents/MacOS/${helper:t:r}" 2>/dev/null
++done
++
++libobs_plist="${built:h:h:h}/libobs/$config/libobs.framework/Resources/Info.plist"
++[[ -f $libobs_plist ]] || fail "cannot find the libobs this build used"
++obs_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$libobs_plist")
++obs_minor=${(j:.:)${(s:.:)obs_version}[1,2]}
++cat > "$plugin/Contents/Resources/addon.json" <<JSON
++{
++  "id": "browser-source",
++  "version": "$version",
++  "obs": "$obs_minor",
++  "arch": "$arch",
++  "cef": "$cef_build"
++}
++JSON
++
++python3 "$here/local-signing.py" --deep --sign "$plugin" >/dev/null
++codesign --verify --deep --strict "$plugin" || fail "signature does not verify"
++
++mkdir -p "$out"
++zip="$out/LiveHime-BrowserAddon-v$version-$arch.zip"
++rm -f "$zip"
++ditto -c -k --keepParent "$plugin" "$zip"
++print -- "$zip"
++print -- "  OBS $obs_minor · CEF $cef_build · $(( $(stat -f %z "$zip") / 1048576 )) MB · sha256 $(shasum -a 256 "$zip" | cut -d' ' -f1)"
+-- 
+2.54.0 (Apple Git-157)
+

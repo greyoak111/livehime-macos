@@ -56,6 +56,33 @@ pkgbuild 会打印几行 `write: Permission denied`：它想复制系统保护�
 The pkg is unsigned (that needs a Developer ID Installer certificate), so Gatekeeper blocks the first open;
 README and release notes must keep explaining Open Anyway.
 
+### 浏览器组件 / Browser add-on
+
+从浏览器组件正式上线起执行（计划见 [BROWSER_ADDON_PLAN.md](BROWSER_ADDON_PLAN.md)，应用内管理完成之前不发布组件）。
+Applies once the browser add-on ships (see the plan; it is not published before in-app management is done).
+
+组件跟 **OBS 底座**走，不跟 LiveHime 走：/ The add-on follows the **OBS base**, not LiveHime:
+- **OBS 底座变了**（或组件本身有修复）：重新构建两个架构的组件，版本号递增，附件里放新的两个 zip 和新生成的 `addons.json`。
+  **OBS base changed** (or the add-on has a fix): rebuild both architectures, bump its version, attach the two zips and a fresh `addons.json`.
+- **OBS 底座没变**：不重建组件，把上一个版本的 `addons.json` 原样附上；里面的下载地址继续指向第一次发布那两个 zip 的 Release。
+  **OBS base unchanged**: no rebuild; attach the previous release's `addons.json` unchanged. Its URLs keep pointing at the release that first carried the zips.
+
+```sh
+# obs-browser 子模块要先打上 obs-fork/browser-addon/0001（见该目录的 README）
+# The obs-browser submodule must carry obs-fork/browser-addon/0001 (see that folder's README)
+v=<版本>; a=<组件版本>
+obs-studio-clean/build-aux/livehime/package-browser-addon.sh arm64  $a dist/v$v
+obs-studio-clean/build-aux/livehime/package-browser-addon.sh x86_64 $a dist/v$v
+scripts/verify-browser-addon.sh dist/v$v/LiveHime-BrowserAddon-v$a-arm64.zip  $w/arm64/LiveHimeMacApp.app
+scripts/verify-browser-addon.sh dist/v$v/LiveHime-BrowserAddon-v$a-x86_64.zip $w/x86_64/LiveHimeMacApp.app
+obs-studio-clean/build-aux/livehime/addons-manifest.py v$v dist/v$v/addons.json dist/v$v/LiveHime-BrowserAddon-v$a-*.zip
+```
+
+`$w` 是上面打 pkg 时解出来的两个 app：组件要对着**要发布的那个 app** 检查（OBS 底座、签名证书）。
+CEF 放在 `obs-studio-clean/.deps`（arm64 约 90 MB，x86_64 约 100 MB），下载前征得维护者同意。
+`$w` holds the two apps unpacked for the pkg: the add-on is checked against **the app being released** (OBS base, certificate).
+CEF lives in `obs-studio-clean/.deps` (about 90 MB for arm64, 100 MB for x86_64); ask the maintainer before downloading.
+
 ## 什么时候发、走哪个通道 / What goes where
 
 | 类型 / Kind | 通道 / Channel | 转正式版 / Promote to stable |
@@ -92,6 +119,9 @@ README and release notes must keep explaining Open Anyway.
    更新用的 zip、Source code 不是软件），照 [v0.2.10 的发布说明](RELEASE_NOTES_v0.2.10.md) 的格式。
    Release notes say what changed, whether OBS was upgraded and whether settings migrate, and **open with
    the “which file to download” table**, as in the v0.2.10 notes.
+8. （组件上线后）`scripts/verify-browser-addon.sh` 两个架构全部 PASS；`addons.json` 已附上，且其中组件的
+   `obs` 与这次发布的 OBS 底座一致。/ (Once the add-on ships) the add-on check passes for both architectures,
+   and `addons.json` is attached with an `obs` that matches this release's OBS base.
 
 ## 出问题时 / When a release is bad
 

@@ -1,8 +1,16 @@
 diff --git a/obs-browser-plugin.cpp b/obs-browser-plugin.cpp
-index 95a168c..3c34978 100644
+index 95a168c..a100d56 100644
 --- a/obs-browser-plugin.cpp
 +++ b/obs-browser-plugin.cpp
-@@ -79,6 +79,26 @@ static std::wstring deviceId;
+@@ -23,6 +23,7 @@
+ #include <util/dstr.hpp>
+ #include <obs-module.h>
+ #include <obs.hpp>
++#include <algorithm>
+ #include <functional>
+ #include <sstream>
+ #include <thread>
+@@ -79,6 +80,26 @@ static std::wstring deviceId;
  
  bool hwaccel = false;
  
@@ -29,7 +37,7 @@ index 95a168c..3c34978 100644
  /* ========================================================================= */
  
  #ifdef ENABLE_BROWSER_QT_LOOP
-@@ -345,6 +365,21 @@ static void BrowserInit(void)
+@@ -345,6 +366,31 @@ static void BrowserInit(void)
  	char *abs_path = os_get_abs_path_ptr(path.c_str());
  	CefString(&settings.browser_subprocess_path) = abs_path;
  	bfree(abs_path);
@@ -47,11 +55,21 @@ index 95a168c..3c34978 100644
 +		CefString(&settings.framework_dir_path) = own_framework;
 +		CefString(&settings.browser_subprocess_path) = OwnFrameworksDir() +
 +							       "/OBS Helper.app/Contents/MacOS/OBS Helper";
++
++		/* The add-on ships only some of CEF's locales; use English when
++		 * the interface language is not among them. */
++		std::string lproj = obs_get_locale();
++		std::replace(lproj.begin(), lproj.end(), '-', '_');
++		std::string language = lproj.substr(0, lproj.find('_'));
++		std::string resources = own_framework + "/Resources/";
++		if (!os_file_exists((resources + lproj + ".lproj").c_str()) &&
++		    !os_file_exists((resources + language + ".lproj").c_str()))
++			CefString(&settings.locale) = "en-US";
 +	}
  #endif
  
  	bool tex_sharing_avail = false;
-@@ -733,8 +768,14 @@ bool obs_module_load(void)
+@@ -733,8 +779,14 @@ bool obs_module_load(void)
  #if defined(__APPLE__) && !defined(ENABLE_BROWSER_LEGACY)
  	/* Load CEF at runtime as required on macOS */
  	CefScopedLibraryLoader library_loader;
@@ -67,7 +85,7 @@ index 95a168c..3c34978 100644
  #endif
  #endif
  	blog(LOG_INFO, "[obs-browser]: Version %s", OBS_BROWSER_VERSION_STRING);
-@@ -758,6 +799,15 @@ bool obs_module_load(void)
+@@ -758,6 +810,15 @@ bool obs_module_load(void)
  
  void obs_module_post_load(void)
  {

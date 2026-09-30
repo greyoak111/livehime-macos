@@ -16,7 +16,9 @@ contains `Contents/Frameworks/Chromium Embedded Framework.framework`, it
    next to the framework) and `main_bundle_path` (the app, so child processes
    find the browser process);
 3. starts CEF in `obs_module_post_load`, on the main thread, because LiveHime's
-   frontend is built without the browser and never starts it.
+   frontend is built without the browser and never starts it;
+4. uses English when the interface language is not among the CEF locales the
+   add-on keeps (en, zh_CN, zh_TW).
 
-Without such a bundle, behavior is unchanged. Verified in P0 (2026-09-30); see
+Without such a bundle, behavior is unchanged. Verified in P0 and P1 (2026-09-30); see
 `docs/BROWSER_ADDON_PLAN.md`.

@@ -1,7 +1,7 @@
 # 浏览器来源可选组件 + 更新说明弹窗：计划书 / Browser source add-on + What's New dialog: plan
 
-2026-09-29 起草，2026-09-30 修订（组件改为独立版本、两阶段更新、状态机；新增更新说明弹窗）。组件 P0 已完成（可行），P1 起未开工。
-Drafted 2026-09-29, revised 2026-09-30. Add-on P0 done (feasible); P1 onward not started.
+2026-09-29 起草，2026-09-30 修订（组件改为独立版本、两阶段更新、状态机；新增更新说明弹窗）。组件 P0（可行性）、P1（打包）已完成，P2 起未开工。
+Drafted 2026-09-29, revised 2026-09-30. Add-on P0 (feasibility) and P1 (packaging) done; P2 onward not started.
 
 第一部分是浏览器来源组件，第二部分是更新说明弹窗。两者互相独立，可以分开做；弹窗更小，适合先做。
 Part 1 is the browser add-on, part 2 the What's New dialog. They are independent; the dialog is smaller and can come first.
@@ -155,14 +155,32 @@ Tested on the released v0.2.10 (arm64): the add-on works, renders pages into the
 
 **P0 留下的问题，放进 P2 / Open items for P2**
 - 目前装了组件就会在启动时拉起 CEF，常驻约 150 MB。更好的做法是：**只在确实有浏览器来源时才启动**，并且保证在主线程上启动（从其他线程创建来源时，切到主线程初始化）。
-- P1 打包时剥离调试符号，重新测量下载大小。
+- ~~P1 打包时剥离调试符号，重新测量下载大小。~~ 已在 P1 完成，见下。
+
+## P1 结果（2026-09-30）/ P1 results
+
+| 文件 | 作用 |
+|---|---|
+| `obs-studio-clean/build-aux/livehime/build-macos.sh` | 新增 `BROWSER_ADDON=1`：同一套构建参数，只把浏览器打开，编进 `build_macos_browser`（Intel 为 `build_macos_x86_64_browser`），只编 obs-browser 和四个 Helper。参数只有一处，不会和正式构建走样 |
+| `obs-studio-clean/build-aux/livehime/package-browser-addon.sh <arch> <组件版本> <输出目录>` | 构建 → 组装（CEF + 四个 Helper 放进插件的 `Contents/Frameworks`）→ 只留 en / zh_CN / zh_TW 三个 CEF 语言包 → 剥离符号 → 写 `addon.json` → 本地证书签名 → `LiveHime-BrowserAddon-v<版本>-<arch>.zip`。obs-browser 没打补丁时直接报错停下 |
+| `obs-studio-clean/build-aux/livehime/addons-manifest.py <tag> <out> <zip>…` | 生成 Release 附件 `addons.json`：组件版本、OBS 底座、CEF、各架构的下载地址、大小、SHA-256 |
+| `scripts/verify-browser-addon.sh <zip> <app>` | 25 项检查：文件名与清单一致、OBS 底座与要发布的 app 一致、所有二进制的架构、CEF 和四个 Helper 齐全、从自己的包加载 CEF、用 app 的 libobs、没有指向构建目录的路径、只剩三个语言包、签名有效且与 app 同一证书 |
+| `obs-fork/browser-addon/0001-…patch` | 增加语言回退：界面语言不在三个语言包里时，CEF 用英文（Chromium 找不到语言包可能直接中止） |
+| `docs/RELEASING.md` | “打包”一节加上组件：OBS 底座变了才重建，否则原样沿用上一版的 `addons.json`；发布关卡第 8 条 |
+
+实测 / Measured:
+- 组件 zip **98.4 MB**（P0 时 108.4 MB；去掉 52 个 CEF 语言包省了 10 MB），解包 222 MB。CEF 主程序本身 183 MB，已是剥离过的发行版，无法再小。
+- 检查脚本：arm64 组件对已发布的 v0.2.10 全部 PASS；故意改错版本号、拿错 app 时相应检查 FAIL。
+- 端到端：把打好的 zip 解进插件目录，在 v0.2.10 上分别用 en-US、de-DE（没带的语言，走英文回退）、zh-CN 三种界面语言各启动一次，
+  浏览器来源都能渲染（像素精确），退出干净，无崩溃报告。测试后设置按备份恢复，逐文件比对一致，组件已移到废纸篓。
+- 尚未做：x86_64 组件（需要先征得同意下载约 100 MB 的 Intel 版 CEF，放到 P3）。
 
 ## 分阶段 / Phases
 
 | 阶段 | 内容 | 完成标准 |
 |---|---|---|
 | **P0 可行性** ✅ 2026-09-30 | 下载 CEF（arm64，88.5 MB，按 SHA-256 核对）；单独目录编出 obs-browser；手动放进插件目录；测试实例里加浏览器来源打开网页 | 网页能显示在画面里；记下组件大小、每个来源的内存占用；确认插件目录路径和需要的补丁 |
-| P1 打包 | `package-browser-addon.sh`、签名、`addon.json`、`addons.json`、`verify-browser-addon.sh`，写进发布流程 | 检查脚本全部通过，解包后签名有效 |
+| **P1 打包** ✅ 2026-09-30（arm64） | `package-browser-addon.sh`、签名、`addon.json`、`addons.json`、`verify-browser-addon.sh`，写进发布流程 | 检查脚本全部通过，解包后签名有效 |
 | P2 应用内管理 | 启动前的“待生效/待移除”处理（OBS 分支补丁）；Swift 核心的下载/校验/备料；Qt “可选组件”界面；与应用更新合并的两阶段流程 | 端到端测试覆盖：安装、重启后可用、移除、组件下载失败时主体不受影响、OBS 版本不符时不加载、损坏时不加载 |
 | P3 发布 | Intel 构建（98.7 MB 的 CEF）、README 与发布说明，按发布规则先作为测试版发 v0.3.0 | 测试版无问题反馈后转正式版 |
 
