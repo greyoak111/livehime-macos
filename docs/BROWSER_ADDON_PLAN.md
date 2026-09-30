@@ -1,7 +1,7 @@
 # 浏览器来源可选组件 + 更新说明弹窗：计划书 / Browser source add-on + What's New dialog: plan
 
-2026-09-29 起草，2026-09-30 修订（组件改为独立版本、两阶段更新、状态机；新增更新说明弹窗）。尚未开工。
-Drafted 2026-09-29, revised 2026-09-30 (add-on versioned on its own, two-phase updates, states; What's New dialog added). Not started.
+2026-09-29 起草，2026-09-30 修订（组件改为独立版本、两阶段更新、状态机；新增更新说明弹窗）。组件 P0 已完成（可行），P1 起未开工。
+Drafted 2026-09-29, revised 2026-09-30. Add-on P0 done (feasible); P1 onward not started.
 
 第一部分是浏览器来源组件，第二部分是更新说明弹窗。两者互相独立，可以分开做；弹窗更小，适合先做。
 Part 1 is the browser add-on, part 2 the What's New dialog. They are independent; the dialog is smaller and can come first.
@@ -124,11 +124,44 @@ Only the Installed state is loaded; in every other state the app works as it doe
 - 组件只在 OBS 底座变化时重新发布；其余版本的 Release 里，`addons.json` 继续指向上一版组件的附件（跨 Release 引用）。
 - 发布流程（`docs/RELEASING.md`）加 `verify-browser-addon.sh`，与 pkg 的检查同样处理。
 
+## P0 结果（2026-09-30，可行）/ P0 results (feasible)
+
+在已发布的 v0.2.10（arm64）上实测，**组件方案可行**：浏览器来源能创建、能渲染网页进画面，退出干净、无崩溃。
+Tested on the released v0.2.10 (arm64): the add-on works, renders pages into the canvas, and quits cleanly.
+
+**做法 / How**
+- 单独的构建目录 `build_macos_browser`（与正式构建相同的参数，只把 `ENABLE_BROWSER` 设为 ON），只编 `obs-browser` 和四个 `OBS Helper` 目标。
+- 组件包 = 编出的 `obs-browser.plugin`，在其 `Contents/Frameworks/` 里放入 CEF 框架和四个 Helper，用本地开发证书签名，`codesign --verify --deep --strict` 通过。
+- 组件链接的 libobs、Qt、obs-frontend-api 都通过 `@executable_path/../Frameworks` 解析到应用自己的，无需携带。
+
+**需要的补丁（都在 obs-browser 子模块里，见 `obs-fork/browser-addon/0001-…patch`）/ Patches needed**
+1. 组件自带 CEF 时，从组件包加载 CEF（`cef_load_library`），不走 `LoadInMain`。
+2. 设置 `framework_dir_path`、`browser_subprocess_path`（组件包里的 `OBS Helper`），以及 **`main_bundle_path` = 应用本身**。
+   不设最后这一项，子进程会把组件包当成主包，找不到浏览器进程，启动即退出（实测：页面全黑，Helper 反复重启）。
+3. **在 `obs_module_post_load` 里、主线程上启动 CEF**。原版 OBS 由前端在启动时初始化 CEF；我们的前端不带浏览器，
+   第一次初始化会落到创建来源的线程（例如 obs-websocket 的线程），macOS 上的 CEF 在那里无法启动，退出时还会崩溃（实测）。
+- 没有自带 CEF 的组件包时，行为与原版完全一致。
+
+**实测数字 / Measurements**
+
+| 项 | 值 |
+|---|---|
+| 插件目录 | `~/Library/Application Support/LiveHime/obs-studio/plugins/obs-browser.plugin`（已确认） |
+| 组件解包大小 | 262 MB |
+| 组件 zip（`ditto -c -k`） | 108.4 MB（RelWithDebInfo，未剥离符号；P1 剥离后应更小） |
+| 装了组件、没有浏览器来源时 | GPU Helper 约 80 MB + 网络 Helper 约 73 MB，常驻 |
+| 一个浏览器来源时 | 另加两个 Renderer（约 84 MB、106 MB）和一个 Helper（约 70 MB），Helper 合计约 430 MB |
+| 渲染 | 纯色页像素精确（`rgb(255, 0, 170)`）；`https://example.com` 正常显示 |
+
+**P0 留下的问题，放进 P2 / Open items for P2**
+- 目前装了组件就会在启动时拉起 CEF，常驻约 150 MB。更好的做法是：**只在确实有浏览器来源时才启动**，并且保证在主线程上启动（从其他线程创建来源时，切到主线程初始化）。
+- P1 打包时剥离调试符号，重新测量下载大小。
+
 ## 分阶段 / Phases
 
 | 阶段 | 内容 | 完成标准 |
 |---|---|---|
-| **P0 可行性** | 下载 CEF（arm64，88.5 MB，按 SHA-256 核对）；单独目录编出 obs-browser；手动放进插件目录；测试实例里加浏览器来源打开网页 | 网页能显示在画面里；记下组件大小、每个来源的内存占用；确认插件目录路径和需要的补丁 |
+| **P0 可行性** ✅ 2026-09-30 | 下载 CEF（arm64，88.5 MB，按 SHA-256 核对）；单独目录编出 obs-browser；手动放进插件目录；测试实例里加浏览器来源打开网页 | 网页能显示在画面里；记下组件大小、每个来源的内存占用；确认插件目录路径和需要的补丁 |
 | P1 打包 | `package-browser-addon.sh`、签名、`addon.json`、`addons.json`、`verify-browser-addon.sh`，写进发布流程 | 检查脚本全部通过，解包后签名有效 |
 | P2 应用内管理 | 启动前的“待生效/待移除”处理（OBS 分支补丁）；Swift 核心的下载/校验/备料；Qt “可选组件”界面；与应用更新合并的两阶段流程 | 端到端测试覆盖：安装、重启后可用、移除、组件下载失败时主体不受影响、OBS 版本不符时不加载、损坏时不加载 |
 | P3 发布 | Intel 构建（98.7 MB 的 CEF）、README 与发布说明，按发布规则先作为测试版发 v0.3.0 | 测试版无问题反馈后转正式版 |
