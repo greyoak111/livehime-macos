@@ -56,7 +56,8 @@ v0.2.0 把应用整个换成了带直播姬面板的 OBS，但保留了同一个
 `~/Library/WebKit` 或 `~/Library/Application Support`。这些位置保存了登录会话、网页状态和
 OBS 用户配置。升级脚本只移动目标 App 本身，成功后临时回滚副本会被清理，不会触碰这些数据。
 
-熟悉终端的用户可以运行仓库内的安全替换脚本：
+熟悉终端的用户可以运行 v0.1.x 的安全替换脚本（已从主分支移除，在标签
+[`v0.1.2`](https://github.com/greyoak111/livehime-macos/tree/v0.1.2) 里）：
 
 ```sh
 macos-livehime-adapter/scripts/install-release-app.sh \

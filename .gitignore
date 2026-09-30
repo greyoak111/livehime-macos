@@ -33,14 +33,14 @@ obs-studio/.deps/
 captures/
 private/
 
-# Keep source checkouts from being absorbed into the release repository.
+# Keep source checkouts from being absorbed into the release repository
+# (the fork itself is published as obs-fork/patches).
 /biliobs/
 /obs-studio/
+/obs-studio-clean/
 
-# Local research notes and downloaded version metadata
-/PORTING_NOTES.md
-/Livehime-Win-beta-8.6.0.11050-api.json
-/tools/
+# Private research: analysis of the Windows client, early notes and tools
+/research/
 
 # Compatibility lab generated caches and reports
 __pycache__/

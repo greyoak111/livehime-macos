@@ -101,7 +101,8 @@ pkg 和 DMG 装的是同一个软件，用哪个都行，后装的会替换先�
 构建步骤见 [`obs-fork/README.md`](obs-fork/README.md)。直播姬插件的 Swift 核心可以单独测试：
 在打过补丁的源码里进入 `plugins/livehime/core` 运行 `swift test`。
 
-`macos-livehime-adapter/` 是 v0.1.x 的旧实现（原生外壳 + 内置 OBS），仅作参考保留。
+v0.1.x 的旧实现（原生外壳 + 内置 OBS、兼容性实验室）已从主分支移除，需要时见标签
+[`v0.1.2`](https://github.com/greyoak111/livehime-macos/tree/v0.1.2)。
 
 ## 特别鸣谢 / Special thanks
 
