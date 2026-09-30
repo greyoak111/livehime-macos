@@ -1,0 +1,1811 @@
+From c9c219d9adf18be42fce1029e7263235dcdd4621 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 19:26:22 +0800
+Subject: [PATCH] Manage the browser add-on from the Updates tab
+
+The Updates tab gains an Optional add-ons section for the browser
+source: download and install, update, remove, undo, and restart to
+apply. Changes are staged under addons-pending and applied by the
+frontend on the next start, before any module loads; the frontend then
+loads the add-on only when its manifest names this OBS base and
+architecture and it is signed by the app's certificate, and otherwise
+adds obs-browser to the disabled modules.
+
+The Swift core finds the add-on in the running version's addons.json
+(checked against the release digest), downloads it, checks its SHA-256,
+manifest and signature, and stages it. When an app update moves to
+another OBS base, the matching add-on is staged with it before the
+update is ready; if that fails, the update still goes ahead and says so.
+
+Tested by unit tests and two end-to-end tests (e2e-addon.mjs and
+e2e-addon-update.mjs).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  33 +++
+ build-aux/livehime/tests/e2e-addon-update.mjs | 146 ++++++++++
+ build-aux/livehime/tests/e2e-addon.mjs        | 202 +++++++++++++
+ frontend/cmake/os-macos.cmake                 |   1 +
+ frontend/utility/platform-osx.mm              | 100 +++++++
+ frontend/utility/platform.hpp                 |   3 +
+ frontend/widgets/OBSBasic.cpp                 |   3 +
+ plugins/livehime/CMakeLists.txt               |   2 +
+ .../Sources/LiveHimeCore/AddonBridge.swift    | 145 +++++++++
+ .../Sources/LiveHimeCore/AddonManager.swift   | 274 ++++++++++++++++++
+ .../LiveHimeCore/AppUpdateBridge.swift        |  46 +++
+ .../Sources/LiveHimeCore/AppUpdater.swift     |  21 +-
+ .../LiveHimeCoreTests/AddonManagerTests.swift | 116 ++++++++
+ plugins/livehime/core/include/livehime-core.h |  16 +
+ plugins/livehime/data/locale/en-US.ini        |  28 ++
+ plugins/livehime/data/locale/zh-CN.ini        |  28 ++
+ plugins/livehime/src/automation.cpp           |  39 ++-
+ plugins/livehime/src/feature-panel.cpp        |   4 +
+ plugins/livehime/src/update-page.cpp          | 184 +++++++++++-
+ plugins/livehime/src/update-page.hpp          |  36 +++
+ 20 files changed, 1419 insertions(+), 8 deletions(-)
+ create mode 100644 build-aux/livehime/tests/e2e-addon-update.mjs
+ create mode 100644 build-aux/livehime/tests/e2e-addon.mjs
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/AddonBridge.swift
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/AddonManager.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/AddonManagerTests.swift
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 09c01dd28..25c3b7abc 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -108,6 +108,39 @@ node e2e-update.mjs <websocket password> build_macos/frontend/RelWithDebInfo/Liv
+ The `Snapshot` vendor request renders the dock (optionally a tab) to a PNG,
+ for checking layouts without screen recording permission.
+ 
++## Browser add-on
++
++Needs a browser add-on zip signed like the build
++(`build-aux/livehime/package-browser-addon.sh arm64 1.0.0 <dir>`).
++
++`e2e-addon.mjs` drives the Updates tab's "Optional add-ons" through the
++`Addon` vendor request, against a local add-on list (`LIVEHIME_ADDONS_FEED`;
++write one with `addons-manifest.py` and point its `url` at the zip with
++`file://`). It launches and quits LiveHime itself and checks: not installed
++and offered; install stages it until a restart, undo drops it; "Restart
++LiveHime" reopens the app with the add-on installed and a browser source
++rendering a page; an add-on whose manifest names another OBS base is kept
++but not loaded (update needed), and so is one whose files changed after
++signing (damaged); remove stages the removal, and after a restart the add-on
++is in the Trash and the browser source is gone.
++
++`e2e-addon-update.mjs` installs the zip, offers 9.9.9 "on OBS 33.0" with an
++addons.json listing the add-on rebuilt for OBS 33.0, and checks that
++downloading the update also stages that add-on; then, with the add-on zip
++gone, that the update stays ready, reports the problem and stages nothing.
++Quitting installs 9.9.9 into the work copy.
++
++Both share LiveHime's settings folder: back up `basic`, `plugin_config`,
++`plugin_manager`, `user.ini` and `global.ini` first and put them back after;
++move `obs-studio/plugins`, `obs-studio/addons-pending`, the backups the update
++test prints and `~/Library/Caches/local.livehime.macos.dev/Updates` to the
++Trash.
++
++```bash
++node e2e-addon.mjs build_macos/frontend/RelWithDebInfo/LiveHime.app <websocket password> <addons.json>
++node e2e-addon-update.mjs <websocket password> build_macos/frontend/RelWithDebInfo/LiveHime.app <add-on zip> /tmp/livehime-addon-update
++```
++
+ ## Bilibili interface check
+ 
+ The Updates tab's "B 站接口巡检…" runs a read-only check of the Bilibili
+diff --git a/build-aux/livehime/tests/e2e-addon-update.mjs b/build-aux/livehime/tests/e2e-addon-update.mjs
+new file mode 100644
+index 000000000..4dd1c7fc1
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-addon-update.mjs
+@@ -0,0 +1,146 @@
++// The browser add-on across an app update that changes the OBS base, against a
++// local release feed (no GitHub):
++// - with the add-on installed, downloading 9.9.9 (claiming OBS 33.0) also
++//   downloads, verifies and stages the add-on built for OBS 33.0, from the
++//   release's addons.json, before the update is ready;
++// - when that add-on cannot be downloaded, the update is still ready, says
++//   so ("addonProblem"), stages nothing and keeps the installed add-on.
++// The update is installed into the work copy when the test quits LiveHime.
++// Usage: node e2e-addon-update.mjs <ws password> <built LiveHime.app> <browser add-on zip> <work dir>
++// The zip must be signed like the app. Copies the app into <work dir>/install and launches that
++// copy with the e2e keychain and LIVEHIME_UPDATE_FEED; installs the add-on zip into LiveHime's
++// plugin folder. It shares LiveHime's settings folder: back it up first and restore it after
++// (including plugins and addons-pending); prints the settings backups the update created
++// ("BACKUP <path>") so the caller can remove them.
++import { createHash } from 'node:crypto';
++import { execFileSync } from 'node:child_process';
++import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const [password, builtApp, addonZip, work] = process.argv.slice(2);
++const here = path.dirname(fileURLToPath(import.meta.url));
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const sh = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8' });
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const fileSha = (f) => createHash('sha256').update(readFileSync(f)).digest('hex');
++let fails = 0;
++const check = (n, ok, i = '') => { if (!ok) fails++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${i && !ok ? '  — ' + i : ''}`); };
++const install = path.join(work, 'install', 'LiveHime.app');
++const feed = path.join(work, 'feed');
++const support = path.join(os.homedir(), 'Library/Application Support/LiveHime');
++const config = path.join(support, 'obs-studio');
++const plugins = path.join(config, 'plugins');
++const staged = path.join(config, 'addons-pending', 'obs-browser.plugin');
++const backups = path.join(support, 'backups');
++const listBackups = () => (existsSync(backups) ? readdirSync(backups).filter((n) => !n.startsWith('.')) : []);
++const backupsBefore = new Set(listBackups());
++const manifest = (bundle) => JSON.parse(readFileSync(path.join(bundle, 'Contents/Resources/addon.json'), 'utf8'));
++const running = () => { try { return sh('/usr/bin/pgrep', ['-f', `${install}/Contents/MacOS/`]).trim(); } catch { return ''; } };
++const signLikeBuild = (bundle) => sh('python3', [path.join(here, '..', 'local-signing.py'), '--deep', '--sign', bundle]);
++
++// Fixtures: the installed copy with the current add-on, 9.9.9 on "OBS 33.0", and the add-on
++// rebuilt for OBS 33.0 (same files, manifest changed, signed like the build).
++rmSync(work, { recursive: true, force: true });
++for (const d of ['install', 'new', 'addon33', 'feed']) mkdirSync(path.join(work, d), { recursive: true });
++sh('/usr/bin/ditto', [builtApp, install]);
++mkdirSync(plugins, { recursive: true });
++sh('/usr/bin/ditto', ['-x', '-k', addonZip, plugins]);
++const current = manifest(path.join(plugins, 'obs-browser.plugin'));
++
++const newApp = path.join(work, 'new', 'LiveHime.app');
++sh('/usr/bin/ditto', [builtApp, newApp]);
++sh('/usr/libexec/PlistBuddy', ['-c', 'Set CFBundleShortVersionString 9.9.9', `${newApp}/Contents/Info.plist`]);
++sh('/usr/libexec/PlistBuddy', ['-c', 'Set CFBundleShortVersionString 33.0.0', `${newApp}/Contents/Frameworks/libobs.framework/Resources/Info.plist`]);
++signLikeBuild(newApp);
++const appZip = path.join(feed, 'app.zip');
++sh('/usr/bin/ditto', ['-c', '-k', '--keepParent', newApp, appZip]);
++
++sh('/usr/bin/ditto', ['-x', '-k', addonZip, path.join(work, 'addon33')]);
++const bundle33 = path.join(work, 'addon33', 'obs-browser.plugin');
++writeFileSync(path.join(bundle33, 'Contents/Resources/addon.json'),
++  JSON.stringify({ ...current, version: '2.0.0', obs: '33.0' }, null, 2) + '\n');
++signLikeBuild(bundle33);
++const addon33 = path.join(feed, 'LiveHime-BrowserAddon-v2.0.0-arm64.zip');
++sh('/usr/bin/ditto', ['-c', '-k', '--keepParent', bundle33, addon33]);
++const addons = path.join(feed, 'addons.json');
++writeFileSync(addons, JSON.stringify({ schema: 1, addons: [{ id: 'browser-source', version: '2.0.0', obs: '33.0', cef: current.cef,
++  assets: { arm64: { name: path.basename(addon33), url: `file://${addon33}`, size: readFileSync(addon33).length, sha256: fileSha(addon33) } } }] }));
++writeFileSync(path.join(feed, 'feed.json'), JSON.stringify({
++  tag_name: 'v9.9.9', prerelease: false, draft: false, html_url: 'https://example.invalid/releases/v9.9.9', body: '## Test release 9.9.9',
++  assets: [
++    { name: 'LiveHimeMacApp-v9.9.9-arm64.zip', browser_download_url: `file://${appZip}`, size: readFileSync(appZip).length, digest: `sha256:${fileSha(appZip)}` },
++    { name: 'addons.json', browser_download_url: `file://${addons}`, size: readFileSync(addons).length, digest: `sha256:${fileSha(addons)}` },
++  ],
++}));
++
++let ws, pend, id = 1;
++async function connect() {
++  for (let i = 0; i < 120; i++) {
++    try {
++      ws = new WebSocket('ws://127.0.0.1:4466');
++      pend = new Map();
++      await new Promise((ok, bad) => {
++        ws.onerror = bad;
++        ws.onmessage = (m) => {
++          const msg = JSON.parse(m.data);
++          if (msg.op === 0) { const a = msg.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + a.salt) + a.challenge) } })); }
++          else if (msg.op === 2) ok();
++          else if (msg.op === 7) pend.get(msg.d.requestId)?.(msg.d);
++        };
++      });
++      return;
++    } catch { await sleep(500); }
++  }
++  throw new Error('LiveHime did not come up');
++}
++const vendor = (requestType, requestData = {}) => new Promise((ok) => {
++  const requestId = String(id++);
++  pend.set(requestId, (d) => ok(d.responseData?.responseData ?? {}));
++  ws.send(JSON.stringify({ op: 6, d: { requestType: 'CallVendorRequest', requestId, requestData: { vendorName: 'livehime', requestType, requestData } } }));
++});
++async function waitUpdate(want, action) {
++  let r = await vendor('Update', action ? { action } : {});
++  for (let i = 0; i < 240 && !want(r); i++) { await sleep(500); r = await vendor('Update'); }
++  return r;
++}
++
++async function run() {
++  sh('/usr/bin/open', ['-n', '--env', 'LIVEHIME_KEYCHAIN_SERVICE=local.livehime.macos.e2e-test',
++    '--env', `LIVEHIME_UPDATE_FEED=file://${path.join(feed, 'feed.json')}`, install]);
++  await connect();
++  await sleep(2500);
++  await vendor('Update', { automatic: false });
++  let r = await waitUpdate((s) => s.available === '9.9.9', 'check');
++  check('9.9.9 is offered', r.available === '9.9.9', JSON.stringify(r));
++  r = await waitUpdate((s) => s.ready === '9.9.9' || s.status === 'failed', 'download');
++  check('9.9.9 is ready', r.ready === '9.9.9', JSON.stringify(r));
++  check('...with the add-on for its OBS staged', existsSync(staged) && manifest(staged).obs === '33.0' && manifest(staged).version === '2.0.0',
++    existsSync(staged) ? JSON.stringify(manifest(staged)) : 'nothing staged');
++  check('...and no add-on problem', r.addonProblem === '', r.addonProblem);
++  check('the installed add-on is untouched until the restart', manifest(path.join(plugins, 'obs-browser.plugin')).obs === current.obs);
++
++  // The add-on for OBS 33 cannot be downloaded any more: the update stays ready without it.
++  await vendor('Addon', { action: 'cancel' });
++  rmSync(addon33);
++  r = await vendor('Update', { action: 'retryAddon' });
++  for (let i = 0; i < 60 && !r.addonProblem; i++) { await sleep(500); r = await vendor('Update'); }
++  check('a failed add-on download is reported', r.addonProblem !== '', JSON.stringify(r));
++  check('...the update stays ready', r.ready === '9.9.9');
++  check('...nothing is staged', !existsSync(staged));
++  check('...and the installed add-on is kept', manifest(path.join(plugins, 'obs-browser.plugin')).obs === current.obs);
++
++  // Quitting installs the update into the work copy; wait for the swap to finish.
++  try { execFileSync('/usr/bin/osascript', ['-e', 'tell application id "local.livehime.macos.dev" to quit'], { stdio: 'ignore' }); } catch {}
++  for (let i = 0; i < 120 && running(); i++) await sleep(500);
++  const version = () => { try { return JSON.stringify(execFileSync('/usr/bin/plutil', ['-extract', 'CFBundleShortVersionString', 'raw', `${install}/Contents/Info.plist`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()); } catch { return ''; } };
++  for (let i = 0; i < 60 && version() !== '"9.9.9"'; i++) await sleep(500);
++}
++
++run().catch((e) => { fails++; console.log(`FAIL  ${e.message}`); })
++  .finally(() => {
++    for (const b of listBackups().filter((n) => !backupsBefore.has(n))) console.log(`BACKUP ${path.join(backups, b)}`);
++    console.log(fails ? `${fails} check(s) failed` : 'browser add-on across an update OK');
++    process.exit(fails ? 1 : 0);
++  });
+diff --git a/build-aux/livehime/tests/e2e-addon.mjs b/build-aux/livehime/tests/e2e-addon.mjs
+new file mode 100644
+index 000000000..320a57823
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-addon.mjs
+@@ -0,0 +1,202 @@
++// The browser add-on end to end, against a local add-on list (no GitHub):
++// - not installed at first, and the list offers it;
++// - install stages it (pending until restart); undo drops it; install again;
++// - "Restart LiveHime" reopens the app, the add-on is installed and a browser
++//   source renders a page into the canvas;
++// - an add-on built for another OBS base is not loaded (update needed), nor
++//   one whose files were changed after signing (damaged);
++// - remove stages the removal; after a restart the add-on is in the Trash and
++//   the browser source is gone.
++// Launches and quits LiveHime itself, with an isolated Keychain item and
++// LIVEHIME_ADDONS_FEED. It shares LiveHime's settings folder: back up
++// basic, plugin_config, user.ini and global.ini first and restore them after,
++// and do not run it while a normal LiveHime is open.
++// Usage: node e2e-addon.mjs <LiveHime.app> <websocket password> <addons.json>
++//   (the add-on zip the list points at must be signed like the app)
++import { createHash } from 'node:crypto';
++import { execFileSync } from 'node:child_process';
++import { appendFileSync, copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
++import { homedir } from 'node:os';
++import path from 'node:path';
++import { inflateSync } from 'node:zlib';
++
++const [app, password, list] = process.argv.slice(2);
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const bundleId = execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleIdentifier', `${app}/Contents/Info.plist`]).toString().trim();
++const plugin = path.join(homedir(), 'Library/Application Support/LiveHime/obs-studio/plugins/obs-browser.plugin');
++let failures = 0;
++function check(name, ok, detail = '') {
++  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : `  (${detail})`}`);
++  if (!ok) failures++;
++}
++
++let ws, pending, nextId;
++function connect() {
++  return new Promise((resolve, reject) => {
++    ws = new WebSocket('ws://127.0.0.1:4466');
++    pending = new Map();
++    nextId = 1;
++    ws.onerror = () => reject(new Error('connect'));
++    ws.onclose = () => { for (const r of pending.values()) r(null); pending.clear(); };
++    ws.onmessage = (event) => {
++      const msg = JSON.parse(event.data);
++      if (msg.op === 0) {
++        const { challenge, salt } = msg.d.authentication;
++        ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + salt) + challenge), eventSubscriptions: 0 } }));
++      } else if (msg.op === 2) resolve();
++      else if (msg.op === 7) pending.get(msg.d.requestId)?.(msg.d);
++    };
++  });
++}
++function request(requestType, requestData = {}) {
++  const requestId = String(nextId++);
++  return new Promise((resolve) => {
++    pending.set(requestId, resolve);
++    ws.send(JSON.stringify({ op: 6, d: { requestType, requestId, requestData } }));
++  });
++}
++async function addon(action) {
++  const r = await request('CallVendorRequest', { vendorName: 'livehime', requestType: 'Addon', requestData: action ? { action } : {} });
++  return r?.responseData?.responseData ?? {};
++}
++async function waitAddon(want, timeoutMs = 60000) {
++  const end = Date.now() + timeoutMs;
++  let last = {};
++  while (Date.now() < end) {
++    last = await addon();
++    if (want(last)) return last;
++    await sleep(300);
++  }
++  return last;
++}
++async function hasBrowserSource() {
++  return (await request('GetInputKindList')).responseData.inputKinds.includes('browser_source');
++}
++
++async function running() {
++  try { execFileSync('pgrep', ['-f', `${app}/Contents/MacOS/`]); return true; } catch { return false; }
++}
++async function launch() {
++  execFileSync('open', ['-n', '--env', 'LIVEHIME_KEYCHAIN_SERVICE=local.livehime.macos.e2e-test',
++    '--env', `LIVEHIME_ADDONS_FEED=file://${path.resolve(list)}`, app]);
++  await reconnect();
++}
++async function reconnect(timeoutMs = 60000) {
++  const end = Date.now() + timeoutMs;
++  while (Date.now() < end) {
++    try { await connect(); await sleep(2500); return; } catch { await sleep(500); }
++  }
++  throw new Error('LiveHime did not come up');
++}
++async function quit() {
++  try { execFileSync('osascript', ['-e', `tell application id "${bundleId}" to quit`], { stdio: 'ignore' }); } catch {}
++  for (let i = 0; i < 60 && await running(); i++) await sleep(500);
++}
++async function waitRestart() {
++  for (let i = 0; i < 60 && ws.readyState === WebSocket.OPEN; i++) await sleep(250);
++  await sleep(1500);
++  await reconnect();
++}
++
++function pixel(png, x, y) {
++  let pos = 8, width = 0, colorType = 0;
++  const idat = [];
++  while (pos < png.length) {
++    const len = png.readUInt32BE(pos), type = png.toString('latin1', pos + 4, pos + 8), data = png.subarray(pos + 8, pos + 8 + len);
++    if (type === 'IHDR') { width = data.readUInt32BE(0); colorType = data[9]; }
++    if (type === 'IDAT') idat.push(data);
++    pos += 12 + len;
++  }
++  const bpp = colorType === 6 ? 4 : 3, stride = width * bpp, raw = inflateSync(Buffer.concat(idat));
++  const rows = [];
++  for (let r = 0; r <= y; r++) {
++    const f = raw[r * (stride + 1)], line = raw.subarray(r * (stride + 1) + 1, (r + 1) * (stride + 1)), out = Buffer.alloc(stride);
++    for (let i = 0; i < stride; i++) {
++      const a = i >= bpp ? out[i - bpp] : 0, b = r ? rows[r - 1][i] : 0, c = i >= bpp && r ? rows[r - 1][i - bpp] : 0;
++      const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
++      out[i] = (line[i] + [0, a, b, (a + b) >> 1, pa <= pb && pa <= pc ? a : pb <= pc ? b : c][f]) & 255;
++    }
++    rows.push(out);
++  }
++  return [...rows[y].subarray(x * bpp, x * bpp + 3)];
++}
++async function renders() {
++  const scene = (await request('GetCurrentProgramScene')).responseData.currentProgramSceneName;
++  const url = 'data:text/html,<html><body style="margin:0;background:%23ff00aa"></body></html>';
++  await request('CreateInput', { sceneName: scene, inputName: 'e2e Browser', inputKind: 'browser_source', inputSettings: { url, width: 320, height: 180 } });
++  await sleep(4000);
++  const shot = await request('GetSourceScreenshot', { sourceName: 'e2e Browser', imageFormat: 'png' });
++  await request('RemoveInput', { inputName: 'e2e Browser' });
++  const [r, g, b] = pixel(Buffer.from(shot.responseData.imageData.split(',')[1], 'base64'), 160, 90);
++  return Math.abs(r - 255) < 8 && g < 8 && Math.abs(b - 170) < 8;
++}
++
++async function run() {
++  check('starts without the add-on', !existsSync(plugin), plugin);
++  await launch();
++  let state = await waitAddon((s) => s.state === 'notInstalled' && s.available);
++  check('not installed, and this version offers it', state.state === 'notInstalled' && state.available, JSON.stringify(state));
++  check('no browser source yet', !(await hasBrowserSource()));
++
++  await addon('install');
++  state = await waitAddon((s) => s.status === 'idle' && s.state === 'pendingInstall');
++  check('install stages it until restart', state.state === 'pendingInstall' && state.pending === '1.0.0', JSON.stringify(state));
++  state = await addon('cancel');
++  state = await waitAddon((s) => s.state === 'notInstalled');
++  check('undo drops the staged install', state.state === 'notInstalled', JSON.stringify(state));
++  await addon('install');
++  state = await waitAddon((s) => s.status === 'idle' && s.state === 'pendingInstall');
++  check('install again', state.state === 'pendingInstall', JSON.stringify(state));
++
++  const restart = await addon('restart');
++  check('restart accepted', restart.accepted === true);
++  await waitRestart();
++  state = await waitAddon((s) => s.state === 'installed');
++  check('installed after the restart', state.state === 'installed' && state.installed === '1.0.0', JSON.stringify(state));
++  check('browser source available', await hasBrowserSource());
++  check('a browser source renders the page', await renders());
++
++  // Another OBS base: kept on disk, not loaded.
++  await quit();
++  const manifest = path.join(plugin, 'Contents/Resources/addon.json');
++  const original = readFileSync(manifest);
++  writeFileSync(manifest, original.toString().replace(/"obs": "[^"]*"/, '"obs": "31.1"'));
++  await launch();
++  state = await waitAddon((s) => s.state === 'updateNeeded');
++  check('built for another OBS: update needed', state.state === 'updateNeeded', JSON.stringify(state));
++  check('...and not loaded', !(await hasBrowserSource()));
++  await quit();
++  writeFileSync(manifest, original);
++
++  // Changed after signing: damaged, not loaded.
++  const page = path.join(plugin, 'Contents/Resources/error.html');
++  copyFileSync(page, `${page}.e2e`);
++  appendFileSync(page, '<!-- changed -->');
++  await launch();
++  state = await waitAddon((s) => s.state === 'damaged');
++  check('changed after signing: damaged', state.state === 'damaged', JSON.stringify(state));
++  check('...and not loaded', !(await hasBrowserSource()));
++  await quit();
++  copyFileSync(`${page}.e2e`, page);
++  execFileSync('rm', [`${page}.e2e`]);
++
++  await launch();
++  state = await waitAddon((s) => s.state === 'installed');
++  check('restored add-on loads again', state.state === 'installed' && await hasBrowserSource(), JSON.stringify(state));
++  await addon('remove');
++  state = await waitAddon((s) => s.state === 'pendingRemoval');
++  check('remove stages the removal', state.state === 'pendingRemoval', JSON.stringify(state));
++  await addon('restart');
++  await waitRestart();
++  state = await waitAddon((s) => s.state === 'notInstalled');
++  check('removed after the restart', state.state === 'notInstalled' && !existsSync(plugin), JSON.stringify(state));
++  check('browser source gone', !(await hasBrowserSource()));
++  await quit();
++}
++
++run().catch((e) => { console.log(`FAIL  ${e.message}`); failures++; })
++  .finally(() => {
++    console.log(failures ? `${failures} check(s) failed` : 'browser add-on end to end OK');
++    process.exit(failures ? 1 : 0);
++  });
+diff --git a/frontend/cmake/os-macos.cmake b/frontend/cmake/os-macos.cmake
+index d91c1d8a9..7f335cbe7 100644
+--- a/frontend/cmake/os-macos.cmake
++++ b/frontend/cmake/os-macos.cmake
+@@ -31,6 +31,7 @@ target_link_libraries(
+     "$<LINK_LIBRARY:FRAMEWORK,AppKit.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,ApplicationServices.framework>"
+     "$<LINK_LIBRARY:FRAMEWORK,AVFoundation.framework>"
++    "$<LINK_LIBRARY:FRAMEWORK,Security.framework>"
+ )
+ 
+ if(LIVEHIME_APP_VERSION)
+diff --git a/frontend/utility/platform-osx.mm b/frontend/utility/platform-osx.mm
+index 5421a23e7..8e5181852 100644
+--- a/frontend/utility/platform-osx.mm
++++ b/frontend/utility/platform-osx.mm
+@@ -22,6 +22,7 @@
+ #import <util/threading.h>
+ 
+ #import <AVFoundation/AVFoundation.h>
++#import <Security/Security.h>
+ #import <AppKit/AppKit.h>
+ #import <dlfcn.h>
+ 
+@@ -359,3 +360,102 @@ bool HighContrastEnabled()
+ {
+     return [[NSWorkspace sharedWorkspace] accessibilityDisplayShouldIncreaseContrast];
+ }
++
++/* LiveHime's optional add-ons (the browser source) live in the user plugin
++ * folder. The Updates tab stages installs and removals under
++ * addons-pending; they take effect here, before any module loads. An add-on
++ * is then loaded only when its manifest names this OBS base and architecture
++ * and it is signed by the app's certificate; otherwise it stays on disk and
++ * obs-browser is added to the disabled modules. */
++static NSData *LeafCertificate(NSURL *url, bool validate)
++{
++    SecStaticCodeRef code = nullptr;
++    if (SecStaticCodeCreateWithPath((__bridge CFURLRef) url, kSecCSDefaultFlags, &code) != errSecSuccess)
++        return nil;
++    NSData *leaf = nil;
++    CFDictionaryRef info = nullptr;
++    if ((!validate || SecStaticCodeCheckValidity(code, kSecCSStrictValidate, nullptr) == errSecSuccess) &&
++        SecCodeCopySigningInformation(code, kSecCSSigningInformation, &info) == errSecSuccess) {
++        NSArray *certificates = ((__bridge NSDictionary *) info)[(__bridge NSString *) kSecCodeInfoCertificates];
++        if (certificates.count > 0)
++            leaf = (__bridge_transfer NSData *) SecCertificateCopyData(
++                (__bridge SecCertificateRef) certificates.firstObject);
++        CFRelease(info);
++    }
++    CFRelease(code);
++    return leaf;
++}
++
++void ApplyLiveHimeAddons()
++{
++    char path[512];
++    if (GetAppConfigPath(path, sizeof(path), "obs-studio") <= 0)
++        return;
++    NSFileManager *fm = [NSFileManager defaultManager];
++    NSURL *config = [NSURL fileURLWithPath:@(path) isDirectory:YES];
++    NSURL *pending = [config URLByAppendingPathComponent:@"addons-pending" isDirectory:YES];
++    NSURL *plugins = [config URLByAppendingPathComponent:@"plugins" isDirectory:YES];
++    NSURL *installed = [plugins URLByAppendingPathComponent:@"obs-browser.plugin" isDirectory:YES];
++    NSURL *staged = [pending URLByAppendingPathComponent:@"obs-browser.plugin" isDirectory:YES];
++    NSURL *removal = [pending URLByAppendingPathComponent:@"remove-browser-source"];
++
++    auto trash = [&](NSURL *url) {
++        if (![fm fileExistsAtPath:url.path])
++            return true;
++        NSError *error = nil;
++        if ([fm trashItemAtURL:url resultingItemURL:nil error:&error])
++            return true;
++        blog(LOG_WARNING, "[livehime] add-on: cannot move %s to the Trash: %s", url.path.UTF8String,
++             error.localizedDescription.UTF8String);
++        return false;
++    };
++
++    if ([fm fileExistsAtPath:removal.path]) {
++        if (trash(installed))
++            blog(LOG_INFO, "[livehime] add-on: browser source removed");
++        [fm removeItemAtURL:removal error:nil];
++    }
++    if ([fm fileExistsAtPath:staged.path] && trash(installed)) {
++        NSError *error = nil;
++        [fm createDirectoryAtURL:plugins withIntermediateDirectories:YES attributes:nil error:nil];
++        if ([fm moveItemAtURL:staged toURL:installed error:&error])
++            blog(LOG_INFO, "[livehime] add-on: browser source installed");
++        else
++            blog(LOG_WARNING, "[livehime] add-on: cannot install the browser source: %s",
++                 error.localizedDescription.UTF8String);
++    }
++    if (![fm fileExistsAtPath:installed.path])
++        return;
++
++    NSString *problem = nil;
++    NSData *data =
++        [NSData dataWithContentsOfURL:[installed URLByAppendingPathComponent:@"Contents/Resources/addon.json"]];
++    NSDictionary *manifest = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
++    uint32_t version = obs_get_version();
++    NSString *obs = [NSString stringWithFormat:@"%u.%u", version >> 24, (version >> 16) & 0xFF];
++#if defined(__aarch64__)
++    NSString *arch = @"arm64";
++#else
++    NSString *arch = @"x86_64";
++#endif
++    if (![manifest isKindOfClass:[NSDictionary class]] || ![manifest[@"id"] isEqual:@"browser-source"])
++        problem = @"no valid manifest";
++    else if (![manifest[@"obs"] isEqual:obs])
++        problem = [NSString stringWithFormat:@"built for OBS %@, this is OBS %@", manifest[@"obs"], obs];
++    else if (![manifest[@"arch"] isEqual:arch])
++        problem = [NSString stringWithFormat:@"built for %@", manifest[@"arch"]];
++    else {
++        NSData *app = LeafCertificate([NSBundle mainBundle].bundleURL, false);
++        NSData *addon = LeafCertificate(installed, true);
++        if (!addon)
++            problem = @"invalid signature";
++        else if (![addon isEqualToData:app])
++            problem = @"signed by a different certificate";
++    }
++    if (problem) {
++        obs_add_disabled_module("obs-browser");
++        blog(LOG_WARNING, "[livehime] add-on: browser source not loaded (%s)", problem.UTF8String);
++    } else {
++        blog(LOG_INFO, "[livehime] add-on: browser source %s", [manifest[@"version"] description].UTF8String);
++    }
++}
+diff --git a/frontend/utility/platform.hpp b/frontend/utility/platform.hpp
+index 24f397bdd..aa1fa3de2 100644
+--- a/frontend/utility/platform.hpp
++++ b/frontend/utility/platform.hpp
+@@ -106,4 +106,7 @@ MacPermissionStatus CheckPermissionWithPrompt(MacPermissionType type, bool promp
+ #define CheckPermission(x) CheckPermissionWithPrompt(x, false)
+ #define RequestPermission(x) CheckPermissionWithPrompt(x, true)
+ void OpenMacOSPrivacyPreferences(const char *tab);
++/* LiveHime: applies staged add-on changes and disables an unsuitable add-on;
++ * call before modules load. */
++void ApplyLiveHimeAddons();
+ #endif
+diff --git a/frontend/widgets/OBSBasic.cpp b/frontend/widgets/OBSBasic.cpp
+index 58b15e0f6..62dba550f 100644
+--- a/frontend/widgets/OBSBasic.cpp
++++ b/frontend/widgets/OBSBasic.cpp
+@@ -1042,6 +1042,9 @@ void OBSBasic::OBSInit()
+ 		SetSafeModuleNames();
+ 	} else {
+ 		AddExtraModulePaths();
++#ifdef __APPLE__
++		ApplyLiveHimeAddons();
++#endif
+ 	}
+ 
+ 	// Core modules are not allowed to be disabled by the user via plugin manager.
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index f03bb0644..1b5968bae 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -9,6 +9,8 @@ target_sources(
+   livehime
+   PRIVATE
+     core/include/livehime-core.h
++    core/Sources/LiveHimeCore/AddonBridge.swift
++    core/Sources/LiveHimeCore/AddonManager.swift
+     core/Sources/LiveHimeCore/AppUpdateBridge.swift
+     core/Sources/LiveHimeCore/AppUpdater.swift
+     core/Sources/LiveHimeCore/ApiProbe.swift
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AddonBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/AddonBridge.swift
+new file mode 100644
+index 000000000..d5a6067ff
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AddonBridge.swift
+@@ -0,0 +1,145 @@
++import Foundation
++
++/// Add-on state behind the C entry points below; everything on the main thread.
++@MainActor
++final class AddonTask {
++    static let shared = AddonTask()
++    var busy = false
++    var offer: AddonOffer?
++    var lastPercent = -1
++
++    /// Emits {"event":"addon","id","state","installed","pending","problem","size","available",
++    /// "status"(idle|checking|downloading|failed), …}.
++    func emit(_ fields: [String: Any] = [:]) {
++        let status = AddonManager.status()
++        var object: [String: Any] = ["event": "addon", "id": AddonManager.browserSource,
++                                     "state": status.state.rawValue, "status": "idle"]
++        if let installed = status.installed { object["installed"] = installed }
++        if let pending = status.pending { object["pending"] = pending }
++        if let problem = status.problem { object["problem"] = problem }
++        if let offer { object["size"] = offer.size; object["version"] = offer.version }
++        object.merge(fields) { $1 }
++        CoreBridge.shared?.emit(object)
++    }
++
++    func failed(_ error: Error) {
++        let update = error as? AppUpdateError
++        emit(["status": "failed", "reason": update?.reason ?? "network",
++              "message": update?.errorDescription ?? error.localizedDescription])
++    }
++}
++
++private func onMainThread(_ body: @escaping @MainActor () -> Void) {
++    if Thread.isMainThread {
++        MainActor.assumeIsolated { body() }
++    } else {
++        DispatchQueue.main.async { MainActor.assumeIsolated { body() } }
++    }
++}
++
++/// Emits the browser source's state. When it is not installed or needs an
++/// update, also looks up the fitting add-on of the running version (to show
++/// its size): "available" true, or false when this version offers none.
++@_cdecl("livehime_core_addon_state")
++public func livehime_core_addon_state() {
++    onMainThread {
++        let state = AddonTask.shared
++        state.emit()
++        let current = AddonManager.status().state
++        guard !state.busy, state.offer == nil, current == .notInstalled || current == .updateNeeded else { return }
++        Task.detached {
++            let offer = try? await AddonManager.offerForRunningApp()
++            await MainActor.run {
++                state.offer = offer
++                state.emit(["available": offer != nil])
++            }
++        }
++    }
++}
++
++/// Downloads, verifies and stages the browser source for the running
++/// version; it is installed when LiveHime next starts. Emits "checking",
++/// "downloading" with "progress", then the new state or "failed".
++@_cdecl("livehime_core_addon_install")
++public func livehime_core_addon_install() {
++    onMainThread {
++        let state = AddonTask.shared
++        guard !state.busy else { return }
++        state.busy = true
++        state.lastPercent = -1
++        state.emit(["status": "checking"])
++        Task.detached {
++            do {
++                let offer: AddonOffer
++                if let known = await MainActor.run(body: { state.offer }) {
++                    offer = known
++                } else {
++                    offer = try await AddonManager.offerForRunningApp()
++                }
++                await MainActor.run {
++                    state.offer = offer
++                    state.emit(["status": "downloading", "progress": 0.0])
++                }
++                let bundle = try await AddonManager.download(offer) { fraction in
++                    DispatchQueue.main.async {
++                        MainActor.assumeIsolated {
++                            let percent = Int(fraction * 100)
++                            guard percent != state.lastPercent else { return }
++                            state.lastPercent = percent
++                            state.emit(["status": "downloading", "progress": fraction])
++                        }
++                    }
++                }
++                try AddonManager.stage(bundle)
++                await MainActor.run {
++                    state.busy = false
++                    state.emit()
++                }
++            } catch {
++                await MainActor.run {
++                    state.busy = false
++                    state.failed(error)
++                }
++            }
++        }
++    }
++}
++
++/// Marks the browser source for removal (to the Trash) at the next start.
++@_cdecl("livehime_core_addon_remove")
++public func livehime_core_addon_remove() {
++    onMainThread {
++        let state = AddonTask.shared
++        guard !state.busy else { return }
++        do {
++            try AddonManager.scheduleRemoval()
++            state.emit()
++        } catch {
++            state.failed(error)
++        }
++    }
++}
++
++/// Drops a staged install or removal.
++@_cdecl("livehime_core_addon_cancel")
++public func livehime_core_addon_cancel() {
++    onMainThread {
++        let state = AddonTask.shared
++        guard !state.busy else { return }
++        AddonManager.cancelPending()
++        state.emit()
++    }
++}
++
++/// Arranges for LiveHime to reopen once it quits (the caller then quits).
++/// Returns 1 when arranged. Call on the main thread.
++@_cdecl("livehime_core_relaunch")
++public func livehime_core_relaunch() -> Int32 {
++    guard Thread.isMainThread else { return 0 }
++    do {
++        try AddonManager.scheduleRelaunch()
++        return 1
++    } catch {
++        return 0
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AddonManager.swift b/plugins/livehime/core/Sources/LiveHimeCore/AddonManager.swift
+new file mode 100644
+index 000000000..c84c9e388
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AddonManager.swift
+@@ -0,0 +1,274 @@
++import Foundation
++import Security
++
++/// An add-on's own manifest (Contents/Resources/addon.json in its bundle).
++public struct AddonManifest: Equatable, Sendable, Decodable {
++    public let id: String
++    public let version: String
++    /// The OBS base it was built against, "major.minor".
++    public let obs: String
++    public let arch: String
++    public let cef: String?
++}
++
++/// An add-on as a release offers it (from the release's addons.json), for one architecture.
++public struct AddonOffer: Equatable, Sendable {
++    public let id: String
++    public let version: String
++    public let obs: String
++    public let archive: URL
++    public let size: Int64
++    public let sha256: String
++}
++
++/// What the Updates tab shows for an add-on.
++public enum AddonState: String, Sendable {
++    case notInstalled, installed, updateNeeded, pendingInstall, pendingRemoval, damaged
++}
++
++public struct AddonStatus: Equatable, Sendable {
++    public var state: AddonState
++    /// The installed add-on's version, and the staged one's.
++    public var installed: String?
++    public var pending: String?
++    /// Why it is not loaded (updateNeeded, damaged).
++    public var problem: String?
++}
++
++/// LiveHime's optional add-ons; so far one, the browser source (obs-browser
++/// with its own CEF). It lives in OBS's user plugin folder. Installs and
++/// removals are staged under addons-pending and take effect when LiveHime next
++/// starts, before any module loads (the frontend does that, see
++/// ApplyLiveHimeAddons); the frontend also refuses to load an add-on that does
++/// not fit this OBS base and architecture or is not signed like the app.
++/// An add-on follows the OBS base: each release's addons.json lists the add-on
++/// for that release's OBS, with a download URL, size and SHA-256.
++public enum AddonManager {
++    public static let browserSource = "browser-source"
++    static let bundleName = "obs-browser.plugin"
++
++    /// OBS's configuration folder; unit tests use a temporary one.
++    nonisolated(unsafe) static var configDirectory: URL = AppUpdater.configDirectory
++    static var pluginsDirectory: URL { configDirectory.appendingPathComponent("plugins", isDirectory: true) }
++    static var pendingDirectory: URL { configDirectory.appendingPathComponent("addons-pending", isDirectory: true) }
++    static var installedBundle: URL { pluginsDirectory.appendingPathComponent(bundleName, isDirectory: true) }
++    static var pendingBundle: URL { pendingDirectory.appendingPathComponent(bundleName, isDirectory: true) }
++    static var removalMarker: URL { pendingDirectory.appendingPathComponent("remove-\(browserSource)") }
++
++    /// "32.2.2" → "32.2".
++    static func obsBase(_ version: String?) -> String? {
++        guard let parts = version?.split(separator: "."), parts.count >= 2 else { return nil }
++        return "\(parts[0]).\(parts[1])"
++    }
++
++    /// The OBS base of the running app.
++    public static var currentOBS: String? { obsBase(AppUpdater.obsVersion(of: Bundle.main.bundleURL)) }
++
++    static func manifest(of bundle: URL) -> AddonManifest? {
++        let file = bundle.appendingPathComponent("Contents/Resources/addon.json")
++        return (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(AddonManifest.self, from: $0) }
++    }
++
++    /// Signed validly (the bundle's own seal) by the certificate that signed `app`.
++    static func signedLike(_ bundle: URL, app: URL, nested: Bool) -> Bool {
++        var code: SecStaticCode?
++        guard SecStaticCodeCreateWithPath(bundle as CFURL, [], &code) == errSecSuccess, let code else { return false }
++        var flags = kSecCSStrictValidate
++        if nested { flags |= kSecCSCheckNestedCode | kSecCSCheckAllArchitectures }
++        guard SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: flags), nil) == errSecSuccess else { return false }
++        guard let leaf = AppUpdater.leafCertificate(of: bundle) else { return false }
++        return leaf == AppUpdater.leafCertificate(of: app)
++    }
++
++    /// The add-on's state, judged the way the frontend judges it at start-up.
++    static func status(obs: String? = currentOBS, arch: String = AppUpdater.architecture,
++                              app: URL = Bundle.main.bundleURL) -> AddonStatus {
++        let fm = FileManager.default
++        let installed = fm.fileExists(atPath: installedBundle.path) ? manifest(of: installedBundle) : nil
++        var status = AddonStatus(state: .notInstalled, installed: installed?.version)
++        if fm.fileExists(atPath: removalMarker.path) {
++            status.state = .pendingRemoval
++        } else if fm.fileExists(atPath: pendingBundle.path) {
++            status.state = .pendingInstall
++            status.pending = manifest(of: pendingBundle)?.version
++        } else if !fm.fileExists(atPath: installedBundle.path) {
++            status.state = .notInstalled
++        } else if let installed, installed.id == browserSource {
++            if installed.arch != arch || installed.obs != obs {
++                status.state = .updateNeeded
++                status.problem = "built for OBS \(installed.obs) (\(installed.arch))"
++            } else if !signedLike(installedBundle, app: app, nested: false) {
++                status.state = .damaged
++                status.problem = "invalid signature"
++            } else {
++                status.state = .installed
++            }
++        } else {
++            status.state = .damaged
++            status.problem = "no valid manifest"
++        }
++        return status
++    }
++
++    // MARK: Finding the add-on for a release
++
++    /// The add-ons a release offers for `architecture`, from its addons.json.
++    static func offers(from data: Data, architecture: String = AppUpdater.architecture) throws -> [AddonOffer] {
++        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let list = root["addons"] as? [[String: Any]] else {
++            throw AppUpdateError.network("invalid add-on list")
++        }
++        return list.compactMap { entry in
++            guard let id = entry["id"] as? String, let version = entry["version"] as? String,
++                  let obs = entry["obs"] as? String,
++                  let asset = (entry["assets"] as? [String: Any])?[architecture] as? [String: Any],
++                  let url = (asset["url"] as? String).flatMap(URL.init(string:)),
++                  let sha = asset["sha256"] as? String else { return nil }
++            return AddonOffer(id: id, version: version, obs: obs, archive: url,
++                              size: (asset["size"] as? NSNumber)?.int64Value ?? 0, sha256: sha.lowercased())
++        }
++    }
++
++    /// Tests point LIVEHIME_ADDONS_FEED at a local addons.json.
++    static var feedOverride: URL? {
++        ProcessInfo.processInfo.environment["LIVEHIME_ADDONS_FEED"].flatMap(URL.init(string:))
++    }
++
++    static func fetch(_ url: URL, github: Bool = false) async throws -> Data {
++        var request = URLRequest(url: url, timeoutInterval: 20)
++        if github { request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept") }
++        request.setValue("LiveHime/\(AppUpdater.currentVersion)", forHTTPHeaderField: "User-Agent")
++        let data: Data, response: URLResponse
++        do {
++            (data, response) = try await URLSession.shared.data(for: request)
++        } catch {
++            throw AppUpdateError.network(error.localizedDescription)
++        }
++        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
++            throw AppUpdateError.network("HTTP \(http.statusCode)")
++        }
++        return data
++    }
++
++    /// The add-on list of a release, checked against its published digest.
++    static func offers(listedAt url: URL, sha256: String?) async throws -> [AddonOffer] {
++        let data = try await fetch(url)
++        if let sha256 {
++            let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++            try data.write(to: file)
++            defer { try? FileManager.default.removeItem(at: file) }
++            guard try AppUpdater.sha256(of: file) == sha256 else { throw AppUpdateError.checksumMismatch }
++        } else if feedOverride == nil {
++            throw AppUpdateError.missingChecksum
++        }
++        return try offers(from: data)
++    }
++
++    /// The browser source that fits `obs`, from the release of the running
++    /// version (whose OBS base is the running one), or from the test feed.
++    public static func offerForRunningApp(obs: String? = currentOBS) async throws -> AddonOffer {
++        let offers: [AddonOffer]
++        if let feed = feedOverride {
++            offers = try await self.offers(listedAt: feed, sha256: nil)
++        } else {
++            let tag = URL(string: "https://api.github.com/repos/greyoak111/livehime-macos/releases/tags/v\(AppUpdater.currentVersion)")!
++            let release = try AppUpdater.release(from: try await fetch(tag, github: true))
++            guard let list = release.addons else { throw AppUpdateError.noArchive }
++            offers = try await self.offers(listedAt: list, sha256: release.addonsSha256)
++        }
++        return try offer(in: offers, obs: obs)
++    }
++
++    /// The browser source for `obs` in `release` (used when an update changes the OBS base).
++    static func offer(for release: AppRelease, obs: String?) async throws -> AddonOffer {
++        if let feed = feedOverride {
++            return try offer(in: try await offers(listedAt: feed, sha256: nil), obs: obs)
++        }
++        guard let list = release.addons else { throw AppUpdateError.noArchive }
++        return try offer(in: try await offers(listedAt: list, sha256: release.addonsSha256), obs: obs)
++    }
++
++    static func offer(in offers: [AddonOffer], obs: String?) throws -> AddonOffer {
++        guard let offer = offers.first(where: { $0.id == browserSource && $0.obs == obs }) else {
++            throw AppUpdateError.noArchive
++        }
++        return offer
++    }
++
++    // MARK: Download, verification and staging
++
++    /// Downloads, checks and unpacks `offer`; returns the verified bundle.
++    public static func download(_ offer: AddonOffer, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
++        let fm = FileManager.default
++        let folder = AppUpdater.updatesDirectory.appendingPathComponent("addon-\(offer.id)-\(offer.version)", isDirectory: true)
++        try? fm.removeItem(at: folder)
++        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
++        let archive = folder.appendingPathComponent("addon.zip")
++        try await Downloader.fetch(offer.archive, to: archive, expectedSize: offer.size, progress: progress)
++        guard try AppUpdater.sha256(of: archive) == offer.sha256 else {
++            try? fm.removeItem(at: folder)
++            throw AppUpdateError.checksumMismatch
++        }
++        let unpacked = folder.appendingPathComponent("unpacked", isDirectory: true)
++        try AppUpdater.run("/usr/bin/ditto", ["-x", "-k", archive.path, unpacked.path])
++        try? fm.removeItem(at: archive)
++        let bundle = unpacked.appendingPathComponent(bundleName, isDirectory: true)
++        try verify(bundle: bundle, offer: offer)
++        return bundle
++    }
++
++    /// The bundle must be the offered add-on (id, version, OBS base, this
++    /// architecture), validly signed throughout by the app's certificate.
++    static func verify(bundle: URL, offer: AddonOffer, arch: String = AppUpdater.architecture,
++                       app: URL = Bundle.main.bundleURL) throws {
++        guard let manifest = manifest(of: bundle) else { throw AppUpdateError.invalidApp("no add-on manifest") }
++        guard manifest.id == offer.id, manifest.version == offer.version, manifest.obs == offer.obs else {
++            throw AppUpdateError.invalidApp("not the offered add-on")
++        }
++        guard manifest.arch == arch else { throw AppUpdateError.invalidApp("built for \(manifest.arch)") }
++        guard signedLike(bundle, app: app, nested: true) else {
++            throw AppUpdateError.invalidApp("not signed like the app")
++        }
++    }
++
++    /// Puts a verified bundle where the next start installs it from; replaces
++    /// an earlier staged one and a pending removal.
++    public static func stage(_ bundle: URL) throws {
++        let fm = FileManager.default
++        try fm.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
++        try? fm.removeItem(at: removalMarker)
++        try? fm.removeItem(at: pendingBundle)
++        try fm.moveItem(at: bundle, to: pendingBundle)
++        try? fm.removeItem(at: bundle.deletingLastPathComponent().deletingLastPathComponent())
++    }
++
++    /// Marks the add-on for removal at the next start (it is in use now).
++    public static func scheduleRemoval() throws {
++        let fm = FileManager.default
++        try fm.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
++        try? fm.removeItem(at: pendingBundle)
++        try Data().write(to: removalMarker)
++    }
++
++    /// Drops a staged install or removal.
++    public static func cancelPending() {
++        try? FileManager.default.removeItem(at: pendingBundle)
++        try? FileManager.default.removeItem(at: removalMarker)
++    }
++
++    /// Starts a helper that reopens LiveHime once it has quit (the caller
++    /// then quits). LiveHime's own environment (test keychain, feeds) is kept.
++    public static func scheduleRelaunch(app: URL = Bundle.main.bundleURL) throws {
++        let environment = ProcessInfo.processInfo.environment.filter { $0.key.hasPrefix("LIVEHIME_") }
++            .sorted { $0.key < $1.key }
++        let passed = environment.flatMap { ["--env", "\($0.key)=\($0.value)"] }
++        let process = Process()
++        process.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
++        process.arguments = ["/bin/sh", "-c",
++                             "while /bin/kill -0 \"$0\" 2>/dev/null; do /bin/sleep 0.3; done; /usr/bin/open \"$@\"",
++                             String(getpid())] + passed + [app.path]
++        process.standardOutput = FileHandle.nullDevice
++        process.standardError = FileHandle.nullDevice
++        try process.run()
++    }
++}
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
+index 95e64f552..ddd2b10bc 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdateBridge.swift
+@@ -9,6 +9,8 @@ final class UpdateState {
+     var busy = false
+     var cleaned = false
+     var lastPercent = -1
++    /// Why the browser source for the update's OBS base could not be staged.
++    var addonProblem: String?
+ 
+     func emit(_ fields: [String: Any]) {
+         var object: [String: Any] = ["event": "update", "current": AppUpdater.currentVersion,
+@@ -23,6 +25,7 @@ final class UpdateState {
+         var fields: [String: Any] = ["version": release.version, "notes": release.notes, "page": release.page.absoluteString,
+                                      "size": release.size, "prerelease": release.prerelease]
+         if let staged, let obs = AppUpdater.obsVersion(of: staged) { fields["obsNew"] = obs }
++        if let addonProblem { fields["addonProblem"] = addonProblem }
+         return fields
+     }
+ 
+@@ -111,9 +114,11 @@ public func livehime_core_update_download() {
+                         }
+                     }
+                 }
++                let addonProblem = await stageAddon(for: release, app: app)
+                 await MainActor.run {
+                     state.busy = false
+                     state.staged = app
++                    state.addonProblem = addonProblem
+                     state.emit(["status": "ready"].merging(state.releaseFields(release)) { $1 })
+                 }
+             } catch {
+@@ -126,6 +131,47 @@ public func livehime_core_update_download() {
+     }
+ }
+ 
++/// When the browser source is installed and the update moves to another OBS
++/// base, downloads and stages the add-on for that base too, so both are ready
++/// before LiveHime restarts. Returns why that failed; the app update still
++/// goes ahead then, and the old add-on is simply not loaded until updated.
++func stageAddon(for release: AppRelease, app: URL) async -> String? {
++    let fm = FileManager.default
++    guard fm.fileExists(atPath: AddonManager.installedBundle.path),
++          !fm.fileExists(atPath: AddonManager.removalMarker.path),
++          let installed = AddonManager.manifest(of: AddonManager.installedBundle) else { return nil }
++    let obs = AddonManager.obsBase(AppUpdater.obsVersion(of: app))
++    if installed.obs == obs { return nil }
++    if let pending = AddonManager.manifest(of: AddonManager.pendingBundle), pending.obs == obs { return nil }
++    do {
++        let offer = try await AddonManager.offer(for: release, obs: obs)
++        let bundle = try await AddonManager.download(offer) { _ in }
++        try AddonManager.stage(bundle)
++        return nil
++    } catch {
++        return (error as? AppUpdateError)?.errorDescription ?? error.localizedDescription
++    }
++}
++
++/// Tries staging the browser source for the downloaded update again. Emits
++/// "ready" (with "addonProblem" if it failed again).
++@_cdecl("livehime_core_update_retry_addon")
++public func livehime_core_update_retry_addon() {
++    onMainThread {
++        let state = UpdateState.shared
++        guard !state.busy, let release = state.release, let staged = state.staged else { return }
++        state.busy = true
++        Task.detached {
++            let problem = await stageAddon(for: release, app: staged)
++            await MainActor.run {
++                state.busy = false
++                state.addonProblem = problem
++                state.emit(["status": "ready"].merging(state.releaseFields(release)) { $1 })
++            }
++        }
++    }
++}
++
+ /// Installs the downloaded update once LiveHime quits (the caller quits it
+ /// when `relaunch` is set, and LiveHime reopens afterwards). Returns 1 when
+ /// the installer is waiting, 0 when there is nothing to install or it could
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+index 24f23af23..b4efcee02 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AppUpdater.swift
+@@ -13,6 +13,9 @@ public struct AppRelease: Equatable, Sendable {
+     public let sha256: String?
+     /// A test ("beta") release, offered only to those who opted in.
+     public var prerelease = false
++    /// The release's list of optional add-ons (addons.json) and its digest, if it has one.
++    public var addons: URL? = nil
++    public var addonsSha256: String? = nil
+ }
+ 
+ public enum AppUpdateError: Error, Equatable, LocalizedError {
+@@ -125,14 +128,20 @@ public enum AppUpdater {
+         }), let archive = (asset["browser_download_url"] as? String).flatMap(URL.init(string:)) else {
+             throw AppUpdateError.noArchive
+         }
+-        var sha: String?
+-        if let digest = asset["digest"] as? String, digest.hasPrefix("sha256:") {
+-            sha = String(digest.dropFirst("sha256:".count)).lowercased()
+-        }
++        let sha = digest(of: asset)
++        let addons = assets.first { ($0["name"] as? String) == "addons.json" }
+         return AppRelease(version: version, notes: root["body"] as? String ?? "",
+                           page: (root["html_url"] as? String).flatMap(URL.init(string:)) ?? releasesPage,
+                           archive: archive, size: (asset["size"] as? NSNumber)?.int64Value ?? 0, sha256: sha,
+-                          prerelease: root["prerelease"] as? Bool ?? false)
++                          prerelease: root["prerelease"] as? Bool ?? false,
++                          addons: (addons?["browser_download_url"] as? String).flatMap(URL.init(string:)),
++                          addonsSha256: digest(of: addons))
++    }
++
++    /// Hex SHA-256 from a GitHub asset's "digest" ("sha256:…").
++    static func digest(of asset: [String: Any]?) -> String? {
++        guard let digest = asset?["digest"] as? String, digest.hasPrefix("sha256:") else { return nil }
++        return String(digest.dropFirst("sha256:".count)).lowercased()
+     }
+ 
+     public static func latest(beta: Bool = false) async throws -> AppRelease {
+@@ -414,7 +423,7 @@ public enum AppUpdater {
+ }
+ 
+ /// A download task that reports progress and moves the file into place.
+-private final class Downloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
++final class Downloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+     private let destination: URL
+     private let expectedSize: Int64
+     private let progress: @Sendable (Double) -> Void
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/AddonManagerTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/AddonManagerTests.swift
+new file mode 100644
+index 000000000..1843ae9b7
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/AddonManagerTests.swift
+@@ -0,0 +1,116 @@
++import XCTest
++@testable import LiveHimeCore
++
++final class AddonManagerTests: XCTestCase {
++    private var saved: URL!
++    private var root: URL!
++
++    override func setUpWithError() throws {
++        saved = AddonManager.configDirectory
++        root = FileManager.default.temporaryDirectory.appendingPathComponent("addons-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
++        AddonManager.configDirectory = root
++    }
++
++    override func tearDownWithError() throws {
++        AddonManager.configDirectory = saved
++        try? FileManager.default.removeItem(at: root)
++    }
++
++    /// A bare (unsigned) add-on bundle with a manifest.
++    private func bundle(at url: URL, version: String = "1.0.0", obs: String = "32.2", arch: String = "arm64") throws -> URL {
++        let resources = url.appendingPathComponent("Contents/Resources", isDirectory: true)
++        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
++        let manifest = #"{"id":"browser-source","version":"\#(version)","obs":"\#(obs)","arch":"\#(arch)","cef":"6533"}"#
++        try Data(manifest.utf8).write(to: resources.appendingPathComponent("addon.json"))
++        return url
++    }
++
++    private let list = #"""
++    {"schema":1,"addons":[{"id":"browser-source","version":"1.2.0","obs":"32.2","cef":"6533","assets":{
++      "arm64":{"name":"a.zip","url":"https://example.invalid/a.zip","size":100,"sha256":"ABC"},
++      "x86_64":{"name":"x.zip","url":"https://example.invalid/x.zip","size":200,"sha256":"def"}}}]}
++    """#
++
++    func testOBSBaseIsMajorAndMinor() {
++        XCTAssertEqual(AddonManager.obsBase("32.2.2"), "32.2")
++        XCTAssertEqual(AddonManager.obsBase("33.0"), "33.0")
++        XCTAssertNil(AddonManager.obsBase("32"))
++        XCTAssertNil(AddonManager.obsBase(nil))
++    }
++
++    func testReadsTheOfferForEachArchitecture() throws {
++        let arm = try AddonManager.offers(from: Data(list.utf8), architecture: "arm64")
++        XCTAssertEqual(arm, [AddonOffer(id: "browser-source", version: "1.2.0", obs: "32.2",
++                                        archive: URL(string: "https://example.invalid/a.zip")!, size: 100, sha256: "abc")])
++        XCTAssertEqual(try AddonManager.offers(from: Data(list.utf8), architecture: "x86_64").first?.size, 200)
++        XCTAssertTrue(try AddonManager.offers(from: Data(list.utf8), architecture: "riscv").isEmpty)
++    }
++
++    func testOnlyAnAddOnForThisOBSBaseIsOffered() throws {
++        let offers = try AddonManager.offers(from: Data(list.utf8), architecture: "arm64")
++        XCTAssertEqual(try AddonManager.offer(in: offers, obs: "32.2").version, "1.2.0")
++        XCTAssertThrowsError(try AddonManager.offer(in: offers, obs: "33.0")) {
++            XCTAssertEqual($0 as? AppUpdateError, .noArchive)
++        }
++    }
++
++    func testReleaseCarriesItsAddOnList() throws {
++        let json = #"""
++        {"tag_name":"v0.3.0","assets":[
++          {"name":"LiveHimeMacApp-v0.3.0-arm64.zip","browser_download_url":"https://e.invalid/a.zip","digest":"sha256:aa"},
++          {"name":"addons.json","browser_download_url":"https://e.invalid/addons.json","digest":"sha256:BB"}]}
++        """#
++        let release = try AppUpdater.release(from: Data(json.utf8))
++        XCTAssertEqual(release.addons?.absoluteString, "https://e.invalid/addons.json")
++        XCTAssertEqual(release.addonsSha256, "bb")
++        let without = try AppUpdater.release(from: Data(#"{"tag_name":"v0.2.10","assets":[{"name":"LiveHimeMacApp-v0.2.10-arm64.zip","browser_download_url":"https://e.invalid/a.zip"}]}"#.utf8))
++        XCTAssertNil(without.addons)
++    }
++
++    func testStates() throws {
++        XCTAssertEqual(AddonManager.status(obs: "32.2", arch: "arm64").state, .notInstalled)
++
++        try FileManager.default.createDirectory(at: AddonManager.pluginsDirectory, withIntermediateDirectories: true)
++        _ = try bundle(at: AddonManager.installedBundle, obs: "31.1")
++        var status = AddonManager.status(obs: "32.2", arch: "arm64")
++        XCTAssertEqual(status.state, .updateNeeded)
++        XCTAssertEqual(status.installed, "1.0.0")
++
++        // Right OBS base and architecture, but not signed like the app.
++        try FileManager.default.removeItem(at: AddonManager.installedBundle)
++        _ = try bundle(at: AddonManager.installedBundle)
++        XCTAssertEqual(AddonManager.status(obs: "32.2", arch: "arm64").state, .damaged)
++        XCTAssertEqual(AddonManager.status(obs: "32.2", arch: "x86_64").state, .updateNeeded)
++
++        try FileManager.default.removeItem(at: AddonManager.installedBundle.appendingPathComponent("Contents/Resources/addon.json"))
++        XCTAssertEqual(AddonManager.status(obs: "32.2", arch: "arm64").state, .damaged)
++
++        let staged = try bundle(at: root.appendingPathComponent("staging/unpacked/obs-browser.plugin"), version: "1.1.0")
++        try AddonManager.stage(staged)
++        status = AddonManager.status(obs: "32.2", arch: "arm64")
++        XCTAssertEqual(status.state, .pendingInstall)
++        XCTAssertEqual(status.pending, "1.1.0")
++        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("staging").path))
++
++        try AddonManager.scheduleRemoval()
++        XCTAssertEqual(AddonManager.status(obs: "32.2", arch: "arm64").state, .pendingRemoval)
++        XCTAssertFalse(FileManager.default.fileExists(atPath: AddonManager.pendingBundle.path))
++
++        AddonManager.cancelPending()
++        XCTAssertEqual(AddonManager.status(obs: "32.2", arch: "arm64").state, .damaged)
++    }
++
++    func testOnlyTheOfferedAddOnIsAccepted() throws {
++        let offer = AddonOffer(id: "browser-source", version: "1.0.0", obs: "32.2",
++                               archive: URL(string: "https://e.invalid/a.zip")!, size: 1, sha256: "aa")
++        let wrongVersion = try bundle(at: root.appendingPathComponent("v/obs-browser.plugin"), version: "0.9.0")
++        XCTAssertThrowsError(try AddonManager.verify(bundle: wrongVersion, offer: offer, arch: "arm64"))
++        let wrongArch = try bundle(at: root.appendingPathComponent("a/obs-browser.plugin"), arch: "x86_64")
++        XCTAssertThrowsError(try AddonManager.verify(bundle: wrongArch, offer: offer, arch: "arm64"))
++        let unsigned = try bundle(at: root.appendingPathComponent("u/obs-browser.plugin"))
++        XCTAssertThrowsError(try AddonManager.verify(bundle: unsigned, offer: offer, arch: "arm64")) {
++            XCTAssertEqual($0 as? AppUpdateError, .invalidApp("not signed like the app"))
++        }
++    }
++}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 234e272e4..85b8ddb71 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -90,6 +90,22 @@ int livehime_core_update_install(int relaunch);
+ int livehime_core_update_rollback(void);
+ /* Emits the idle state ("status":"idle") with current, obsCurrent, previous. */
+ void livehime_core_update_state(void);
++/* When the browser add-on could not be staged with a downloaded update that
++ * changes the OBS base ("ready" carries "addonProblem"), tries again. */
++void livehime_core_update_retry_addon(void);
++
++/* Optional add-ons (so far the browser source): events are {"event":"addon",
++ * "id","state":"notInstalled|installed|updateNeeded|pendingInstall|
++ * pendingRemoval|damaged","status":"idle|checking|downloading|failed",
++ * ["installed","pending","problem","version","size","available"(false when
++ * this version offers none),"progress"(0-1),"reason","message"]}. Installs
++ * and removals take effect when LiveHime next starts. */
++void livehime_core_addon_state(void);
++void livehime_core_addon_install(void);
++void livehime_core_addon_remove(void);
++void livehime_core_addon_cancel(void);
++/* Arranges for LiveHime to reopen once it quits; returns 1 when arranged. */
++int livehime_core_relaunch(void);
+ 
+ /* Read-only check of the Bilibili interfaces LiveHime uses (public ones, the
+  * danmaku connection, the official pages; the account's own read-only ones
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index e4584567b..d369a2f45 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -216,6 +216,34 @@ LiveHime.Update.Failed.invalidApp="The downloaded app failed the signature check
+ LiveHime.Update.Failed.location="LiveHime cannot replace itself here (keep it in the Applications folder)."
+ LiveHime.Update.Failed.noArchive="This release has no app package."
+ LiveHime.Update.Failed.unsupported="Development builds do not update themselves."
++LiveHime.Addon.Title="Optional add-ons"
++LiveHime.Addon.Browser="Browser source"
++LiveHime.Addon.BrowserDesc="Shows web pages in your scenes, such as danmaku or gift-effect web tools. Downloaded separately into your user folder; the app itself is unchanged. After installing and restarting, choose Browser in Add Source."
++LiveHime.Addon.Size=" (about %1 MB)"
++LiveHime.Addon.State.checking="Looking for the add-on…"
++LiveHime.Addon.State.downloading="Downloading %1%"
++LiveHime.Addon.State.failed="The add-on was not installed: %1"
++LiveHime.Addon.State.installed="Installed %1"
++LiveHime.Addon.State.updateNeeded="Needs an update: it does not match this OBS version, so it is not loaded"
++LiveHime.Addon.State.pendingInstall="%1 downloaded; takes effect when LiveHime restarts"
++LiveHime.Addon.State.pendingRemoval="Removed (to the Trash) when LiveHime restarts"
++LiveHime.Addon.State.damaged="The add-on is damaged and not loaded"
++LiveHime.Addon.State.notInstalled="Not installed"
++LiveHime.Addon.State.unavailable="This version does not offer the browser add-on yet"
++LiveHime.Addon.Install="Download and install"
++LiveHime.Addon.Update="Update"
++LiveHime.Addon.Reinstall="Reinstall"
++LiveHime.Addon.Retry="Retry"
++LiveHime.Addon.Remove="Remove"
++LiveHime.Addon.Restart="Restart LiveHime now"
++LiveHime.Addon.Cancel="Undo"
++LiveHime.Addon.RemoveTitle="Remove the browser source"
++LiveHime.Addon.RemoveConfirm="Browser sources in your scenes stop working once it is removed. The add-on moves to the Trash the next time LiveHime starts. Remove it?"
++LiveHime.Addon.BusyOutput="Streaming or recording; restart when you are done."
++LiveHime.Addon.RetryWithUpdate="Retry downloading the browser add-on"
++LiveHime.Addon.WithUpdateFailed="The browser add-on could not be downloaded with the update. If you update now, browser sources are off until you update the add-on under Optional add-ons below."
++LiveHime.Addon.Failed.invalidApp="The downloaded add-on failed the signature check and was discarded."
++LiveHime.Addon.Failed.noArchive="No browser add-on fits this version."
+ LiveHime.Update.BannerAvailable="Version %1 is available"
+ LiveHime.Update.BannerView="View"
+ LiveHime.Update.BannerReady="Version %1 is downloaded and installs when you quit"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index 1a20640b7..c46a8feb2 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -216,6 +216,34 @@ LiveHime.Update.Failed.invalidApp="下载的应用没有通过签名检查，已
+ LiveHime.Update.Failed.location="无法替换当前应用（请把 LiveHime 放在“应用程序”文件夹里再更新）。"
+ LiveHime.Update.Failed.noArchive="这个版本没有可用的安装包。"
+ LiveHime.Update.Failed.unsupported="开发版不能自动更新。"
++LiveHime.Addon.Title="可选组件"
++LiveHime.Addon.Browser="浏览器来源"
++LiveHime.Addon.BrowserDesc="在画面里显示网页，比如弹幕、礼物特效这类网页工具。单独下载，装在你的用户目录里，不影响主程序；装好并重启后，在“添加来源”里选“浏览器”。"
++LiveHime.Addon.Size="（约 %1 MB）"
++LiveHime.Addon.State.checking="正在查找组件…"
++LiveHime.Addon.State.downloading="正在下载 %1%"
++LiveHime.Addon.State.failed="组件没有装好：%1"
++LiveHime.Addon.State.installed="已安装 %1"
++LiveHime.Addon.State.updateNeeded="需要更新：和当前的 OBS 版本不匹配，暂未加载"
++LiveHime.Addon.State.pendingInstall="已下载 %1，重启 LiveHime 后生效"
++LiveHime.Addon.State.pendingRemoval="重启 LiveHime 后移除（移到废纸篓）"
++LiveHime.Addon.State.damaged="组件已损坏，暂未加载"
++LiveHime.Addon.State.notInstalled="未安装"
++LiveHime.Addon.State.unavailable="这个版本暂时没有提供浏览器组件"
++LiveHime.Addon.Install="下载安装"
++LiveHime.Addon.Update="更新"
++LiveHime.Addon.Reinstall="重新安装"
++LiveHime.Addon.Retry="重试"
++LiveHime.Addon.Remove="移除"
++LiveHime.Addon.Restart="立即重启 LiveHime"
++LiveHime.Addon.Cancel="撤销"
++LiveHime.Addon.RemoveTitle="移除浏览器来源"
++LiveHime.Addon.RemoveConfirm="移除后，场景里的浏览器来源会失效。组件会在下次启动 LiveHime 时移到废纸篓。确定移除吗？"
++LiveHime.Addon.BusyOutput="正在直播或录制，结束后再重启。"
++LiveHime.Addon.RetryWithUpdate="重试下载浏览器组件"
++LiveHime.Addon.WithUpdateFailed="浏览器组件没能随更新一起下载。现在更新的话，浏览器来源会先停用，稍后可以在下方“可选组件”里更新。"
++LiveHime.Addon.Failed.invalidApp="下载的组件没有通过签名检查，已丢弃。"
++LiveHime.Addon.Failed.noArchive="找不到适合这个版本的浏览器组件。"
+ LiveHime.Update.BannerAvailable="发现新版本 v%1"
+ LiveHime.Update.BannerView="查看"
+ LiveHime.Update.BannerReady="v%1 已下载，退出时自动安装"
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index dc13a9c3b..0aa819a43 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -274,7 +274,8 @@ void snapshot(obs_data_t *request, obs_data_t *response, void *)
+ }
+ 
+ /* Updates for tests: optional "automatic" and "beta" (bool) and "action"
+- * (check | download | restart | skip | rollback, rollback without asking),
++ * (check | download | restart | skip | rollback, rollback without asking |
++ * retryAddon, stage the browser add-on for the downloaded update again),
+  * then replies with the Updates tab's state. With LIVEHIME_UPDATE_FEED set
+  * the feed and archive can be local files. */
+ void update(obs_data_t *request, obs_data_t *response, void *)
+@@ -297,6 +298,8 @@ void update(obs_data_t *request, obs_data_t *response, void *)
+ 			page->skipAvailable();
+ 		else if (action == "rollback")
+ 			accepted = page->rollback(false);
++		else if (action == "retryAddon")
++			livehime_core_update_retry_addon();
+ 		obs_data_set_bool(response, "accepted", accepted);
+ 		obs_data_set_bool(response, "automatic", page->automatic());
+ 		obs_data_set_string(response, "status", page->status().toUtf8().constData());
+@@ -308,6 +311,38 @@ void update(obs_data_t *request, obs_data_t *response, void *)
+ 		obs_data_set_bool(response, "beta", page->beta());
+ 		obs_data_set_string(response, "skipped", page->skipped().toUtf8().constData());
+ 		obs_data_set_string(response, "previous", page->previousVersion().toUtf8().constData());
++		obs_data_set_string(response, "addonProblem", page->addonWithUpdateProblem().toUtf8().constData());
++	});
++}
++
++/* The browser add-on for tests: optional "action" (state | install | remove |
++ * cancel | restart; remove without asking), then replies with the Updates
++ * tab's add-on state. With LIVEHIME_ADDONS_FEED set the add-on list and its
++ * zip can be local files. */
++void addon(obs_data_t *request, obs_data_t *response, void *)
++{
++	onUiThread([&] {
++		UpdatePage *page = target->features()->updates();
++		const QString action = QString::fromUtf8(obs_data_get_string(request, "action"));
++		bool accepted = true;
++		if (action == "state")
++			livehime_core_addon_state();
++		else if (action == "install")
++			page->installAddon();
++		else if (action == "remove")
++			page->removeAddon(false);
++		else if (action == "cancel")
++			page->cancelAddon();
++		else if (action == "restart")
++			accepted = page->restartForAddon();
++		obs_data_set_bool(response, "accepted", accepted);
++		obs_data_set_string(response, "state", page->addonState().toUtf8().constData());
++		obs_data_set_string(response, "status", page->addonStatus().toUtf8().constData());
++		obs_data_set_string(response, "installed", page->addonInstalled().toUtf8().constData());
++		obs_data_set_string(response, "pending", page->addonPending().toUtf8().constData());
++		obs_data_set_string(response, "reason", page->addonReason().toUtf8().constData());
++		obs_data_set_bool(response, "available", page->addonAvailable());
++		obs_data_set_double(response, "progress", page->addonProgress());
+ 	});
+ }
+ 
+@@ -427,6 +462,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "Captions", captions, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "OverlayState", overlayState, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Update", update, nullptr);
++	obs_websocket_vendor_register_request(vendor, "Addon", addon, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Snapshot", snapshot, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Probe", probe, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Emoticons", emoticons, nullptr);
+@@ -448,6 +484,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "Captions");
+ 		obs_websocket_vendor_unregister_request(vendor, "OverlayState");
+ 		obs_websocket_vendor_unregister_request(vendor, "Update");
++		obs_websocket_vendor_unregister_request(vendor, "Addon");
+ 		obs_websocket_vendor_unregister_request(vendor, "Snapshot");
+ 		obs_websocket_vendor_unregister_request(vendor, "Emoticons");
+ 		obs_websocket_vendor_unregister_request(vendor, "Probe");
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 1ac4a4f17..4e0a24fe3 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -272,6 +272,10 @@ void FeaturePanel::applyEvent(const QJsonObject &event)
+ 		updates_->handleEvent(event);
+ 		return;
+ 	}
++	if (name == "addon") {
++		updates_->handleAddonEvent(event);
++		return;
++	}
+ 	if (name == "probe") {
+ 		updates_->handleProbeEvent(event);
+ 		return;
+diff --git a/plugins/livehime/src/update-page.cpp b/plugins/livehime/src/update-page.cpp
+index 177a086e5..43f2414a9 100644
+--- a/plugins/livehime/src/update-page.cpp
++++ b/plugins/livehime/src/update-page.cpp
+@@ -85,6 +85,48 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	rollbackLayout->addWidget(rollbackText_, 1);
+ 	rollbackLayout->addWidget(rollback_);
+ 	rollbackRow_->hide();
++	/* The action row's companion when a downloaded update could not bring the
++	 * browser add-on along. */
++	addonRetry_ = new QPushButton(text("LiveHime.Addon.RetryWithUpdate"), this);
++	addonRetry_->hide();
++	connect(addonRetry_, &QPushButton::clicked, this, [this] {
++		addonRetry_->hide();
++		livehime_core_update_retry_addon();
++	});
++
++	/* "Optional add-ons": the browser source. */
++	auto *addonTitle = new QLabel(text("LiveHime.Addon.Title"), this);
++	addonTitle->setStyleSheet(QStringLiteral("font-weight: bold;"));
++	auto *addonName = new QLabel(text("LiveHime.Addon.Browser"), this);
++	addonStateLabel_ = new QLabel(this);
++	addonStateLabel_->setWordWrap(true);
++	auto *addonDesc = new QLabel(text("LiveHime.Addon.BrowserDesc"), this);
++	addonDesc->setWordWrap(true);
++	addonDesc->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
++	addonBar_ = new QProgressBar(this);
++	addonBar_->setRange(0, 100);
++	addonBar_->setTextVisible(true);
++	addonBar_->hide();
++	addonAction_ = new QPushButton(this);
++	addonSecondary_ = new QPushButton(this);
++	addonSecondary_->hide();
++	auto *addonButtons = new QHBoxLayout;
++	addonButtons->addWidget(addonAction_, 1);
++	addonButtons->addWidget(addonSecondary_);
++	connect(addonAction_, &QPushButton::clicked, this, [this] {
++		if (addonStatus_ != "failed" && (addonState_ == "pendingInstall" || addonState_ == "pendingRemoval"))
++			restartForAddon();
++		else
++			installAddon();
++	});
++	connect(addonSecondary_, &QPushButton::clicked, this, [this] {
++		if (addonState_ == "pendingInstall" || addonState_ == "pendingRemoval")
++			cancelAddon();
++		else
++			removeAddon(true);
++	});
++	showAddon();
++
+ 	link_ = new QLabel(QStringLiteral("<a href=\"%1\" style=\"color:#fb7299\">%2</a>")
+ 				   .arg(kReleases, text("LiveHime.Update.OpenReleases")),
+ 			   this);
+@@ -113,9 +155,19 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	layout->addWidget(bar_);
+ 	layout->addWidget(notes_);
+ 	layout->addLayout(actions);
++	layout->addWidget(addonRetry_);
+ 	layout->addWidget(rollbackRow_);
+ 	layout->addWidget(link_);
+ 	layout->addWidget(hint);
++	layout->addSpacing(12);
++	layout->addWidget(addonTitle);
++	auto *addonHeader = new QHBoxLayout;
++	addonHeader->addWidget(addonName);
++	addonHeader->addWidget(addonStateLabel_, 1);
++	layout->addLayout(addonHeader);
++	layout->addWidget(addonDesc);
++	layout->addWidget(addonBar_);
++	layout->addLayout(addonButtons);
+ 	layout->addStretch(1);
+ 	layout->addWidget(probeButton_);
+ 
+@@ -144,7 +196,10 @@ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ 	setStatus(automatic_ ? "LiveHime.Update.Status.auto" : "LiveHime.Update.Status.manual");
+ 	obs_frontend_add_event_callback(frontendEvent, this);
+ 	/* The core reports the versions (and a previous one to roll back to). */
+-	QTimer::singleShot(2000, this, [] { livehime_core_update_state(); });
++	QTimer::singleShot(2000, this, [] {
++		livehime_core_update_state();
++		livehime_core_addon_state();
++	});
+ }
+ 
+ UpdatePage::~UpdatePage()
+@@ -340,6 +395,11 @@ void UpdatePage::handleEvent(const QJsonObject &event)
+ 		if (!obsNew.isEmpty() && obsNew.section('.', 0, 0) != obsCurrent_.section('.', 0, 0))
+ 			status_->setText(status_->text() + QStringLiteral("\n") +
+ 					 text("LiveHime.Update.ObsUpgrade").arg(obsCurrent_, obsNew));
++		const QString addonProblem = event.value("addonProblem").toString();
++		addonWithUpdateProblem_ = addonProblem;
++		addonRetry_->setVisible(!addonProblem.isEmpty());
++		if (!addonProblem.isEmpty())
++			status_->setText(status_->text() + QStringLiteral("\n") + text("LiveHime.Addon.WithUpdateFailed"));
+ 		emit ready(version);
+ 	} else if (status == "failed") {
+ 		const QString reason = event.value("reason").toString();
+@@ -362,6 +422,128 @@ void UpdatePage::handleEvent(const QJsonObject &event)
+ 	}
+ }
+ 
++void UpdatePage::handleAddonEvent(const QJsonObject &event)
++{
++	addonState_ = event.value("state").toString();
++	addonStatus_ = event.value("status").toString();
++	addonInstalled_ = event.value("installed").toString();
++	addonPending_ = event.value("pending").toString();
++	addonProblem_ = event.value("problem").toString();
++	if (event.contains("available"))
++		addonAvailable_ = event.value("available").toBool();
++	if (event.contains("size"))
++		addonSize_ = static_cast<qint64>(event.value("size").toDouble());
++	addonProgress_ = event.value("progress").toDouble();
++	addonReason_ = addonStatus_ == "failed" ? event.value("reason").toString() : QString();
++	if (addonStatus_ == "failed")
++		blog(LOG_WARNING, "[livehime] browser add-on: %s %s", addonReason_.toUtf8().constData(),
++		     event.value("message").toString().toUtf8().constData());
++	showAddon();
++}
++
++void UpdatePage::showAddon()
++{
++	const bool pending = addonState_ == "pendingInstall" || addonState_ == "pendingRemoval";
++	const QString size = addonSize_ > 0 ? text("LiveHime.Addon.Size").arg(qRound(addonSize_ / 1048576.0))
++					    : QString();
++	QString message;
++	QString action;
++	QString secondary;
++	bool error = false;
++	if (addonStatus_ == "checking") {
++		message = text("LiveHime.Addon.State.checking");
++	} else if (addonStatus_ == "downloading") {
++		message = text("LiveHime.Addon.State.downloading").arg(qRound(addonProgress_ * 100));
++		addonBar_->setValue(static_cast<int>(addonProgress_ * 100));
++	} else if (addonStatus_ == "failed") {
++		/* The add-on's own wording first, then the updater's. */
++		QString reason;
++		for (const char *prefix : {"LiveHime.Addon.Failed.", "LiveHime.Update.Failed."}) {
++			const QByteArray key = prefix + addonReason_.toUtf8();
++			reason = QString::fromUtf8(obs_module_text(key.constData()));
++			if (reason != QString::fromUtf8(key))
++				break;
++			reason = text("LiveHime.Update.Failed.network");
++		}
++		message = text("LiveHime.Addon.State.failed").arg(reason);
++		action = text("LiveHime.Addon.Retry");
++		error = true;
++	} else if (addonState_ == "installed") {
++		message = text("LiveHime.Addon.State.installed").arg(addonInstalled_);
++		secondary = text("LiveHime.Addon.Remove");
++	} else if (addonState_ == "updateNeeded") {
++		message = text("LiveHime.Addon.State.updateNeeded");
++		action = text("LiveHime.Addon.Update") + size;
++		secondary = text("LiveHime.Addon.Remove");
++		error = true;
++	} else if (addonState_ == "pendingInstall") {
++		message = text("LiveHime.Addon.State.pendingInstall").arg(addonPending_);
++		action = text("LiveHime.Addon.Restart");
++		secondary = text("LiveHime.Addon.Cancel");
++	} else if (addonState_ == "pendingRemoval") {
++		message = text("LiveHime.Addon.State.pendingRemoval");
++		action = text("LiveHime.Addon.Restart");
++		secondary = text("LiveHime.Addon.Cancel");
++	} else if (addonState_ == "damaged") {
++		message = text("LiveHime.Addon.State.damaged");
++		action = text("LiveHime.Addon.Reinstall") + size;
++		secondary = text("LiveHime.Addon.Remove");
++		error = true;
++	} else if (addonState_ == "notInstalled" && !addonAvailable_) {
++		message = text("LiveHime.Addon.State.unavailable");
++	} else {
++		message = text("LiveHime.Addon.State.notInstalled");
++		action = text("LiveHime.Addon.Install") + size;
++	}
++	if (!pending && !addonAvailable_ && addonStatus_ != "failed" && addonState_ != "installed")
++		action.clear();
++	const bool busy = addonStatus_ == "checking" || addonStatus_ == "downloading";
++	addonStateLabel_->setText(message);
++	addonStateLabel_->setStyleSheet(error ? QStringLiteral("color: #e06c75;") : QStringLiteral("color: #9aa0ab;"));
++	addonBar_->setVisible(addonStatus_ == "downloading");
++	addonAction_->setText(action);
++	addonAction_->setVisible(!action.isEmpty() && !busy);
++	addonSecondary_->setText(secondary);
++	addonSecondary_->setVisible(!secondary.isEmpty() && !busy);
++}
++
++void UpdatePage::installAddon()
++{
++	livehime_core_addon_install();
++}
++
++void UpdatePage::removeAddon(bool confirm)
++{
++	if (confirm && QMessageBox::question(this, text("LiveHime.Addon.RemoveTitle"),
++					     text("LiveHime.Addon.RemoveConfirm")) != QMessageBox::Yes)
++		return;
++	livehime_core_addon_remove();
++}
++
++void UpdatePage::cancelAddon()
++{
++	livehime_core_addon_cancel();
++}
++
++bool UpdatePage::restartForAddon()
++{
++	/* With a downloaded update, restarting installs it too (the staged add-on
++	 * applies on the way up either way). */
++	if (!readyVersion_.isEmpty())
++		return restartNow();
++	if (obs_frontend_streaming_active() || obs_frontend_recording_active()) {
++		addonStateLabel_->setText(text("LiveHime.Addon.BusyOutput"));
++		addonStateLabel_->setStyleSheet(QStringLiteral("color: #e06c75;"));
++		return false;
++	}
++	if (!livehime_core_relaunch())
++		return false;
++	blog(LOG_INFO, "[livehime] restarting to apply the browser add-on change");
++	if (auto *main = static_cast<QMainWindow *>(obs_frontend_get_main_window()))
++		QMetaObject::invokeMethod(main, "close", Qt::QueuedConnection);
++	return true;
++}
++
+ void UpdatePage::setStatus(const char *key, const QString &arg, bool error)
+ {
+ 	status_key_ = QString::fromUtf8(key);
+diff --git a/plugins/livehime/src/update-page.hpp b/plugins/livehime/src/update-page.hpp
+index 135935fcd..ec7ff8bab 100644
+--- a/plugins/livehime/src/update-page.hpp
++++ b/plugins/livehime/src/update-page.hpp
+@@ -20,6 +20,8 @@ class QTimer;
+  * "Restart and update" (not while streaming or recording). The beta option
+  * also offers pre-releases; a version can be skipped (automatic mode then
+  * leaves it alone); the previous version can be put back (and skipped).
++ * Below, "Optional add-ons" (the browser source): install, update, remove;
++ * changes take effect when LiveHime restarts.
+  * Settings live in features.json under "update". */
+ class UpdatePage : public QWidget {
+ 	Q_OBJECT
+@@ -29,6 +31,22 @@ public:
+ 	~UpdatePage() override;
+ 
+ 	void handleEvent(const QJsonObject &event);
++	/* Browser add-on events ({"event":"addon"}). */
++	void handleAddonEvent(const QJsonObject &event);
++	/* Automation and the buttons: install/update, remove, drop a staged change. */
++	void installAddon();
++	void removeAddon(bool confirm = true);
++	void cancelAddon();
++	/* Quits to apply a staged add-on change (with a downloaded update, installs
++	 * that too); false while streaming or recording. */
++	bool restartForAddon();
++	QString addonState() const { return addonState_; }
++	QString addonStatus() const { return addonStatus_; }
++	QString addonInstalled() const { return addonInstalled_; }
++	QString addonPending() const { return addonPending_; }
++	QString addonReason() const { return addonReason_; }
++	bool addonAvailable() const { return addonAvailable_; }
++	double addonProgress() const { return addonProgress_; }
+ 	/* Interface check results, forwarded to its dialog. */
+ 	void handleProbeEvent(const QJsonObject &event);
+ 	ProbeDialog *probe();
+@@ -51,6 +69,8 @@ public:
+ 	QString availableVersion() const { return availableVersion_; }
+ 	double progress() const { return progress_; }
+ 	QString failReason() const { return failReason_; }
++	/* Why the browser add-on did not come with the downloaded update, if so. */
++	QString addonWithUpdateProblem() const { return addonWithUpdateProblem_; }
+ 	/* The running app's version (CFBundleShortVersionString). */
+ 	static QString currentVersion();
+ 
+@@ -62,6 +82,7 @@ signals:
+ private:
+ 	static void frontendEvent(enum obs_frontend_event event, void *param);
+ 	void setStatus(const char *key, const QString &arg = QString(), bool error = false);
++	void showAddon();
+ 	void load();
+ 	void save() const;
+ 
+@@ -79,6 +100,16 @@ private:
+ 	QString page_;
+ 	double progress_ = 0;
+ 	QString failReason_;
++	QString addonWithUpdateProblem_;
++	QString addonState_;
++	QString addonStatus_ = QStringLiteral("idle");
++	QString addonInstalled_;
++	QString addonPending_;
++	QString addonProblem_;
++	QString addonReason_;
++	bool addonAvailable_ = true;
++	double addonProgress_ = 0;
++	qint64 addonSize_ = 0;
+ 
+ 	QLabel *version_;
+ 	QCheckBox *auto_;
+@@ -96,4 +127,9 @@ private:
+ 	QPushButton *probeButton_;
+ 	ProbeDialog *probe_ = nullptr;
+ 	QTimer *timer_;
++	QLabel *addonStateLabel_;
++	QProgressBar *addonBar_;
++	QPushButton *addonAction_;
++	QPushButton *addonSecondary_;
++	QPushButton *addonRetry_;
+ };
+-- 
+2.54.0 (Apple Git-157)
+

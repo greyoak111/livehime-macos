@@ -120,8 +120,9 @@ CEF lives in `obs-studio-clean/.deps` (about 90 MB for arm64, 100 MB for x86_64)
    Release notes say what changed, whether OBS was upgraded and whether settings migrate, and **open with
    the “which file to download” table**, as in the v0.2.10 notes.
 8. （组件上线后）`scripts/verify-browser-addon.sh` 两个架构全部 PASS；`addons.json` 已附上，且其中组件的
-   `obs` 与这次发布的 OBS 底座一致。/ (Once the add-on ships) the add-on check passes for both architectures,
-   and `addons.json` is attached with an `obs` that matches this release's OBS base.
+   `obs` 与这次发布的 OBS 底座一致；`e2e-addon.mjs` 和 `e2e-addon-update.mjs` 全部通过。
+   (Once the add-on ships) the add-on check passes for both architectures, `addons.json` is attached with an
+   `obs` that matches this release's OBS base, and the two add-on end-to-end tests pass.
 
 ## 出问题时 / When a release is bad
 
