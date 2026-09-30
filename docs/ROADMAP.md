@@ -62,6 +62,9 @@ v0.2.0 构建时关闭了 `ENABLE_BROWSER`（CEF 体积大、签名复杂）。2
 主程序体积不变，需要的人在应用里一键安装。计划见 [浏览器来源可选组件计划书](BROWSER_ADDON_PLAN.md)，尚未开工。
 Decided on 2026-09-29: an optional add-on installed from inside the app; see the plan. Not started.
 
+同一份计划书的第二部分是**更新说明弹窗**：更新后首次打开时居中显示这次更新的内容（内容过多时在弹窗内滚动），可以先于浏览器组件单独做。
+Part 2 of the same plan is a **What's New dialog** shown centered on the first launch after an update (scrolls when long); it can ship before the add-on.
+
 ### 3. 其他 / Other
 
 - 公证（notarization）与 Intel 构建：需要 Apple Developer 账号，暂不安排。
