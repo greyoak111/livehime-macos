@@ -26,6 +26,14 @@
 
 ## 打包 / Packaging
 
+**构建前**，先写好 `docs/RELEASE_NOTES_v<版本>.md`，并复制到 `obs-studio-clean/plugins/livehime/data/release-notes/`
+（随 OBS 分支补丁提交）：应用更新后第一次打开时，“更新说明”弹窗就读这份，只显示“新功能”“修复”“升级”三节，最多最近三个版本。
+`scripts/check-release-notes.sh <版本>` 检查它存在、有内容可显示、且与打进应用的那份一致。
+**Before building**, write `docs/RELEASE_NOTES_v<version>.md` and copy it into the fork's
+`plugins/livehime/data/release-notes/` (committed with the fork patches): the What's New dialog shown on the first
+launch after an update reads it (What's new, Fixes and Upgrade only, at most the three newest versions).
+`scripts/check-release-notes.sh <version>` checks it exists, has something to show and matches the bundled copy.
+
 每个版本的附件（`dist/v<版本>/`），都从同一次构建出来：/ Every release's files, from the same builds:
 
 | 附件 / File | 做法 / How |
@@ -123,6 +131,8 @@ CEF lives in `obs-studio-clean/.deps` (about 90 MB for arm64, 100 MB for x86_64)
    `obs` 与这次发布的 OBS 底座一致；`e2e-addon.mjs` 和 `e2e-addon-update.mjs` 全部通过。
    (Once the add-on ships) the add-on check passes for both architectures, `addons.json` is attached with an
    `obs` that matches this release's OBS base, and the two add-on end-to-end tests pass.
+9. `scripts/check-release-notes.sh <版本>` 全部 PASS；`e2e-whats-new.mjs` 全部通过。
+   The release notes check passes and the What's New end-to-end test passes.
 
 ## 出问题时 / When a release is bad
 

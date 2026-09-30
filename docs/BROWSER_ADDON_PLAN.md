@@ -1,7 +1,7 @@
 # 浏览器来源可选组件 + 更新说明弹窗：计划书 / Browser source add-on + What's New dialog: plan
 
-2026-09-29 起草，2026-09-30 修订（组件改为独立版本、两阶段更新、状态机；新增更新说明弹窗）。组件 P0（可行性）、P1（打包）、P2（应用内管理）已完成；P3（发布，随 v0.3.0）未开工。
-Drafted 2026-09-29, revised 2026-09-30. Add-on P0, P1 and P2 done; P3 (release, with v0.3.0) not started.
+2026-09-29 起草，2026-09-30 修订（组件改为独立版本、两阶段更新、状态机；新增更新说明弹窗）。组件 P0（可行性）、P1（打包）、P2（应用内管理）和更新说明弹窗（W1–W3）已完成；组件 P3（发布，随 v0.3.0）未开工。
+Drafted 2026-09-29, revised 2026-09-30. Add-on P0–P2 and the What's New dialog (W1–W3) done; add-on P3 (release, with v0.3.0) not started.
 
 第一部分是浏览器来源组件，第二部分是更新说明弹窗。两者互相独立，可以分开做；弹窗更小，适合先做。
 Part 1 is the browser add-on, part 2 the What's New dialog. They are independent; the dialog is smaller and can come first.
@@ -255,10 +255,23 @@ On the first launch after an update, show a small dialog centered on the main wi
   全新安装不弹；从旧版本更新后弹、居中、内容可滚动；点“知道了”后不再弹；回滚后不弹。
 - 长内容场景：把多个版本的说明一起塞进去，确认按钮始终可见、可以滚到底。
 
+## 结果（2026-09-30）/ Results
+
+按上面的设计做完，实测中改了三处：/ Built as designed, with three changes found in testing:
+- **最多显示最近三个版本**，更早的只留一句“更早版本的变化见完整发布说明”。原设计会把跳过的版本全列出来，太长。
+- **弹窗不是模态的**：模态弹窗开着时会挡住退出，测试里因此叠开了多个实例。现在开着弹窗也能正常退出（退出不算“已读”，下次还会弹）。
+- **显示前把 `<` 转义**：0.2.8 的说明里有 `<start>`，会被当成 HTML 标签吞掉后面的文字。
+
+判定 / Deciding what to show：`lastSeenVersion` 为空时，这次运行开始前已有 LiveHime 设置 = 从 0.3.0 之前升级上来，只显示当前版本；没有任何设置 = 全新安装，不弹。
+回滚（记录的版本更新）不弹，并记下当前版本。只有用户点按钮、按 Esc 或点关闭按钮才算“已读”。
+
+测试 / Tests：Swift 单元测试 5 个（全套 111 个，0 失败）；`e2e-whats-new.mjs` 15 项全部通过（从旧版升级、居中、记录、下次不弹、多版本滚动且不超过主窗口 70%、开着退出下次再弹、回滚、全新安装）。
+弹窗截图检查过开头和滚到底两种状态。`scripts/check-release-notes.sh` 对 0.2.10 通过；0.3.0 的说明还没写，所以现在不通过，这是预期的。
+
 ## 分阶段 / Phases
 
 | 阶段 | 内容 | 完成标准 |
 |---|---|---|
-| W1 | 构建时打包发布说明；段落提取与版本选择（含单元测试） | 测试通过；应用包里能看到 `release-notes/` |
-| W2 | 弹窗界面、`lastSeenVersion`、首次启动逻辑 | 端到端测试全部通过 |
-| W3 | 发布流程加“发布说明必须有新功能或修复”检查，写进 `docs/RELEASING.md` | 下一个版本起生效 |
+| **W1** ✅ | 构建时打包发布说明；段落提取与版本选择（含单元测试） | 测试通过；应用包里能看到 `release-notes/` |
+| **W2** ✅ | 弹窗界面、`lastSeenVersion`、首次启动逻辑 | 端到端测试全部通过 |
+| **W3** ✅ | 发布流程加“发布说明必须有新功能或修复”检查，写进 `docs/RELEASING.md` | 下一个版本起生效 |

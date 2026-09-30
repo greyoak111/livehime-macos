@@ -1,0 +1,1398 @@
+From 4099e330cf942159a532aafc1bb1fae82015ccf1 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 19:52:55 +0800
+Subject: [PATCH] Show what's new once after an update
+
+After an update, the first start shows a dialog centered on the main
+window with what changed since the last version seen: the What's new,
+Fixes and Upgrade sections of the bundled release notes (now under
+data/release-notes), at most the three newest versions, with a pointer
+to the full notes for earlier ones. Long text scrolls inside the
+dialog, which is at most 70% of the main window's height; it is not
+modal. Closing it records the version (update.lastSeenVersion);
+quitting with it open shows it again. A fresh install and a rollback
+show nothing; an upgrade from a version that did not record the last
+one seen shows the current version. When the browser add-on needs an
+update, a line on top offers to open the Updates tab.
+
+Tested by unit tests and e2e-whats-new.mjs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/tests/README.md            |  18 +++
+ build-aux/livehime/tests/e2e-whats-new.mjs    | 143 ++++++++++++++++++
+ plugins/livehime/CMakeLists.txt               |   3 +
+ .../Sources/LiveHimeCore/ReleaseNotes.swift   |  89 +++++++++++
+ .../LiveHimeCoreTests/ReleaseNotesTests.swift |  98 ++++++++++++
+ plugins/livehime/core/include/livehime-core.h |   6 +
+ plugins/livehime/data/locale/en-US.ini        |   6 +
+ plugins/livehime/data/locale/zh-CN.ini        |   6 +
+ .../release-notes/RELEASE_NOTES_v0.2.0.md     |  76 ++++++++++
+ .../release-notes/RELEASE_NOTES_v0.2.1.md     |  55 +++++++
+ .../release-notes/RELEASE_NOTES_v0.2.10.md    |  49 ++++++
+ .../release-notes/RELEASE_NOTES_v0.2.6.md     |  50 ++++++
+ .../release-notes/RELEASE_NOTES_v0.2.7.md     |  41 +++++
+ .../release-notes/RELEASE_NOTES_v0.2.8.md     |  58 +++++++
+ .../release-notes/RELEASE_NOTES_v0.2.9.md     |  48 ++++++
+ plugins/livehime/src/automation.cpp           |  34 +++++
+ plugins/livehime/src/feature-panel.cpp        |  16 ++
+ plugins/livehime/src/update-page.cpp          |  77 ++++++++++
+ plugins/livehime/src/update-page.hpp          |  15 ++
+ plugins/livehime/src/whats-new-dialog.cpp     | 128 ++++++++++++++++
+ plugins/livehime/src/whats-new-dialog.hpp     |  38 +++++
+ 21 files changed, 1054 insertions(+)
+ create mode 100644 build-aux/livehime/tests/e2e-whats-new.mjs
+ create mode 100644 plugins/livehime/core/Sources/LiveHimeCore/ReleaseNotes.swift
+ create mode 100644 plugins/livehime/core/Tests/LiveHimeCoreTests/ReleaseNotesTests.swift
+ create mode 100644 plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.0.md
+ create mode 100644 plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.1.md
+ create mode 100644 plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.10.md
+ create mode 100644 plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.6.md
+ create mode 100644 plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.7.md
+ create mode 100644 plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.8.md
+ create mode 100644 plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.9.md
+ create mode 100644 plugins/livehime/src/whats-new-dialog.cpp
+ create mode 100644 plugins/livehime/src/whats-new-dialog.hpp
+
+diff --git a/build-aux/livehime/tests/README.md b/build-aux/livehime/tests/README.md
+index 25c3b7abc..fb1f87006 100644
+--- a/build-aux/livehime/tests/README.md
++++ b/build-aux/livehime/tests/README.md
+@@ -141,6 +141,24 @@ node e2e-addon.mjs build_macos/frontend/RelWithDebInfo/LiveHime.app <websocket p
+ node e2e-addon-update.mjs <websocket password> build_macos/frontend/RelWithDebInfo/LiveHime.app <add-on zip> /tmp/livehime-addon-update
+ ```
+ 
++## What's new after an update
++
++`e2e-whats-new.mjs` sets the last version seen (`update.lastSeenVersion` in
++LiveHime's features.json) before each launch and checks through the
++`WhatsNew` vendor request: an upgrade from a version that did not record it
++shows the current version's notes, centered on the main window; closing it
++records the version and the next start shows nothing; several versions behind
++shows the dialog with scrolling text no taller than 70% of the main window;
++quitting with it open records nothing, so it shows again; after a rollback and
++on a fresh install (no LiveHime settings) nothing is shown and the current
++version is recorded. It launches and quits LiveHime itself and stops if an
++instance is still running. It rewrites LiveHime's own settings: back up
++`plugin_config` first and put it back after.
++
++```bash
++node e2e-whats-new.mjs build_macos/frontend/RelWithDebInfo/LiveHime.app <websocket password> [dialog.png]
++```
++
+ ## Bilibili interface check
+ 
+ The Updates tab's "B 站接口巡检…" runs a read-only check of the Bilibili
+diff --git a/build-aux/livehime/tests/e2e-whats-new.mjs b/build-aux/livehime/tests/e2e-whats-new.mjs
+new file mode 100644
+index 000000000..8a4d344a4
+--- /dev/null
++++ b/build-aux/livehime/tests/e2e-whats-new.mjs
+@@ -0,0 +1,143 @@
++// The "What's new" dialog after an update, driven by the last version seen
++// (features.json "update"."lastSeenVersion"), with no GitHub involved:
++// - upgrading from a version that did not record it (settings exist, no
++//   lastSeenVersion) shows the current version's notes, centered on the main
++//   window; closing it records the version, and the next start shows nothing;
++// - several versions behind shows each of them, newest first; the text
++//   scrolls inside a dialog no taller than 70% of the main window;
++// - after a rollback (last seen newer) and on a fresh install (no LiveHime
++//   settings) nothing is shown and the current version is recorded;
++// - quitting with the dialog open shows it again next time.
++// Launches and quits LiveHime itself (isolated Keychain item). It rewrites
++// LiveHime's own settings (plugin_config/livehime): back up plugin_config
++// first and put it back after, and do not run it while a normal LiveHime is open.
++// Usage: node e2e-whats-new.mjs <LiveHime.app> <websocket password> [<dialog PNG>]
++import { createHash } from 'node:crypto';
++import { execFileSync } from 'node:child_process';
++import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
++import { homedir } from 'node:os';
++import path from 'node:path';
++
++const [app, password, png] = process.argv.slice(2);
++const sha = (s) => createHash('sha256').update(s).digest('base64');
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const plist = (key) => execFileSync('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, `${app}/Contents/Info.plist`]).toString().trim();
++const bundleId = plist('CFBundleIdentifier');
++const current = plist('CFBundleShortVersionString');
++const dir = path.join(homedir(), 'Library/Application Support/LiveHime/obs-studio/plugin_config/livehime');
++const features = path.join(dir, 'features.json');
++let failures = 0;
++const check = (name, ok, detail = '') => {
++  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : `  (${detail})`}`);
++  if (!ok) failures++;
++};
++
++function setLastSeen(version) {
++  const data = existsSync(features) ? JSON.parse(readFileSync(features, 'utf8')) : {};
++  data.update = { ...(data.update ?? {}) };
++  if (version === undefined) delete data.update.lastSeenVersion; else data.update.lastSeenVersion = version;
++  mkdirSync(dir, { recursive: true });
++  writeFileSync(features, JSON.stringify(data, null, 4));
++}
++const lastSeenOnDisk = () => (existsSync(features) ? JSON.parse(readFileSync(features, 'utf8')).update?.lastSeenVersion ?? '' : '');
++
++let ws, pend, id;
++async function connect() {
++  for (let i = 0; i < 120; i++) {
++    try {
++      ws = new WebSocket('ws://127.0.0.1:4466');
++      pend = new Map();
++      id = 1;
++      await new Promise((ok, bad) => {
++        ws.onerror = bad;
++        ws.onmessage = (m) => {
++          const msg = JSON.parse(m.data);
++          if (msg.op === 0) { const a = msg.d.authentication; ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, authentication: sha(sha(password + a.salt) + a.challenge) } })); }
++          else if (msg.op === 2) ok();
++          else if (msg.op === 7) pend.get(msg.d.requestId)?.(msg.d);
++        };
++      });
++      return;
++    } catch { await sleep(500); }
++  }
++  throw new Error('LiveHime did not come up');
++}
++const whatsNew = (requestData = {}) => new Promise((ok) => {
++  const requestId = String(id++);
++  pend.set(requestId, (d) => ok(d.responseData?.responseData ?? {}));
++  ws.send(JSON.stringify({ op: 6, d: { requestType: 'CallVendorRequest', requestId, requestData: { vendorName: 'livehime', requestType: 'WhatsNew', requestData } } }));
++});
++const running = () => { try { execFileSync('pgrep', ['-f', `${app}/Contents/MacOS/`]); return true; } catch { return false; } };
++async function launch() {
++  // Never a second instance: it would answer instead of the one under test.
++  if (running()) throw new Error('LiveHime is still running');
++  execFileSync('open', ['-n', '--env', 'LIVEHIME_KEYCHAIN_SERVICE=local.livehime.macos.e2e-test', app]);
++  await connect();
++  await sleep(4000); // loading finishes, then the dialog appears
++}
++async function quit() {
++  try { execFileSync('osascript', ['-e', `tell application id "${bundleId}" to quit`], { stdio: 'ignore' }); } catch {}
++  for (let i = 0; i < 60 && running(); i++) await sleep(500);
++  if (running()) throw new Error('LiveHime did not quit');
++}
++
++async function run() {
++  // Upgrade from a version before this dialog: settings exist, nothing recorded.
++  setLastSeen(undefined);
++  await launch();
++  let r = await whatsNew();
++  check(`an upgrade from before 0.3.0 shows v${current}`, r.open && r.title === `LiveHime v${current}`, JSON.stringify(r));
++  check('...centered on the main window', r.centered === true, JSON.stringify(r));
++  r = await whatsNew({ action: 'close' });
++  await sleep(300);
++  check('closing records the version', (await whatsNew()).lastSeen === current);
++  await quit();
++  check('...on disk', lastSeenOnDisk() === current, lastSeenOnDisk());
++  await launch();
++  check('the next start shows nothing', (await whatsNew()).open === false);
++  await quit();
++
++  // Several versions behind: all of them, and the text scrolls.
++  setLastSeen('0.2.5');
++  await launch();
++  r = await whatsNew(png ? { path: png } : {});
++  check('several versions behind shows the dialog', r.open === true, JSON.stringify(r));
++  check('...the text scrolls inside it', r.scrolls === true, JSON.stringify(r));
++  check('...no taller than 70% of the main window (plus its title bar)', r.height <= r.mainHeight * 0.7 + 4, JSON.stringify(r));
++  check('...centered', r.centered === true, JSON.stringify(r));
++  // Quitting with it open: shown again next time.
++  await quit();
++  check('quitting with it open records nothing', lastSeenOnDisk() === '0.2.5', lastSeenOnDisk());
++  await launch();
++  check('...so it shows again', (await whatsNew()).open === true);
++  await whatsNew({ action: 'close' });
++  await quit();
++
++  // After a rollback: nothing.
++  setLastSeen('9.9.9');
++  await launch();
++  check('after a rollback nothing is shown', (await whatsNew()).open === false);
++  await quit();
++  check('...and the current version is recorded', lastSeenOnDisk() === current, lastSeenOnDisk());
++
++  // A fresh install: no LiveHime settings at all.
++  const aside = `${dir}.e2e-aside`;
++  rmSync(aside, { recursive: true, force: true });
++  renameSync(dir, aside);
++  try {
++    await launch();
++    check('a fresh install shows nothing', (await whatsNew()).open === false);
++    await quit();
++    check('...and records the current version', lastSeenOnDisk() === current, lastSeenOnDisk());
++  } finally {
++    rmSync(dir, { recursive: true, force: true });
++    renameSync(aside, dir);
++  }
++}
++
++run().catch((e) => { console.log(`FAIL  ${e.message}`); failures++; })
++  .finally(async () => {
++    if (running()) await quit().catch(() => console.log('LiveHime is still running: quit it by hand'));
++    console.log(failures ? `${failures} check(s) failed` : "what's new end to end OK");
++    process.exit(failures ? 1 : 0);
++  });
+diff --git a/plugins/livehime/CMakeLists.txt b/plugins/livehime/CMakeLists.txt
+index 1b5968bae..a4070461f 100644
+--- a/plugins/livehime/CMakeLists.txt
++++ b/plugins/livehime/CMakeLists.txt
+@@ -29,6 +29,7 @@ target_sources(
+     core/Sources/LiveHimeCore/LiveRoomActions.swift
+     core/Sources/LiveHimeCore/PlatformSupport.swift
+     core/Sources/LiveHimeCore/QRLogin.swift
++    core/Sources/LiveHimeCore/ReleaseNotes.swift
+     core/Sources/LiveHimeCore/SessionMaintenance.swift
+     core/Sources/LiveHimeCore/WebLoginWindow.swift
+     core/Sources/LiveHimeCore/SessionCoordinator.swift
+@@ -46,6 +47,8 @@ target_sources(
+     src/probe-dialog.hpp
+     src/update-page.cpp
+     src/update-page.hpp
++    src/whats-new-dialog.cpp
++    src/whats-new-dialog.hpp
+     src/caption-overlay.cpp
+     src/caption-overlay.hpp
+     src/captions-page.cpp
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/ReleaseNotes.swift b/plugins/livehime/core/Sources/LiveHimeCore/ReleaseNotes.swift
+new file mode 100644
+index 000000000..42b6870c5
+--- /dev/null
++++ b/plugins/livehime/core/Sources/LiveHimeCore/ReleaseNotes.swift
+@@ -0,0 +1,89 @@
++import Foundation
++
++/// The "What's new" text shown once after an update, from the release notes
++/// bundled with the app (data/release-notes/RELEASE_NOTES_v<version>.md, the
++/// same files as docs/ in the LiveHime repository). Only what matters to
++/// someone who already has the update is kept: what's new, fixes and upgrade
++/// notes; which file to download, validation and source are left out.
++public enum ReleaseNotes {
++    /// Section headings kept, by their Chinese part ("## 新功能 / What's new").
++    static let shown = ["新功能", "修复", "升级"]
++    /// At most this many versions (the newest); older ones are left to the full notes.
++    static let maxVersions = 3
++
++    /// The kept "## …" sections of one release's notes, each heading one level down.
++    static func sections(of markdown: String) -> String {
++        var kept: [String] = []
++        var keeping = false
++        for line in markdown.components(separatedBy: "\n") {
++            if line.hasPrefix("## ") {
++                let title = line.dropFirst(3).trimmingCharacters(in: .whitespaces)
++                keeping = shown.contains { title.hasPrefix($0) }
++                if keeping { kept.append("#" + line) }
++            } else if line.hasPrefix("# ") {
++                keeping = false
++            } else if keeping {
++                // "<start>" and the like would be taken as HTML tags and hide the text after them.
++                kept.append(line.replacingOccurrences(of: "<", with: "\\<"))
++            }
++        }
++        return kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++
++    /// Versions with notes in `directory`.
++    static func versions(in directory: URL) -> [String] {
++        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
++        return names.compactMap { name in
++            guard name.hasPrefix("RELEASE_NOTES_v"), name.hasSuffix(".md") else { return nil }
++            return String(name.dropFirst("RELEASE_NOTES_v".count).dropLast(".md".count))
++        }
++    }
++
++    /// The versions to show after updating from `lastSeen` to `current`, newest
++    /// first: those after `lastSeen` up to `current`. Without `lastSeen` (an
++    /// upgrade from a version that did not record it) only `current`.
++    static func toShow(lastSeen: String?, current: String, available: [String]) -> [String] {
++        available.filter { version in
++            !AppUpdater.isNewer(version, than: current)
++                && (lastSeen.map { AppUpdater.isNewer(version, than: $0) } ?? (version == current))
++        }.sorted { AppUpdater.isNewer($0, than: $1) }
++    }
++
++    /// Markdown for the dialog, or nil when there is nothing to show.
++    public static func whatsNew(directory: URL, lastSeen: String?, current: String) -> (versions: [String], markdown: String)? {
++        var shownVersions: [String] = []
++        var parts: [String] = []
++        let due = toShow(lastSeen: lastSeen, current: current, available: versions(in: directory))
++        for version in due {
++            if shownVersions.count == maxVersions { break }
++            let file = directory.appendingPathComponent("RELEASE_NOTES_v\(version).md")
++            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
++            let body = sections(of: text)
++            guard !body.isEmpty else { continue }
++            shownVersions.append(version)
++            parts.append("## v\(version)\n\n\(body)")
++        }
++        guard !parts.isEmpty else { return nil }
++        if let last = shownVersions.last, due.contains(where: { AppUpdater.isNewer(last, than: $0) }) {
++            parts.append("更早版本的变化见完整发布说明。/ For earlier versions, see the full release notes.")
++        }
++        return (shownVersions, parts.joined(separator: "\n\n"))
++    }
++}
++
++/// Emits {"event":"whatsNew","current","versions":[…],"markdown","addonUpdateNeeded"}
++/// for updating from `last_seen` (empty: from a version that did not record it);
++/// "markdown" is empty when there is nothing to show. `notes_dir` holds the bundled notes.
++@_cdecl("livehime_core_whats_new")
++public func livehime_core_whats_new(_ notesDir: UnsafePointer<CChar>?, _ lastSeen: UnsafePointer<CChar>?) {
++    guard let notesDir else { return }
++    let directory = URL(fileURLWithPath: String(cString: notesDir), isDirectory: true)
++    let seen = lastSeen.map { String(cString: $0) }.flatMap { $0.isEmpty ? nil : $0 }
++    let current = AppUpdater.currentVersion
++    DispatchQueue.main.async {
++        let result = ReleaseNotes.whatsNew(directory: directory, lastSeen: seen, current: current)
++        CoreBridge.shared?.emit(["event": "whatsNew", "current": current, "versions": result?.versions ?? [],
++                                 "markdown": result?.markdown ?? "",
++                                 "addonUpdateNeeded": AddonManager.status().state == .updateNeeded])
++    }
++}
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/ReleaseNotesTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/ReleaseNotesTests.swift
+new file mode 100644
+index 000000000..df6d00f9e
+--- /dev/null
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/ReleaseNotesTests.swift
+@@ -0,0 +1,98 @@
++import XCTest
++@testable import LiveHimeCore
++
++final class ReleaseNotesTests: XCTestCase {
++    private let notes = """
++    # LiveHime macOS v0.3.0
++
++    Intro that is not shown.
++
++    ## 下载哪个文件 / Which file to download
++
++    | a | b |
++
++    ## 新功能 / What's new
++
++    - Browser source add-on.
++
++    ## 修复 / Fixes
++
++    - A fix.
++
++    ## 升级 / Upgrade
++
++    Settings are kept.
++
++    ## 验证 / Validation
++
++    - Tests.
++
++    ## 源码 / Source
++
++    Link.
++    """
++
++    func testKeepsOnlyWhatMattersAfterUpdating() {
++        let kept = ReleaseNotes.sections(of: notes)
++        XCTAssertEqual(kept, """
++        ### 新功能 / What's new
++
++        - Browser source add-on.
++
++        ### 修复 / Fixes
++
++        - A fix.
++
++        ### 升级 / Upgrade
++
++        Settings are kept.
++        """)
++    }
++
++    func testAngleBracketsAreNotTakenAsHTML() {
++        let kept = ReleaseNotes.sections(of: "## 新功能 / What's new\n\n- Saves “直播字幕 <start>.srt” next to it.\n")
++        XCTAssertTrue(kept.contains("\\<start>"), kept)
++    }
++
++    func testShowsAtMostThreeVersionsAndPointsToTheRest() throws {
++        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("notes-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: dir) }
++        for version in ["0.2.6", "0.2.7", "0.2.8", "0.2.9", "0.2.10"] {
++            try "# v\(version)\n\n## 修复 / Fixes\n\n- Fix in \(version).\n"
++                .write(to: dir.appendingPathComponent("RELEASE_NOTES_v\(version).md"), atomically: true, encoding: .utf8)
++        }
++        let many = try XCTUnwrap(ReleaseNotes.whatsNew(directory: dir, lastSeen: "0.2.5", current: "0.2.10"))
++        XCTAssertEqual(many.versions, ["0.2.10", "0.2.9", "0.2.8"])
++        XCTAssertTrue(many.markdown.hasSuffix("For earlier versions, see the full release notes."))
++        let few = try XCTUnwrap(ReleaseNotes.whatsNew(directory: dir, lastSeen: "0.2.8", current: "0.2.10"))
++        XCTAssertEqual(few.versions, ["0.2.10", "0.2.9"])
++        XCTAssertFalse(few.markdown.contains("earlier versions"))
++    }
++
++    func testVersionsSinceTheLastSeenNewestFirst() {
++        let available = ["0.2.8", "0.2.9", "0.2.10", "0.3.0", "0.3.1"]
++        XCTAssertEqual(ReleaseNotes.toShow(lastSeen: "0.2.8", current: "0.3.0", available: available), ["0.3.0", "0.2.10", "0.2.9"])
++        XCTAssertEqual(ReleaseNotes.toShow(lastSeen: "0.3.0", current: "0.3.0", available: available), [])
++        // After a rollback, nothing.
++        XCTAssertEqual(ReleaseNotes.toShow(lastSeen: "0.3.1", current: "0.3.0", available: available), [])
++        // From a version that did not record what was seen: only the current one.
++        XCTAssertEqual(ReleaseNotes.toShow(lastSeen: nil, current: "0.3.0", available: available), ["0.3.0"])
++    }
++
++    func testBuildsTheDialogTextFromBundledNotes() throws {
++        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("notes-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: dir) }
++        try notes.write(to: dir.appendingPathComponent("RELEASE_NOTES_v0.3.0.md"), atomically: true, encoding: .utf8)
++        try "# v0.2.10\n\n## 修复 / Fixes\n\n- Old fix.\n".write(to: dir.appendingPathComponent("RELEASE_NOTES_v0.2.10.md"), atomically: true, encoding: .utf8)
++        try "# v0.2.9\n\n## 源码 / Source\n\nNothing shown.\n".write(to: dir.appendingPathComponent("RELEASE_NOTES_v0.2.9.md"), atomically: true, encoding: .utf8)
++
++        let result = try XCTUnwrap(ReleaseNotes.whatsNew(directory: dir, lastSeen: "0.2.8", current: "0.3.0"))
++        XCTAssertEqual(result.versions, ["0.3.0", "0.2.10"])
++        XCTAssertTrue(result.markdown.hasPrefix("## v0.3.0\n\n### 新功能 / What's new"))
++        XCTAssertTrue(result.markdown.contains("## v0.2.10\n\n### 修复 / Fixes\n\n- Old fix."))
++        XCTAssertFalse(result.markdown.contains("Nothing shown"))
++        XCTAssertNil(ReleaseNotes.whatsNew(directory: dir, lastSeen: "0.3.0", current: "0.3.0"))
++    }
++}
+diff --git a/plugins/livehime/core/include/livehime-core.h b/plugins/livehime/core/include/livehime-core.h
+index 85b8ddb71..61f073ce5 100644
+--- a/plugins/livehime/core/include/livehime-core.h
++++ b/plugins/livehime/core/include/livehime-core.h
+@@ -107,6 +107,12 @@ void livehime_core_addon_cancel(void);
+ /* Arranges for LiveHime to reopen once it quits; returns 1 when arranged. */
+ int livehime_core_relaunch(void);
+ 
++/* What's new since `last_seen` (empty: an upgrade from a version that did not
++ * record it), from the release notes in `notes_dir`: emits {"event":"whatsNew",
++ * "current","versions":[newest first],"markdown"(empty when nothing to show),
++ * "addonUpdateNeeded"}. */
++void livehime_core_whats_new(const char *notes_dir, const char *last_seen);
++
+ /* Read-only check of the Bilibili interfaces LiveHime uses (public ones, the
+  * danmaku connection, the official pages; the account's own read-only ones
+  * when signed in). room 0 uses the account's room. Emits
+diff --git a/plugins/livehime/data/locale/en-US.ini b/plugins/livehime/data/locale/en-US.ini
+index d369a2f45..97cf9532e 100644
+--- a/plugins/livehime/data/locale/en-US.ini
++++ b/plugins/livehime/data/locale/en-US.ini
+@@ -244,6 +244,12 @@ LiveHime.Addon.RetryWithUpdate="Retry downloading the browser add-on"
+ LiveHime.Addon.WithUpdateFailed="The browser add-on could not be downloaded with the update. If you update now, browser sources are off until you update the add-on under Optional add-ons below."
+ LiveHime.Addon.Failed.invalidApp="The downloaded add-on failed the signature check and was discarded."
+ LiveHime.Addon.Failed.noArchive="No browser add-on fits this version."
++LiveHime.WhatsNew.Title="LiveHime v%1"
++LiveHime.WhatsNew.Heading="LiveHime is now v%1"
++LiveHime.WhatsNew.Ok="Got it"
++LiveHime.WhatsNew.FullNotes="Full release notes"
++LiveHime.WhatsNew.AddonUpdate="The browser add-on needs an update; browser sources are off until then."
++LiveHime.WhatsNew.OpenUpdates="Update it"
+ LiveHime.Update.BannerAvailable="Version %1 is available"
+ LiveHime.Update.BannerView="View"
+ LiveHime.Update.BannerReady="Version %1 is downloaded and installs when you quit"
+diff --git a/plugins/livehime/data/locale/zh-CN.ini b/plugins/livehime/data/locale/zh-CN.ini
+index c46a8feb2..d05a7a96e 100644
+--- a/plugins/livehime/data/locale/zh-CN.ini
++++ b/plugins/livehime/data/locale/zh-CN.ini
+@@ -244,6 +244,12 @@ LiveHime.Addon.RetryWithUpdate="重试下载浏览器组件"
+ LiveHime.Addon.WithUpdateFailed="浏览器组件没能随更新一起下载。现在更新的话，浏览器来源会先停用，稍后可以在下方“可选组件”里更新。"
+ LiveHime.Addon.Failed.invalidApp="下载的组件没有通过签名检查，已丢弃。"
+ LiveHime.Addon.Failed.noArchive="找不到适合这个版本的浏览器组件。"
++LiveHime.WhatsNew.Title="LiveHime v%1"
++LiveHime.WhatsNew.Heading="LiveHime 已更新到 v%1"
++LiveHime.WhatsNew.Ok="知道了"
++LiveHime.WhatsNew.FullNotes="查看完整发布说明"
++LiveHime.WhatsNew.AddonUpdate="浏览器组件需要更新，更新前浏览器来源不可用。"
++LiveHime.WhatsNew.OpenUpdates="去更新"
+ LiveHime.Update.BannerAvailable="发现新版本 v%1"
+ LiveHime.Update.BannerView="查看"
+ LiveHime.Update.BannerReady="v%1 已下载，退出时自动安装"
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.0.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.0.md
+new file mode 100644
+index 000000000..f7733cde5
+--- /dev/null
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.0.md
+@@ -0,0 +1,76 @@
++# LiveHime macOS v0.2.0
++
++LiveHime macOS 是第三方的哔哩哔哩直播姬 macOS 版本，仅供学习、研究和社区交流，与哔哩哔哩、
++OBS Project 或 Windows 版直播姬官方无关。
++LiveHime macOS is an unofficial third-party macOS take on Bilibili LiveHime, for learning,
++research and community exchange only.
++
++## 重做 / Rebuilt on OBS
++
++v0.2.0 不再是“原生外壳 + 隐藏的 OBS 后台”，而是一个 **带直播姬面板的 OBS Studio 32.2.2**。场景、
++来源、滤镜、录制和 OBS 用法完全一样，直播姬功能在右侧“直播姬”停靠面板里。
++v0.2.0 is OBS Studio 32.2.2 with a LiveHime dock instead of a native shell driving a hidden OBS.
++
++## 新功能 / What's new
++
++- **登录 / Sign-in：** 原生扫码登录，也可以通过哔哩哔哩官方页面用密码或短信登录；登录信息存在钥匙串，
++  会自动续期，退出登录时会在服务器端注销。
++  Native QR login, plus password/SMS through Bilibili's own page; Keychain session, automatic renewal,
++  server-side sign-out.
++- **开播 / Going live：** 选分区后一键开播，推流地址自动写入 OBS；OBS 自己的“开始直播 / 停止直播”按钮也走
++  同一流程；结束直播会同时关闭直播间；退出应用时会关闭本程序打开的直播间。
++  One-click go live with the RTMP address filled in automatically. OBS's own Start/Stop buttons use the
++  same flow, and ending the stream also closes the room.
++- **人脸认证 / Face verification：** 开播要求人脸认证时显示原生二维码，用哔哩哔哩 App 扫码完成。
++  Shown as a native QR code to scan with the Bilibili app.
++- **弹幕 / Danmaku：** 实时弹幕、礼物、醒目留言（置顶显示）、上舰、进场，可以发送弹幕、右键复制或禁言
++  （本场 / 1 小时 / 永久），可以管理屏蔽词，也可以只看礼物。
++  Live feed with sending, copy/mute, blocked words and a gifts-only view.
++- **悬浮聊天 / Floating chat：** 可拖动的弹幕窗口，支持置顶、钉住、50–100% 不透明度，可以选择是否让它出现在
++  屏幕采集里，也可以绑定快捷键。
++  Draggable window with on-top, pin, 50–100% opacity, an opt-in for screen capture, and a hotkey.
++- **直播间 / Room：** 修改标题，打开封面管理，查看看过人数、点赞和高能数据。
++  Title, cover manager, live stats.
++- **“直播姬弹幕”来源 / Danmaku overlay source：** 把弹幕叠加到直播画面上，字体、颜色、描边、行数和停留时间
++  都可以调。
++  An overlay source with adjustable style.
++
++## 升级 / Upgrade
++
++打开 DMG，把 LiveHime 拖到“应用程序”，选择“替换”。Bundle ID（`local.livehime.macos`）和钥匙串项都
++和 v0.1.x 相同，所以登录通常会自动沿用。第一次打开时要重新授予屏幕录制、麦克风和摄像头权限。
++OBS 配置改存到 `~/Library/Application Support/LiveHime`，v0.1.x 的场景不会自动迁移。详见
++[`docs/UPGRADING.md`](UPGRADING.md)。
++Open the DMG, drag LiveHime onto Applications and choose Replace. The login usually carries over.
++Grant capture permissions again on first launch. Scenes from v0.1.x are not migrated.
++
++## 已知限制 / Known limitations
++
++- 只有 Apple Silicon 构建，需要 macOS 13 或更高版本；使用本地证书签名，没有经过 Apple 公证，首次打开需要
++  在“隐私与安全性”里点“仍要打开”。
++  Apple Silicon only, macOS 13+, locally signed and not notarized.
++- 暂不包含浏览器来源；语音字幕在计划中（见 [`docs/ROADMAP.md`](ROADMAP.md)）。
++  No browser source yet; live captions are planned.
++
++## 源码 / Source
++
++应用是 OBS Studio（GPL-2.0-or-later）的修改版。完整改动以补丁形式放在
++[`obs-fork/`](../obs-fork/)，基于上游 `32.2.2`（`ba2f32bdf`）。
++The app is a modified OBS Studio (GPL-2.0-or-later); the complete changes are the patch series in
++[`obs-fork/`](../obs-fork/), based on upstream `32.2.2` (`ba2f32bdf`).
++
++## 验证 / Validation
++
++- Swift core：79 个测试通过，1 个需要联网的测试跳过。
++  Swift core: 79 tests passed, 1 network-gated test skipped.
++- 通过 obs-websocket 端到端测试：推流链路、扫码登录流程、弹幕叠加、悬浮聊天（包括屏幕采集能否看到它）。
++  End-to-end tests over obs-websocket: stream path, QR login flow, overlay, floating chat (including
++  whether screen capture sees it).
++- 用真实账号验证过：扫码登录、登录沿用、开播推流、人脸认证页面。密码/短信登录、原生人脸二维码、禁言和屏蔽词
++  还没在真实账号上验证过，欢迎反馈。
++  Verified on a real account: QR login, login carry-over, going live, the face verification page.
++  Password/SMS login, the native face QR, muting and blocked words have not yet been verified on a real
++  account; feedback welcome.
++- 签名、arm64 和 Bundle ID 检查通过；应用包里没有账号数据、Cookie、推流码或签名密钥。
++  Signature, arm64 and bundle ID checks passed; no account data, cookies, stream keys or signing keys
++  are included.
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.1.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.1.md
+new file mode 100644
+index 000000000..94b5abe71
+--- /dev/null
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.1.md
+@@ -0,0 +1,55 @@
++# LiveHime macOS v0.2.1
++
++修复版本：让沿用哔哩哔哩网页的地方（封面、人脸验证、密码 / 短信登录）按钮都能正常工作。
++A fix release: the buttons on the Bilibili web pages LiveHime hosts (cover, face verification,
++password/SMS login) now all work.
++
++## 修复 / Fixes
++
++- **更换封面 / Changing the cover：** “重新上传”现在能选本地图片，点“确定”上传的也是新图，不再把当前封面
++  重新传一遍。页面里的“取消”和“确定”也能关闭窗口了。
++  Re-upload now takes a local image and Confirm uploads it instead of the current cover again. The page's
++  own Cancel and Confirm now close the window.
++  - 原因 / Cause：这个页面是为 Windows 版里的 Chromium 写的。WebKit 里，没挂到页面上的文件输入框可能在选图
++    过程中被回收；另外，页面给本地图片地址（`blob:`）加的时间戳参数 WebKit 无法加载。
++    The page is written for Chromium in the Windows client. In WebKit, its detached file input can be
++    collected while you choose, and the timestamp it appends to local `blob:` image URLs doesn't load.
++- **人脸验证网页 / Face verification page：** 页面在验证结束后会自动关闭，这时应用会自动重试开播，不用再手动点。
++  When the page closes itself after verification, going live is retried automatically.
++- **登录页 / Login page：** “忘记密码”、用户协议、隐私政策改用默认浏览器打开；网页弹窗能正常显示；
++  QQ / 微信 / 微博登录跳回页面后能完成登录。
++  Forgot password and the agreements open in your browser, page alerts show, and QQ/WeChat/Weibo sign-in
++  completes when it returns to the page.
++- **外部链接 / External links：** 页面里指向其他网站的链接改用默认浏览器打开。
++  Links to other sites open in your default browser.
++
++- **安装包 / Installer：** DMG 打开后有安装指引：箭头提示拖到“应用程序”，并用中英双语说明升级会保留登录、
++  首次打开被拦截时怎么办。
++  The DMG window now shows an arrow to Applications and bilingual notes on upgrading and first launch.
++
++## 诊断 / Diagnostics
++
++这些网页现在会把失败的请求、页面错误和页面提示写进 OBS 日志。日志只记录域名、路径和返回码，不记录 Cookie、
++查询参数或请求内容。
++The hosted pages log failed requests, page errors and toasts to the OBS log (host, path and result code
++only; never cookies, queries or request bodies).
++
++## 验证 / Validation
++
++- 端到端测试在真实窗口里用真实点击完成：选本地图 → 编辑器画面与所选图片一致（色差 0.0）→ 点“确定”上传
++  （`code=0`）→ 直播间封面换成新图，进入哔哩哔哩审核。账号主人已同意这次测试。
++  End-to-end in the real window with real clicks: pick a local image → the editor shows it (colour
++  distance 0.0) → Confirm uploads it (`code=0`) → the room cover changed and went to Bilibili review.
++  Run with the account owner's consent.
++- Swift core：79 个测试通过，1 个需要联网的测试跳过。签名、arm64 和 Bundle ID 检查通过。
++  Swift core: 79 passed, 1 network-gated skipped. Signature, arm64 and bundle ID checks passed.
++
++## 升级 / Upgrade
++
++打开 DMG，把 LiveHime 拖到“应用程序”，选择“替换”。登录和设置都会保留。
++Open the DMG, drag LiveHime onto Applications and choose Replace. Login and settings are kept.
++
++## 源码 / Source
++
++基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)（共 30 个）。
++The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/) (30 patches).
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.10.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.10.md
+new file mode 100644
+index 000000000..60ee660af
+--- /dev/null
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.10.md
+@@ -0,0 +1,49 @@
++# LiveHime macOS v0.2.10
++
++v0.2.9 的小修复版。/ A small fix on top of v0.2.9.
++
++## 下载哪个文件 / Which file to download
++
++| 文件 / File | 给谁用 / For |
++|---|---|
++| **`LiveHime-v0.2.10-Installer.pkg`** | **不知道选哪个就下载这个。** 所有 Mac，双击后一路“继续”，自动选芯片 / Not sure? This one. Any Mac |
++| `LiveHimeMacApp-v0.2.10-arm64.dmg` | Apple 芯片（M 系列），打开后拖进“应用程序” / Apple silicon, drag to install |
++| `LiveHimeMacApp-v0.2.10-x86_64.dmg` | Intel 芯片，打开后拖进“应用程序” / Intel, drag to install |
++| `LiveHimeMacApp-v0.2.10-*.zip` | 应用内更新用的，不用手动下载 / for the in-app updater |
++| Source code (zip / tar.gz) | 源代码，**不是软件**，装软件不要下载 / source code, **not the app** |
++
++安装包没有 Apple 的付费开发者签名。双击时如果提示“无法打开”，到 **系统设置 → 隐私与安全性** 点“仍要打开”，
++第一次打开应用时如果被拦也一样。详细步骤见 [README](../README.md#下载与安装--download-and-install)。
++Not signed by Apple: if macOS blocks the installer or the app, click **Open Anyway** in System Settings → Privacy & Security.
++
++安装包（pkg）是 2026-09-28 补上的，里面的应用和同版本 DMG 完全相同。
++The installer package was added on 2026-09-28; the apps inside are the same as in the DMGs.
++
++## 修复 / Fixes
++
++- “更新”页和“字幕”页在面板较矮时文字被挤扁，现在会像“房间”页一样出现滚动条。
++  The Updates and Captions tabs squashed their text in a short dock; they now scroll like the Room tab.
++
++v0.2.9 的新功能（表情面板、聊天里的表情图片等）见 [v0.2.9 发布说明](RELEASE_NOTES_v0.2.9.md)。
++For v0.2.9's features (emoticons and more) see the [v0.2.9 notes](RELEASE_NOTES_v0.2.9.md).
++
++## 升级 / Upgrade
++
++v0.2.8 和 v0.2.9 会在应用里自动收到这次更新（“直播姬”面板 → 更新），也可以手动下载 DMG 替换。没有升级 OBS，不迁移设置。
++v0.2.8 and v0.2.9 pick this up in the app, or replace it with the DMG. OBS is not upgraded; no settings migrate.
++
++## 验证 / Validation
++
++- 在测试实例里把面板压到 700px 高截图检查：“更新”页和“字幕”页出现滚动条，文字正常换行。
++  Rendered the dock at 700 px high: both tabs scroll and their text wraps normally.
++- Swift core：100 个测试通过，1 个需要联网的测试跳过。签名、架构、Bundle ID 检查通过，和 v0.2.9 使用同一张签名证书；
++  应用包里没有账号数据。
++  Swift core: 100 passed, 1 network-gated skipped. Signature, architecture and bundle id checks passed; same
++  signing certificate as v0.2.9; no account data in the bundle.
++
++## 源码 / Source
++
++基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)：两个架构都对应补丁 0001–0053。
++The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/): patches
++0001–0053 for both architectures. 补丁 0054 只加了打包脚本 `package-pkg.sh`，不影响应用本身。
++Patch 0054 only adds the `package-pkg.sh` packaging script and does not change the app.
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.6.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.6.md
+new file mode 100644
+index 000000000..8c5b9a85f
+--- /dev/null
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.6.md
+@@ -0,0 +1,50 @@
++# LiveHime macOS v0.2.6
++
++## 新功能 / What's new
++
++- **语音字幕 / Live captions：** 直播姬面板新增“字幕”页，可以把麦克风（或任意 OBS 音频来源）实时转成字幕，支持普通话、
++  国语（繁体）、粤语和 English。语音只在这台 Mac 上识别（Apple SpeechAnalyzer），不上传音频，不登录也能用；
++  需要 macOS 26 或更高版本。音频来源静音时会提示，“直播机”这类同音词会自动改成“直播姬”。
++  A Captions tab turns the mic (or any OBS audio source) into live captions in Mandarin, Taiwanese Mandarin,
++  Cantonese or English, recognized on the Mac and never uploaded; works signed out; needs macOS 26+.
++- **“直播姬字幕”来源 / Captions source：** 默认一行、放在画面底部居中；可以调字体、颜色、描边粗细和颜色、阴影、
++  半透明底板、行数和停留时间；句子太长时保留最新的一段。
++  One line at the bottom centre by default, with font, colour, outline, shadow, plate, lines and linger time;
++  long sentences keep the newest words.
++- **“直播姬弹幕”来源改为竖版发言列表 / Danmaku source as a chat list：** 最新消息在最下面，用户名是 B 站粉色，
++  礼物是金色，上舰是紫色，醒目留言带红色底条，长消息自动换行，外加半透明底板。只在有新消息或消息过期时重画。
++  Newest at the bottom; pink names, gold gifts, purple guards, Super Chats on a red strip; wrapped; plate.
++- **摆放 / Placement：** 字幕和弹幕都可以选“画面位置”（底部居中、左下、右下、画面中央、四个角或自由摆放），直接拖动
++  红框的边就能改大小，文字按原字号重新排版，不会被拉伸；手动拖到别处会自动改为自由摆放。
++  Both sources take a canvas position and are resized by dragging the frame without stretching the text.
++- **直播姬面板 / LiveHime dock：** 右上角的关闭按钮去掉了，和场景、源这些主面板一致。
++  The dock no longer has a close button, like the main docks.
++
++## 修复 / Fixes
++
++- DMG 的磁盘图标改为 LiveHime 图标。/ The DMG volume uses the LiveHime icon.
++
++## 升级 / Upgrade
++
++打开 DMG，把 LiveHime 拖到“应用程序”，选择“替换”。登录和设置都会保留。场景里已有的“直播姬弹幕”“直播姬字幕”
++会自动换成新的画布框：弹幕默认放在左下，字幕默认放在底部居中。
++Open the DMG, drag LiveHime onto Applications and choose Replace. Existing danmaku and caption sources switch
++to the new box automatically (danmaku bottom left, captions bottom centre).
++
++## 验证 / Validation
++
++- 端到端测试：媒体源播放中文语音 → 字幕在 1.3 秒内出现、识别正确、同音词修正生效；截图检查字幕框尺寸、底部居中
++  和左对齐；拖边框改大小、画面位置、手动移动后改为自由摆放；弹幕列表的顺序、换行、刷屏后只保留最新消息、贴底，
++  以及改大小和改位置。
++  End to end: speech from a media source becomes captions within 1.3 s, recognized correctly; screenshots check
++  the box size, bottom-centre and left alignment; resizing, placement and moving by hand; the danmaku list's
++  order, wrapping, overflow, bottom anchoring, resizing and placement.
++- Swift core：83 个测试通过，1 个需要联网的测试跳过。签名、arm64、Bundle ID 检查通过；Speech 框架弱链接，
++  macOS 13–15 上应用照常运行，只是没有字幕功能。
++  Swift core: 83 passed, 1 network-gated skipped. Signature, arm64 and bundle ID checks passed; Speech is
++  weak-linked, so the app still runs on macOS 13–15 without captions.
++
++## 源码 / Source
++
++基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)（共 39 个）。
++The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/) (39 patches).
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.7.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.7.md
+new file mode 100644
+index 000000000..bb5102d22
+--- /dev/null
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.7.md
+@@ -0,0 +1,41 @@
++# LiveHime macOS v0.2.7
++
++## 新功能 / What's new
++
++- **回复观众 / Reply to viewers：** 在弹幕面板或悬浮聊天里右键一条弹幕，选“回复 @TA”（也可以直接双击），发送框上方会显示
++  “回复 @某某 ×”，发出的弹幕会作为对这位观众的回复（观众端显示为 @某某）。按 Esc 或点 × 取消。别人发的回复在面板和
++  “直播姬弹幕”来源里显示为“@某某 内容”。
++  Right-click (or double-click) a danmaku and choose "Reply to @name"; the danmaku you send is a reply to that
++  viewer, shown as @name. Esc or × cancels. Replies from others show as "@name …" in the feed and the overlay.
++
++## 修复 / Fixes
++
++- **悬浮聊天置顶 / Floating chat on top：** 以前只要 LiveHime 不在前台，别的应用窗口就能盖住悬浮聊天，其他应用全屏
++  （比如游戏、视频）时它也显示不出来。现在“置顶”打开时，它会一直留在最上面，包括其他应用的全屏画面上。
++  Other apps' windows no longer cover the floating chat while LiveHime is in the background, and it now stays
++  above other apps in full screen.
++- **全屏时的菜单 / Menus over full screen：** 其他应用全屏时，悬浮聊天的“⋯”菜单和弹幕右键菜单也能正常打开。
++  The "⋯" menu and the danmaku right-click menu open over full-screen apps.
++- 置顶打开时，点击悬浮聊天不会再把 LiveHime 主窗口切到前台，输入框照常可以打字。
++  With "on top" on, clicking the floating chat no longer brings LiveHime's main window forward; typing still works.
++
++## 升级 / Upgrade
++
++打开 DMG，把 LiveHime 拖到“应用程序”，选择“替换”。登录和设置都会保留。
++Open the DMG, drag LiveHime onto Applications and choose Replace. Login and settings are kept.
++
++## 验证 / Validation
++
++- 真实账号验证：回复弹幕（面板显示 @某某）、全屏应用上的悬浮聊天和“⋯”菜单。
++  Verified on a real account: sending a reply, and the floating chat and its menu over a full-screen app.
++- 端到端测试（新增 `e2e-float-fullscreen.mjs`）：其他应用全屏时悬浮聊天在其前面、关闭置顶时不出现；其他应用在前台
++  时悬浮聊天仍在最上层；全屏时弹出“⋯”菜单。
++  End to end: the chat is in front of a full-screen app (and absent with "on top" off), stays on top while another
++  app is active, and its "⋯" menu opens over full screen.
++- Swift core：85 个测试通过，1 个需要联网的测试跳过。签名、arm64、Bundle ID 检查通过；应用包里没有账号数据。
++  Swift core: 85 passed, 1 network-gated skipped. Signature, arm64 and bundle ID checks passed; no account data.
++
++## 源码 / Source
++
++基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)（共 43 个）。
++The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/) (43 patches).
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.8.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.8.md
+new file mode 100644
+index 000000000..cdd81126b
+--- /dev/null
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.8.md
+@@ -0,0 +1,58 @@
++# LiveHime macOS v0.2.8
++
++## 新功能 / What's new
++
++- **字幕保存为 SRT / Captions saved as SRT：** 语音字幕开着时，每次录制结束会在录像旁边保存同名的 `.srt`；
++  直播结束会在录像文件夹保存“直播字幕 开播时间.srt”。时间取自识别引擎给出的说话时刻，从录制（不含暂停）或
++  开播算起，可以直接导入剪辑软件或配合录播使用。可在“字幕”页关闭。
++  With captions on, each recording gets a `.srt` with the same name next to it, and each stream a
++  “直播字幕 <start>.srt” in the recording folder, timed from the start of the recording (pauses left out) or
++  stream. Can be turned off on the Captions tab.
++- **应用内更新 / In-app updates：** 面板新增“更新”页。默认自动检查、后台下载、退出时安装；也可以改成手动，
++  走同一个下载通道。可选“参与测试版”，可以跳过某个版本，更新后可以回退到上一版本；每次安装前自动备份场景和
++  设置。下载的安装包必须和 GitHub 公布的校验值一致、并由同一张证书签名才会安装；直播或录制时不会重启。
++  A new Updates tab: automatic checks and background downloads installed on quit, or manual through the same
++  path; an opt-in beta channel; skip a version or roll back; settings backed up before every install. Updates
++  must match GitHub's checksum and be signed by the same certificate; LiveHime never restarts while streaming
++  or recording.
++- **B 站接口巡检 / Bilibili interface check：** “更新”页的“B 站接口巡检…”逐项检查 LiveHime 用到的 B 站
++  接口、弹幕连接和官方页面（只读，登录后也检查账号的只读接口），报告可以直接贴到 Issue，不含账号信息。
++  A read-only check of the Bilibili interfaces LiveHime uses; the report can go into an issue.
++
++## Intel Mac 版 / Intel Macs
++
++从 v0.2.8 起同时提供 Intel 版（`LiveHimeMacApp-v0.2.8-x86_64.dmg`），功能和 Apple 芯片版相同，以后也能在
++应用里自动更新（Intel 版只会下载 Intel 的安装包）。语音字幕需要 macOS 26 或更高版本；Intel Mac 上能否使用
++取决于系统是否提供本机语音识别，不支持时字幕页会提示。Intel 版在 Apple 芯片的 Mac 上交叉编译，在 Rosetta 下
++检查过启动、插件加载和更新器，建议在真实的 Intel Mac 上也试一试，有问题欢迎反馈。
++From v0.2.8 there is also an Intel build, with the same features and in-app updates (it only takes Intel
++archives). Captions need macOS 26 and on-device speech recognition from the system. It was cross-built and
++checked under Rosetta (launch, plugin, updater); reports from real Intel Macs are welcome.
++
++## 升级 / Upgrade
++
++**这一次需要手动升级：** 打开 DMG，把 LiveHime 拖到“应用程序”，选择“替换”。登录和设置都会保留。
++从 v0.2.8 开始，以后的版本可以在应用里直接更新。
++**Upgrade by hand this once:** open the DMG, drag LiveHime onto Applications and choose Replace. From v0.2.8
++on, later versions update from inside the app.
++
++## 验证 / Validation
++
++- 端到端测试：字幕 SRT（与录像对齐误差约 0.06 秒，录制暂停 4 秒时正确扣除）；更新（校验值不符和其他证书
++  签名的安装包被拒绝、正式版 / 测试版选择、跳过、下载校验安装并重启、跨 OBS 大版本回退并恢复设置，共 20 项）；
++  正式版包对模拟的 0.2.9 完成检查、下载、校验和退出时安装；接口巡检（未登录时 11 项通过）。
++  End to end: SRT timing and pauses; updates (rejected checksum and signer, stable/beta, skip, download,
++  verify, install and relaunch, rollback across OBS major versions); the release build against a mock 0.2.9
++  including install on quit; the interface check.
++- Swift core：93 个测试通过，1 个需要联网的测试跳过。签名、arm64、Bundle ID 检查通过，和 v0.2.7 使用同一张
++  签名证书；应用包里没有账号数据。
++  Swift core: 93 passed, 1 network-gated skipped. Signature, arm64 and bundle id checks passed; same signing
++  certificate as v0.2.7; no account data in the bundle.
++
++## 源码 / Source
++
++基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)：Apple 芯片版对应补丁 0001–0048，
++Intel 版对应 0001–0049（0049 只增加构建架构选项，并让更新器按架构选择安装包）。
++The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/): patches
++0001–0048 for the Apple silicon app, 0001–0049 for the Intel app (0049 only adds the architecture option and
++makes the updater pick the archive for its architecture).
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.9.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.9.md
+new file mode 100644
+index 000000000..c981c0928
+--- /dev/null
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.2.9.md
+@@ -0,0 +1,48 @@
++# LiveHime macOS v0.2.9
++
++## 新功能 / What's new
++
++- **表情 / Emoticons：** 发送框旁新增 ☺ 表情面板（侧栏和悬浮聊天都有），和手机直播间一样的分页：小黄脸、
++  通用表情、你账号里的个性化表情包，以及热词系列、tv_小电视。点一下直接发送；未解锁的表情是灰色的，会提示解锁
++  条件。面板就在聊天窗口里面，其他应用全屏时也能正常打开。
++  An emoticon panel next to the send box (dock and floating chat) with the same packs as the phone's live
++  room: 小黄脸, the general stickers, your own packs, plus 热词系列 and tv_小电视. One click sends; locked
++  ones are greyed out with how to unlock them. It sits inside the chat window, so it works over full-screen apps.
++- **聊天里显示表情图片 / Emoticons shown in chat：** 弹幕里的表情和大表情显示成图片，不再是 `[doge]` 或
++  重复的文字。图片只从 B 站图床下载、缩小后缓存在本机（最多 30 MB），不带登录信息。
++  Emoticons and stickers in chat are drawn as pictures instead of `[doge]` or repeated text. Pictures come
++  only from Bilibili's image hosts, without login data, and are cached small (at most 30 MB).
++
++## 修复 / Fixes
++
++- 没登录时，侧栏弹幕列表在大量消息下无法滚动。/ The dock's chat list could not scroll while signed out.
++- B 站把“人脸认证状态”接口改成了只接受 POST，巡检里这一项报 HTTP 405，已修复。开播时的扫码认证窗口保持原来的
++  流程：扫码完成后点“验证完成，重试开播”。
++  Bilibili's face verification status endpoint now takes POST only (the check reported HTTP 405). The QR
++  verification window keeps its flow: scan, then click “验证完成，重试开播”.
++- B 站接口巡检新增“直播间表情”和“主站表情”两项。/ The interface check also covers both emoticon sources.
++
++## 升级 / Upgrade
++
++v0.2.8 会在应用里自动收到这次更新（“直播姬”面板 → 更新），也可以手动下载 DMG 替换。没有升级 OBS，不迁移设置。
++v0.2.8 picks this up in the app (Updates tab), or replace it with the DMG. OBS is not upgraded; no settings migrate.
++
++## 验证 / Validation
++
++- 真实账号：小黄脸、通用大表情、热词、tv_小电视和多个个性化表情包都已实际发送，手机端显示为表情；
++  接口巡检 16 项全部通过。
++  Real account: every kind of emoticon was sent and shown as a picture on the phone; the interface check passed all 16.
++- 端到端测试：表情（面板、插入、未解锁提示、发送失败保留草稿、悬浮聊天共用、刷屏时滚动，共 13 项）；
++  悬浮聊天在全屏应用上方打开表情面板（面板在聊天窗口内，没有额外窗口）；弹幕来源。
++  End to end: emoticons (13 checks, including scrolling under a flood), the panel over a full-screen app,
++  the danmaku overlay.
++- Swift core：100 个测试通过，1 个需要联网的测试跳过。签名、架构、Bundle ID 检查通过，和 v0.2.8 使用同一张
++  签名证书；应用包里没有账号数据。
++  Swift core: 100 passed, 1 network-gated skipped. Signature, architecture and bundle id checks passed; same
++  signing certificate as v0.2.8; no account data in the bundle.
++
++## 源码 / Source
++
++基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)：两个架构都对应补丁 0001–0051。
++The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/): patches
++0001–0051 for both architectures.
+diff --git a/plugins/livehime/src/automation.cpp b/plugins/livehime/src/automation.cpp
+index 0aa819a43..05a83fff2 100644
+--- a/plugins/livehime/src/automation.cpp
++++ b/plugins/livehime/src/automation.cpp
+@@ -10,6 +10,7 @@
+ #include "emoji-picker.hpp"
+ #include "emoticon-store.hpp"
+ #include "update-page.hpp"
++#include "whats-new-dialog.hpp"
+ #include "probe-dialog.hpp"
+ #include "livehime-dock.hpp"
+ 
+@@ -346,6 +347,37 @@ void addon(obs_data_t *request, obs_data_t *response, void *)
+ 	});
+ }
+ 
++/* What's new for tests: replies whether the dialog is open, its title,
++ * whether its text scrolls, and whether it is centered on the main window;
++ * optional "path" saves it as a PNG ("end": scrolled to the end first),
++ * "action":"close" closes it (as read). */
++void whatsNew(obs_data_t *request, obs_data_t *response, void *)
++{
++	const QString path = QString::fromUtf8(obs_data_get_string(request, "path"));
++	onUiThread([&] {
++		UpdatePage *page = target->features()->updates();
++		WhatsNewDialog *dialog = page->whatsNew();
++		QApplication::processEvents();
++		obs_data_set_bool(response, "open", dialog && dialog->isVisible());
++		obs_data_set_string(response, "lastSeen", page->lastSeenVersion().toUtf8().constData());
++		if (!dialog)
++			return;
++		obs_data_set_string(response, "title", dialog->windowTitle().toUtf8().constData());
++		obs_data_set_bool(response, "scrolls", dialog->scrolls());
++		auto *main = static_cast<QWidget *>(obs_frontend_get_main_window());
++		const QPoint offset = dialog->frameGeometry().center() - main->frameGeometry().center();
++		obs_data_set_bool(response, "centered", offset.manhattanLength() <= 4);
++		obs_data_set_int(response, "height", dialog->height());
++		obs_data_set_int(response, "mainHeight", main->height());
++		if (obs_data_get_bool(request, "end"))
++			dialog->scrollToEnd();
++		if (!path.isEmpty())
++			obs_data_set_bool(response, "saved", dialog->grab().save(path, "PNG"));
++		if (QString::fromUtf8(obs_data_get_string(request, "action")) == "close")
++			dialog->accept();
++	});
++}
++
+ /* Live captions for tests: optional {"enabled","source" (name),"locale"}
+  * applies like the Captions tab; replies with the state, the current
+  * caption and what the captions source "overlay_source" shows. */
+@@ -463,6 +495,7 @@ void RegisterAutomation(LiveHimeDock *dock)
+ 	obs_websocket_vendor_register_request(vendor, "OverlayState", overlayState, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Update", update, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Addon", addon, nullptr);
++	obs_websocket_vendor_register_request(vendor, "WhatsNew", whatsNew, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Snapshot", snapshot, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Probe", probe, nullptr);
+ 	obs_websocket_vendor_register_request(vendor, "Emoticons", emoticons, nullptr);
+@@ -485,6 +518,7 @@ void UnregisterAutomation()
+ 		obs_websocket_vendor_unregister_request(vendor, "OverlayState");
+ 		obs_websocket_vendor_unregister_request(vendor, "Update");
+ 		obs_websocket_vendor_unregister_request(vendor, "Addon");
++		obs_websocket_vendor_unregister_request(vendor, "WhatsNew");
+ 		obs_websocket_vendor_unregister_request(vendor, "Snapshot");
+ 		obs_websocket_vendor_unregister_request(vendor, "Emoticons");
+ 		obs_websocket_vendor_unregister_request(vendor, "Probe");
+diff --git a/plugins/livehime/src/feature-panel.cpp b/plugins/livehime/src/feature-panel.cpp
+index 4e0a24fe3..34fb67065 100644
+--- a/plugins/livehime/src/feature-panel.cpp
++++ b/plugins/livehime/src/feature-panel.cpp
+@@ -25,6 +25,7 @@
+ #include <QLineEdit>
+ #include <QListWidget>
+ #include <QPushButton>
++#include <QDockWidget>
+ #include <QScrollArea>
+ #include <QScrollBar>
+ #include <QTabWidget>
+@@ -206,6 +207,17 @@ FeaturePanel::FeaturePanel(QWidget *parent) : QWidget(parent)
+ 	tabs_->addTab(roomScroll, text("LiveHime.Feature.RoomTab"));
+ 	tabs_->addTab(captionsScroll, text("LiveHime.Captions.Tab"));
+ 	tabs_->addTab(updatesTab_, text("LiveHime.Update.Tab"));
++	/* The What's new dialog's "open Updates": this tab, with the dock shown. */
++	connect(updates_, &UpdatePage::showRequested, this, [this] {
++		tabs_->setCurrentWidget(updatesTab_);
++		for (QWidget *w = this; w; w = w->parentWidget()) {
++			if (auto *dock = qobject_cast<QDockWidget *>(w)) {
++				dock->show();
++				dock->raise();
++				break;
++			}
++		}
++	});
+ 
+ 	auto *layout = new QVBoxLayout(this);
+ 	layout->setContentsMargins(0, 0, 0, 0);
+@@ -272,6 +284,10 @@ void FeaturePanel::applyEvent(const QJsonObject &event)
+ 		updates_->handleEvent(event);
+ 		return;
+ 	}
++	if (name == "whatsNew") {
++		updates_->handleWhatsNewEvent(event);
++		return;
++	}
+ 	if (name == "addon") {
+ 		updates_->handleAddonEvent(event);
+ 		return;
+diff --git a/plugins/livehime/src/update-page.cpp b/plugins/livehime/src/update-page.cpp
+index 43f2414a9..8b48ea2aa 100644
+--- a/plugins/livehime/src/update-page.cpp
++++ b/plugins/livehime/src/update-page.cpp
+@@ -1,14 +1,17 @@
+ #include "update-page.hpp"
+ #include "plugin-settings.hpp"
+ #include "probe-dialog.hpp"
++#include "whats-new-dialog.hpp"
+ 
+ #include <livehime-core.h>
+ #include <obs-module.h>
++#include <util/util.hpp>
+ 
+ #include <CoreFoundation/CoreFoundation.h>
+ 
+ #include <QCheckBox>
+ #include <QDesktopServices>
++#include <QFileInfo>
+ #include <QHBoxLayout>
+ #include <QLabel>
+ #include <QMainWindow>
+@@ -48,6 +51,11 @@ constexpr int kCheckIntervalMs = 6 * 60 * 60 * 1000;
+ 
+ UpdatePage::UpdatePage(QWidget *parent) : QWidget(parent)
+ {
++	/* Before anything this run writes: were there LiveHime settings already? */
++	for (const char *name : {"features.json", "state.json", "layout.json"}) {
++		BPtr<char> path = obs_module_config_path(name);
++		hadSettings_ = hadSettings_ || QFileInfo::exists(QString::fromUtf8(path.Get()));
++	}
+ 	load();
+ 
+ 	version_ = new QLabel(text("LiveHime.Update.Current").arg(currentVersion()), this);
+@@ -210,6 +218,8 @@ UpdatePage::~UpdatePage()
+ void UpdatePage::frontendEvent(enum obs_frontend_event event, void *param)
+ {
+ 	auto *self = static_cast<UpdatePage *>(param);
++	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING)
++		self->startWhatsNew();
+ 	/* A downloaded update is installed when LiveHime quits. */
+ 	if (event == OBS_FRONTEND_EVENT_EXIT && !self->readyVersion_.isEmpty()) {
+ 		if (livehime_core_update_install(0))
+@@ -422,6 +432,71 @@ void UpdatePage::handleEvent(const QJsonObject &event)
+ 	}
+ }
+ 
++namespace {
++bool newerVersion(const QString &candidate, const QString &current)
++{
++	const QStringList a = candidate.split('.'), b = current.split('.');
++	for (int i = 0; i < std::max(a.size(), b.size()); i++) {
++		const int x = i < a.size() ? a[i].toInt() : 0, y = i < b.size() ? b[i].toInt() : 0;
++		if (x != y)
++			return x > y;
++	}
++	return false;
++}
++} // namespace
++
++WhatsNewDialog *UpdatePage::whatsNew() const
++{
++	return whatsNew_;
++}
++
++void UpdatePage::startWhatsNew()
++{
++	const QString current = currentVersion();
++	/* A fresh install has nothing to catch up on; after a rollback (or at the
++	 * same version) there is nothing new either. */
++	if ((lastSeen_.isEmpty() && !hadSettings_) || (!lastSeen_.isEmpty() && !newerVersion(current, lastSeen_))) {
++		if (lastSeen_ != current) {
++			lastSeen_ = current;
++			save();
++		}
++		return;
++	}
++	BPtr<char> notes = obs_module_file("release-notes");
++	livehime_core_whats_new(notes ? notes.Get() : "", lastSeen_.toUtf8().constData());
++}
++
++void UpdatePage::handleWhatsNewEvent(const QJsonObject &event)
++{
++	const QString current = event.value("current").toString();
++	const QString markdown = event.value("markdown").toString();
++	auto seen = [this, current] {
++		lastSeen_ = current;
++		save();
++	};
++	if (markdown.isEmpty()) {
++		seen();
++		return;
++	}
++	auto *main = static_cast<QWidget *>(obs_frontend_get_main_window());
++	whatsNew_ = new WhatsNewDialog(main, current, markdown, event.value("addonUpdateNeeded").toBool());
++	whatsNew_->setAttribute(Qt::WA_DeleteOnClose);
++	connect(whatsNew_, &WhatsNewDialog::openUpdates, this, &UpdatePage::showRequested);
++	/* Closed by the user counts as read; quitting with it open shows it again. */
++	connect(whatsNew_, &WhatsNewDialog::read, this, seen);
++	blog(LOG_INFO, "[livehime] what's new: showing %s",
++	     event.value("versions").toVariant().toStringList().join(", ").toUtf8().constData());
++	/* A window of its own (open() would make it window-modal, which macOS may
++	 * attach to the main window as a sheet). */
++	QTimer::singleShot(0, whatsNew_, [dialog = whatsNew_] {
++		if (!dialog)
++			return;
++		dialog->show();
++		dialog->raise();
++		dialog->activateWindow();
++	});
++}
++
+ void UpdatePage::handleAddonEvent(const QJsonObject &event)
+ {
+ 	addonState_ = event.value("state").toString();
+@@ -562,6 +637,7 @@ void UpdatePage::load()
+ 	if (update) {
+ 		beta_ = obs_data_get_bool(update, "beta");
+ 		skipped_ = QString::fromUtf8(obs_data_get_string(update, "skipped"));
++		lastSeen_ = QString::fromUtf8(obs_data_get_string(update, "lastSeenVersion"));
+ 	}
+ }
+ 
+@@ -571,6 +647,7 @@ void UpdatePage::save() const
+ 	obs_data_set_bool(update, "automatic", automatic_);
+ 	obs_data_set_bool(update, "beta", beta_);
+ 	obs_data_set_string(update, "skipped", skipped_.toUtf8().constData());
++	obs_data_set_string(update, "lastSeenVersion", lastSeen_.toUtf8().constData());
+ 	OBSDataAutoRelease changes = obs_data_create();
+ 	obs_data_set_obj(changes, "update", update);
+ 	SavePluginSettings(changes);
+diff --git a/plugins/livehime/src/update-page.hpp b/plugins/livehime/src/update-page.hpp
+index ec7ff8bab..9cdff43f1 100644
+--- a/plugins/livehime/src/update-page.hpp
++++ b/plugins/livehime/src/update-page.hpp
+@@ -3,9 +3,11 @@
+ #include <obs-frontend-api.h>
+ 
+ #include <QJsonObject>
++#include <QPointer>
+ #include <QWidget>
+ 
+ class ProbeDialog;
++class WhatsNewDialog;
+ class QCheckBox;
+ class QLabel;
+ class QProgressBar;
+@@ -31,6 +33,11 @@ public:
+ 	~UpdatePage() override;
+ 
+ 	void handleEvent(const QJsonObject &event);
++	/* What's new after an update ({"event":"whatsNew"}): shows the dialog. */
++	void handleWhatsNewEvent(const QJsonObject &event);
++	/* The dialog while it is open (for tests). */
++	WhatsNewDialog *whatsNew() const;
++	QString lastSeenVersion() const { return lastSeen_; }
+ 	/* Browser add-on events ({"event":"addon"}). */
+ 	void handleAddonEvent(const QJsonObject &event);
+ 	/* Automation and the buttons: install/update, remove, drop a staged change. */
+@@ -78,11 +85,15 @@ signals:
+ 	/* A newer version was found (not yet downloaded), or is downloaded. */
+ 	void available(const QString &version);
+ 	void ready(const QString &version);
++	/* The What's new dialog asks to show this tab. */
++	void showRequested();
+ 
+ private:
+ 	static void frontendEvent(enum obs_frontend_event event, void *param);
+ 	void setStatus(const char *key, const QString &arg = QString(), bool error = false);
+ 	void showAddon();
++	/* After loading: the dialog when updated since the last version seen. */
++	void startWhatsNew();
+ 	void load();
+ 	void save() const;
+ 
+@@ -100,6 +111,10 @@ private:
+ 	QString page_;
+ 	double progress_ = 0;
+ 	QString failReason_;
++	QString lastSeen_;
++	/* LiveHime settings existed before this run (not a fresh install). */
++	bool hadSettings_ = false;
++	QPointer<WhatsNewDialog> whatsNew_;
+ 	QString addonWithUpdateProblem_;
+ 	QString addonState_;
+ 	QString addonStatus_ = QStringLiteral("idle");
+diff --git a/plugins/livehime/src/whats-new-dialog.cpp b/plugins/livehime/src/whats-new-dialog.cpp
+new file mode 100644
+index 000000000..1bd217852
+--- /dev/null
++++ b/plugins/livehime/src/whats-new-dialog.cpp
+@@ -0,0 +1,128 @@
++#include "whats-new-dialog.hpp"
++
++#include <obs-module.h>
++
++#include <QDesktopServices>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QPushButton>
++#include <QCloseEvent>
++#include <QScrollBar>
++#include <QShowEvent>
++#include <QTextBrowser>
++#include <QTextDocument>
++#include <QUrl>
++#include <QVBoxLayout>
++
++#include <cmath>
++
++namespace {
++QString text(const char *key)
++{
++	return QString::fromUtf8(obs_module_text(key));
++}
++constexpr int kWidth = 520;
++} // namespace
++
++WhatsNewDialog::WhatsNewDialog(QWidget *parent, const QString &version, const QString &markdown,
++			       bool addonUpdateNeeded)
++	: QDialog(parent)
++{
++	setWindowTitle(text("LiveHime.WhatsNew.Title").arg(version));
++	/* Not modal: LiveHime stays usable (and can quit) with it open. */
++	setWindowModality(Qt::NonModal);
++
++	auto *layout = new QVBoxLayout(this);
++	auto *heading = new QLabel(text("LiveHime.WhatsNew.Heading").arg(version), this);
++	heading->setStyleSheet(QStringLiteral("font-size: 16px; font-weight: bold;"));
++	layout->addWidget(heading);
++
++	if (addonUpdateNeeded) {
++		auto *row = new QHBoxLayout;
++		auto *notice = new QLabel(text("LiveHime.WhatsNew.AddonUpdate"), this);
++		notice->setWordWrap(true);
++		notice->setStyleSheet(QStringLiteral("color: #e06c75;"));
++		auto *go = new QPushButton(text("LiveHime.WhatsNew.OpenUpdates"), this);
++		connect(go, &QPushButton::clicked, this, [this] {
++			emit openUpdates();
++			accept();
++		});
++		row->addWidget(notice, 1);
++		row->addWidget(go);
++		layout->addLayout(row);
++	}
++
++	text_ = new QTextBrowser(this);
++	text_->setOpenExternalLinks(true);
++	text_->setFrameShape(QFrame::NoFrame);
++	/* Wheel and scroll bar still scroll it; Enter goes to "Got it". */
++	text_->setFocusPolicy(Qt::NoFocus);
++	text_->setMarkdown(markdown);
++	layout->addWidget(text_, 1);
++
++	auto *buttons = new QHBoxLayout;
++	auto *full = new QPushButton(text("LiveHime.WhatsNew.FullNotes"), this);
++	const QUrl page(QStringLiteral("https://github.com/greyoak111/livehime-macos/releases/tag/v%1").arg(version));
++	connect(full, &QPushButton::clicked, this, [page] { QDesktopServices::openUrl(page); });
++	auto *ok = new QPushButton(text("LiveHime.WhatsNew.Ok"), this);
++	ok->setDefault(true);
++	ok->setFocus();
++	connect(ok, &QPushButton::clicked, this, &QDialog::accept);
++	buttons->addWidget(full);
++	buttons->addStretch(1);
++	buttons->addWidget(ok);
++	layout->addLayout(buttons);
++
++	/* As tall as the text needs, up to 70% of the main window; beyond that the
++	 * text scrolls and the buttons stay in view. */
++	const int textWidth = kWidth - layout->contentsMargins().left() - layout->contentsMargins().right();
++	text_->document()->setTextWidth(textWidth - 8);
++	const int needed = static_cast<int>(std::ceil(text_->document()->size().height())) + 12;
++	const int chrome = layout->sizeHint().height() - text_->sizeHint().height();
++	const int cap = parent ? parent->window()->height() * 7 / 10 : 600;
++	text_->setFixedHeight(std::max(120, std::min(needed, cap - chrome)));
++	setFixedWidth(kWidth);
++	adjustSize();
++}
++
++void WhatsNewDialog::showEvent(QShowEvent *event)
++{
++	QDialog::showEvent(event);
++	text_->verticalScrollBar()->setValue(0);
++	/* Centered on the main window once shown (macOS places new windows itself). */
++	if (QWidget *main = parentWidget() ? parentWidget()->window() : nullptr)
++		move(main->frameGeometry().center() - QPoint(frameGeometry().width() / 2, frameGeometry().height() / 2));
++}
++
++void WhatsNewDialog::accept()
++{
++	emit read();
++	QDialog::accept();
++}
++
++void WhatsNewDialog::reject()
++{
++	/* Esc, or the close button (a spontaneous close); a close without the
++	 * user (LiveHime quitting) does not count. */
++	if (!closing_ || closedByUser_)
++		emit read();
++	QDialog::reject();
++}
++
++void WhatsNewDialog::closeEvent(QCloseEvent *event)
++{
++	closing_ = true;
++	closedByUser_ = event->spontaneous();
++	QDialog::closeEvent(event);
++	closing_ = false;
++}
++
++bool WhatsNewDialog::scrolls() const
++{
++	return text_->verticalScrollBar()->maximum() > 0;
++}
++
++void WhatsNewDialog::scrollToEnd()
++{
++	text_->verticalScrollBar()->setValue(text_->verticalScrollBar()->maximum());
++}
+diff --git a/plugins/livehime/src/whats-new-dialog.hpp b/plugins/livehime/src/whats-new-dialog.hpp
+new file mode 100644
+index 000000000..7eedd792c
+--- /dev/null
++++ b/plugins/livehime/src/whats-new-dialog.hpp
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <QDialog>
++
++class QTextBrowser;
++
++/* Shown once after an update, centered on the main window: what changed in
++ * the versions since the last one seen (from the bundled release notes). Tall
++ * text scrolls inside the dialog, at most 70% of the main window's height, so
++ * the buttons stay visible. It is not modal. With "addonUpdateNeeded", a line
++ * on top offers to open the Updates tab. */
++class WhatsNewDialog : public QDialog {
++	Q_OBJECT
++
++public:
++	WhatsNewDialog(QWidget *parent, const QString &version, const QString &markdown, bool addonUpdateNeeded);
++	/* For tests: whether the text needs scrolling; scroll it to the end. */
++	bool scrolls() const;
++	void scrollToEnd();
++
++	void accept() override;
++	void reject() override;
++
++signals:
++	void openUpdates();
++	/* Closed by the user (a button, Esc or the close button); not when it
++	 * closes because LiveHime quits, so it shows again next time. */
++	void read();
++
++protected:
++	void showEvent(QShowEvent *event) override;
++	void closeEvent(QCloseEvent *event) override;
++
++private:
++	QTextBrowser *text_;
++	bool closing_ = false;
++	bool closedByUser_ = false;
++};
+-- 
+2.54.0 (Apple Git-157)
+

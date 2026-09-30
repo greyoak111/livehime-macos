@@ -62,8 +62,8 @@ v0.2.0 构建时关闭了 `ENABLE_BROWSER`（CEF 体积大、签名复杂）。2
 主程序体积不变，需要的人在应用里一键安装。计划见 [浏览器来源可选组件计划书](BROWSER_ADDON_PLAN.md)。P0 可行性、P1 打包、P2 应用内管理已完成（2026-09-30），P3 随 v0.3.0 发布。
 Decided on 2026-09-29: an optional add-on installed from inside the app; see the plan. Not started.
 
-同一份计划书的第二部分是**更新说明弹窗**：更新后首次打开时居中显示这次更新的内容（内容过多时在弹窗内滚动），可以先于浏览器组件单独做。
-Part 2 of the same plan is a **What's New dialog** shown centered on the first launch after an update (scrolls when long); it can ship before the add-on.
+同一份计划书的第二部分是**更新说明弹窗**：更新后首次打开时居中显示这次更新的内容（内容过多时在弹窗内滚动），已完成（2026-09-30），随 v0.3.0 发布。
+Part 2 of the same plan is a **What's New dialog** shown centered on the first launch after an update (scrolls when long); done (2026-09-30), ships with v0.3.0.
 
 ### 3. 其他 / Other
 
