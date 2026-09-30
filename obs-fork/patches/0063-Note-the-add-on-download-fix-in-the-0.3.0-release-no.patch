@@ -1,0 +1,85 @@
+From 4c7d51b4bff7d6991d6cac75f246ca04a8c0603c Mon Sep 17 00:00:00 2001
+From: greyoak111 <suny96636@gmail.com>
+Date: Wed, 30 Sep 2026 22:04:55 +0800
+Subject: [PATCH] Note the add-on download fix in the 0.3.0 release notes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../release-notes/RELEASE_NOTES_v0.3.0.md     | 41 +++++++++++++++----
+ 1 file changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.3.0.md b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.3.0.md
+index c0ff46ead..52b671e6f 100644
+--- a/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.3.0.md
++++ b/plugins/livehime/data/release-notes/RELEASE_NOTES_v0.3.0.md
+@@ -1,8 +1,5 @@
+ # LiveHime macOS v0.3.0
+ 
+-测试版（beta）：打开“参与测试版”的用户会在应用里收到；几天内没有问题反馈后转为正式版。
+-A beta: offered in the app to those who opted into betas; promoted to stable after a few quiet days.
+-
+ ## 下载哪个文件 / Which file to download
+ 
+ | 文件 / File | 给谁用 / For |
+@@ -35,11 +32,18 @@ Not signed by Apple: if macOS blocks the installer or the app, click **Open Anyw
+   After an update, the first start shows what changed (up to the three newest versions, scrolling when long),
+   centered on the main window. Not shown on a fresh install.
+ 
++## 修复 / Fixes
++
++- 浏览器组件下载期间如果检查了更新（手动点“检查更新”或自动检查），安装会失败，要重试一次才能装上。
++  现在组件下载到单独的文件夹，检查更新不会再打断它。
++  Checking for updates while the browser add-on was downloading made the install fail until retried. The add-on
++  now downloads into a folder of its own, out of the way of the update check.
++
+ ## 升级 / Upgrade
+ 
+-v0.2.8 及以后的版本打开“参与测试版”后会在应用里收到这次更新，也可以手动下载安装包或 DMG 替换。
++v0.2.8 及以后的版本会在应用里收到这次更新，也可以手动下载安装包或 DMG 替换。
+ 没有升级 OBS，不迁移设置，登录和设置都会保留。
+-From v0.2.8 on, turn on the beta option to get this in the app, or install the pkg or DMG by hand.
++From v0.2.8 on the app offers this update, or install the pkg or DMG by hand.
+ OBS is not upgraded; no settings migrate; your login and settings are kept.
+ 
+ 装了浏览器组件后，即使画面里没有浏览器来源，它也会在后台常驻约 150 MB 内存；不需要时可以移除。
+@@ -48,14 +52,33 @@ source; remove it if you do not need it.
+ 
+ ## 验证 / Validation
+ 
+-（构建和测试后填写 / filled in after the builds and tests）
++- 维护者用真实账号开播正常；用 pkg 把 0.2.10 升级到 0.3.0，登录、设置和屏幕录制授权都保留，更新说明弹窗正常出现。
++  A real stream by the maintainer; the pkg upgraded 0.2.10 to 0.3.0 keeping the login, settings and screen
++  recording permission, and the What's New dialog appeared.
++- 端到端测试：更新说明 15/15、浏览器组件 19/19、组件随更新 9/9、应用更新 21/21、推流 14/14、字幕 26/26、
++  SRT 16/16、悬浮弹幕 16/16（屏幕采集开关“隐藏 OBS”两种模式）、全屏置顶 5/5。
++  End-to-end: What's New 15/15, add-on 19/19, add-on with an update 9/9, updates 21/21, streaming 14/14,
++  captions 26/26, SRT 16/16, floating chat 16/16 (with and without "Hide OBS"), full-screen pinning 5/5.
++- 浏览器组件两个架构的检查全部通过（架构、从组件自身加载 CEF、只含中英文语言、附 CEF 许可、和应用同一张签名证书）；
++  安装包检查、更新说明检查通过；补丁 0001–0063 在上游 `32.2.2` 上还原出发布用的代码树。
++  Add-on checks pass for both architectures (architecture, CEF loaded from the add-on, en/zh locales only, CEF
++  license included, same signing certificate as the app); installer and release-notes checks pass; patches
++  0001–0063 reproduce the released tree on upstream `32.2.2`.
++- 维护者从 GitHub 发布页真实安装了浏览器组件，浏览器来源正常显示网页；安装失败的问题由此发现并修复（见“修复”）。
++  The maintainer installed the browser add-on from the published release and a browser source showed a page;
++  this is how the failed-install issue above was found and fixed.
++- Swift core：112 个测试，111 个通过，1 个需要联网的测试跳过。
++  Swift core: 112 tests, 111 passed, 1 network-gated skipped.
++- 签名、架构、Bundle ID 检查通过，和 v0.2.10 使用同一张签名证书；应用包里没有账号数据。
++  Signature, architecture and bundle id checks passed; same signing certificate as v0.2.10; no account data in
++  the bundle.
+ 
+ ## 源码 / Source
+ 
+-基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)：两个架构都对应补丁 0001–0059。
++基于上游 OBS Studio `32.2.2`（`ba2f32bdf`）的补丁系列在 [`obs-fork/`](../obs-fork/)：两个架构都对应补丁 0001–0063（0060、0061 只改测试）。
+ 浏览器组件另外对 `plugins/obs-browser` 子模块打了 [`obs-fork/browser-addon`](../obs-fork/browser-addon/) 里的补丁，
+ 组件内含的 Chromium Embedded Framework 的许可见 [`ThirdPartyLicenses/CEF`](../ThirdPartyLicenses/CEF/)。
+-The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/): patches 0001–0059
+-for both architectures. The browser add-on also patches the `plugins/obs-browser` submodule (see
++The patch series on upstream OBS Studio `32.2.2` (`ba2f32bdf`) is in [`obs-fork/`](../obs-fork/): patches 0001–0063
++for both architectures (0060 and 0061 change only tests). The browser add-on also patches the `plugins/obs-browser` submodule (see
+ [`obs-fork/browser-addon`](../obs-fork/browser-addon/)); the license of the Chromium Embedded Framework it contains is
+ in [`ThirdPartyLicenses/CEF`](../ThirdPartyLicenses/CEF/).
+-- 
+2.54.0 (Apple Git-157)
+

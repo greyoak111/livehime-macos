@@ -1,0 +1,64 @@
+From 9ac2fab289b7c9b323b865f09922c37413e7ce28 Mon Sep 17 00:00:00 2001
+From: greyoak111 <suny96636@gmail.com>
+Date: Wed, 30 Sep 2026 22:01:03 +0800
+Subject: [PATCH] Keep an add-on download out of the update cleanup
+
+The first update check after launch empties the update folder, where the
+browser add-on was being downloaded, so checking for updates during the
+download failed the install ("couldn't be moved ... folder doesn't exist");
+a retry worked because the cleanup runs once per launch. Download add-ons
+into a folder of their own next to it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../core/Sources/LiveHimeCore/AddonManager.swift     |  9 ++++++++-
+ .../Tests/LiveHimeCoreTests/AddonManagerTests.swift  | 12 ++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/livehime/core/Sources/LiveHimeCore/AddonManager.swift b/plugins/livehime/core/Sources/LiveHimeCore/AddonManager.swift
+index c84c9e388..8ed5450b9 100644
+--- a/plugins/livehime/core/Sources/LiveHimeCore/AddonManager.swift
++++ b/plugins/livehime/core/Sources/LiveHimeCore/AddonManager.swift
+@@ -197,10 +197,17 @@ public enum AddonManager {
+ 
+     // MARK: Download, verification and staging
+ 
++    /// Where add-ons are downloaded and unpacked: next to the update folder,
++    /// not in it, as the first update check after launch empties that one
++    /// (AppUpdater.cleanUp) and would take a download in progress with it.
++    static var downloadsDirectory: URL {
++        AppUpdater.updatesDirectory.deletingLastPathComponent().appendingPathComponent("AddonDownloads", isDirectory: true)
++    }
++
+     /// Downloads, checks and unpacks `offer`; returns the verified bundle.
+     public static func download(_ offer: AddonOffer, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+         let fm = FileManager.default
+-        let folder = AppUpdater.updatesDirectory.appendingPathComponent("addon-\(offer.id)-\(offer.version)", isDirectory: true)
++        let folder = downloadsDirectory.appendingPathComponent("addon-\(offer.id)-\(offer.version)", isDirectory: true)
+         try? fm.removeItem(at: folder)
+         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+         let archive = folder.appendingPathComponent("addon.zip")
+diff --git a/plugins/livehime/core/Tests/LiveHimeCoreTests/AddonManagerTests.swift b/plugins/livehime/core/Tests/LiveHimeCoreTests/AddonManagerTests.swift
+index 1843ae9b7..7b8e48942 100644
+--- a/plugins/livehime/core/Tests/LiveHimeCoreTests/AddonManagerTests.swift
++++ b/plugins/livehime/core/Tests/LiveHimeCoreTests/AddonManagerTests.swift
+@@ -113,4 +113,16 @@ final class AddonManagerTests: XCTestCase {
+             XCTAssertEqual($0 as? AppUpdateError, .invalidApp("not signed like the app"))
+         }
+     }
++
++    /// The first update check after launch empties the update folder; an
++    /// add-on being downloaded then must not go with it.
++    func testUpdateCleanupLeavesAnAddOnDownloadAlone() throws {
++        let fm = FileManager.default
++        XCTAssertFalse(AddonManager.downloadsDirectory.path.hasPrefix(AppUpdater.updatesDirectory.path + "/"))
++        let folder = AddonManager.downloadsDirectory.appendingPathComponent("addon-test-\(UUID().uuidString)", isDirectory: true)
++        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
++        defer { try? fm.removeItem(at: folder) }
++        AppUpdater.cleanUp()
++        XCTAssertTrue(fm.fileExists(atPath: folder.path))
++    }
+ }
+-- 
+2.54.0 (Apple Git-157)
+

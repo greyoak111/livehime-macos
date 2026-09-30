@@ -15,7 +15,7 @@ OBS.app as in v0.1.x).
   (cross-built on Apple silicon from the universal obs-deps)
 - Bundled files: [`DEPENDENCY-INVENTORY-v0.3.0.txt`](DEPENDENCY-INVENTORY-v0.3.0.txt) (arm64),
   [`DEPENDENCY-INVENTORY-v0.3.0-x86_64.txt`](DEPENDENCY-INVENTORY-v0.3.0-x86_64.txt) (Intel)
-- Both apps were built from the series through patch 0059 (0060 and 0061
+- Both apps were built from the series through patch 0063 (0060 and 0061
   change only tests).
 - Browser add-on 1.0.0: `obs-browser` from the same tree with
   [`obs-fork/browser-addon`](../../obs-fork/browser-addon) applied, built with
