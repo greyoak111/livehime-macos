@@ -1,4 +1,20 @@
-# LiveHime macOS
+<p align="center">
+  <img src="docs/assets/icon.png" width="128" height="128" alt="LiveHime macOS 图标">
+</p>
+
+<h1 align="center">LiveHime macOS</h1>
+
+<p align="center">
+  <a href="https://github.com/greyoak111/livehime-macos/releases/latest"><img alt="最新版本" src="https://img.shields.io/github/v/release/greyoak111/livehime-macos?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=8994ee"></a>
+  <a href="https://github.com/greyoak111/livehime-macos/releases"><img alt="下载量" src="https://img.shields.io/github/downloads/greyoak111/livehime-macos/total?label=%E4%B8%8B%E8%BD%BD&color=8994ee"></a>
+  <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-555?logo=apple">
+  <img alt="Apple 芯片与 Intel" src="https://img.shields.io/badge/Apple%20%E8%8A%AF%E7%89%87%20%7C%20Intel-%E9%83%BD%E6%94%AF%E6%8C%81-555">
+  <a href="LICENSE"><img alt="GPL-2.0" src="https://img.shields.io/github/license/greyoak111/livehime-macos?color=555"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/greyoak111/livehime-macos/releases/latest"><img alt="下载安装包" src="https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD%E5%AE%89%E8%A3%85%E5%8C%85-Installer.pkg-fb4d5a?style=for-the-badge&logo=apple&logoColor=white"></a>
+</p>
 
 **在 Mac 上用哔哩哔哩直播姬的方式开播。** 从 v0.2.0 起，这是一个带“直播姬”面板的
 OBS Studio：OBS 怎么用它就怎么用，登录、开播、弹幕和直播间管理都在右侧面板里。
