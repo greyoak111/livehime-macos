@@ -9,6 +9,10 @@ notices are copied here, and the exact source commit is recorded in
 when a distributable app bundle is produced, its complete dependency inventory
 must be generated from the actual bundle before release.
 
+Qt comes with the OBS dependencies; since v0.3.1 the app's Qt macOS platform
+plugin is rebuilt with a patch. The Qt licenses, the patch and how it is built
+are in `Qt/`.
+
 The optional browser source add-on (not the app itself) contains the Chromium
 Embedded Framework; its license and provenance are in `CEF/`.
 

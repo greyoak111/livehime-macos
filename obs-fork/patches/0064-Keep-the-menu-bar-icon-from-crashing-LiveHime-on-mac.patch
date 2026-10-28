@@ -1,0 +1,189 @@
+From 36b0bf9806ba5619429c45297d5237536e289ba0 Mon Sep 17 00:00:00 2001
+From: greyoak111 <151205158+greyoak111@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:10:42 +0800
+Subject: [PATCH] Keep the menu bar icon from crashing LiveHime on macOS 27
+
+Clicking the menu bar icon aborted the app on macOS 27 (issue #1): Qt
+6.11.1 reads clickCount from NSApp.currentEvent when the status item menu
+starts tracking, and since NSControls use gesture recognizers that event is
+not always a mouse event, so AppKit raises. Neither obs-deps 2026-07-15 nor
+2026-10-23 carries Qt's fix (qtbase 6192d9edd), and 6.11.2 lacks it too.
+
+build-macos.sh now replaces the Qt Cocoa plugin in obs-deps with one built
+from the qtbase 6.11.1 source (checksum-verified) plus a backport of that
+fix, using the obs-deps qtbase settings, for both architectures; it runs
+once per deps folder. After the build it checks that the app bundles the
+patched plugin, since the bundle copy only follows timestamps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build-aux/livehime/build-macos.sh             | 14 ++++
+ build-aux/livehime/qt/patch-qcocoa.sh         | 83 +++++++++++++++++++
+ .../qt/qcocoa-tray-icon-current-event.patch   | 37 +++++++++
+ 3 files changed, 134 insertions(+)
+ create mode 100755 build-aux/livehime/qt/patch-qcocoa.sh
+ create mode 100644 build-aux/livehime/qt/qcocoa-tray-icon-current-event.patch
+
+diff --git a/build-aux/livehime/build-macos.sh b/build-aux/livehime/build-macos.sh
+index 06d77d78a..a2a74f7f4 100755
+--- a/build-aux/livehime/build-macos.sh
++++ b/build-aux/livehime/build-macos.sh
+@@ -50,9 +50,23 @@ if [[ $browser == ON ]]; then
+   exit 0
+ fi
+ 
++# The app bundles the Qt Cocoa plugin from obs-deps; it needs the menu bar
++# icon fix for macOS 27 (qt/patch-qcocoa.sh) before it is copied in.
++qt6_dir=$(sed -n 's/^Qt6_DIR:PATH=//p' "$build_dir/CMakeCache.txt")
++"${0:A:h}/qt/patch-qcocoa.sh" "${qt6_dir:h:h:h}"
++
+ cmake --build "$build_dir" --config "$config" --target obs-studio -- -quiet
+ app="$build_dir/frontend/$config/LiveHime.app"
+ 
++# The bundle copy only follows timestamps, so an older plugin can survive an
++# incremental build; compare the code (signatures differ) to be sure.
++bundled_qcocoa="$app/Contents/PlugIns/platforms/libqcocoa.dylib"
++if [[ $(otool -arch "$arch" -t "$bundled_qcocoa" | tail -n +2 | shasum) != \
++      $(otool -arch "$arch" -t "${qt6_dir:h:h:h}/plugins/platforms/libqcocoa.dylib" | tail -n +2 | shasum) ]]; then
++  print -u2 -- "$bundled_qcocoa is not the patched Qt Cocoa plugin; delete it and build again"
++  exit 1
++fi
++
+ # Sign with the persistent local development certificate (as v0.1.2 did).
+ # Ad-hoc signatures change with every build and macOS does not keep screen
+ # recording, camera or microphone grants for them reliably; a stable
+diff --git a/build-aux/livehime/qt/patch-qcocoa.sh b/build-aux/livehime/qt/patch-qcocoa.sh
+new file mode 100755
+index 000000000..499a85d83
+--- /dev/null
++++ b/build-aux/livehime/qt/patch-qcocoa.sh
+@@ -0,0 +1,83 @@
++#!/bin/zsh
++# Replaces the Qt Cocoa platform plugin in the downloaded obs-deps Qt with one
++# built from the same Qt release plus qcocoa-tray-icon-current-event.patch.
++# Qt 6.11.1 (in obs-deps 2026-07-15 and 2026-10-23) reads clickCount from
++# NSApp.currentEvent when the menu bar icon is clicked; on macOS 27 that event
++# is not always a mouse event and AppKit aborts the app (issue #1). The patch
++# backports Qt's fix (qtbase 6192d9edd00caa14ed6b67c32c0cd8cfe95cf815).
++# Only libqcocoa.dylib changes; it is built for arm64 and x86_64 with the
++# obs-deps qtbase settings, so it matches the Qt frameworks it loads into.
++# Runs once per deps directory: a stamp next to the plugin records the patch
++# and the result, and later runs only check them.
++# Usage: patch-qcocoa.sh <obs-deps-qt6 directory>
++set -euo pipefail
++
++qt_deps=${1:?usage: patch-qcocoa.sh <obs-deps-qt6 directory>}
++here=${0:A:h}
++patch_file="$here/qcocoa-tray-icon-current-event.patch"
++qt_version=6.11.1
++tarball=qtbase-everywhere-src-$qt_version.tar.xz
++tarball_sha256=d9594a31228aa23ad6b531719a29b45f0f3989fe6c136d45767ea179f233c1ac
++tarball_url=https://download.qt.io/archive/qt/6.11/$qt_version/submodules/$tarball
++
++plugin="$qt_deps/plugins/platforms/libqcocoa.dylib"
++stamp="$plugin.livehime"
++[[ -f $plugin ]] || { print -u2 -- "No Qt Cocoa plugin at $plugin"; exit 1; }
++
++if ! grep -qx "QT_VERSION = $qt_version" "$qt_deps/mkspecs/qconfig.pri"; then
++  print -u2 -- "obs-deps Qt is not $qt_version; update the patch and $0 for it"
++  exit 1
++fi
++
++patch_sha=$(shasum -a 256 "$patch_file" | cut -d' ' -f1)
++if [[ -f $stamp ]]; then
++  read -r stamped_patch stamped_plugin < "$stamp"
++  if [[ $stamped_patch == $patch_sha && $stamped_plugin == $(shasum -a 256 "$plugin" | cut -d' ' -f1) ]]; then
++    exit 0
++  fi
++fi
++
++# Not inside .deps: OBS's configure step runs xattr -r over it, and the Qt
++# build tree's framework links make that fail.
++work=${QCOCOA_WORK_DIR:-${here:h:h:h}/build_qcocoa}
++mkdir -p "$work"
++if [[ ! -f "$work/$tarball" ]] || ! print -- "$tarball_sha256  $work/$tarball" | shasum -a 256 -c -s; then
++  print -- "Downloading $tarball_url"
++  curl -fsSL -o "$work/$tarball" "$tarball_url"
++  print -- "$tarball_sha256  $work/$tarball" | shasum -a 256 -c -s \
++    || { print -u2 -- "$tarball does not match its checksum"; exit 1; }
++fi
++
++rm -rf "$work/qtbase" "$work/build"
++mkdir -p "$work/qtbase"
++tar --strip-components 1 -xJf "$work/$tarball" -C "$work/qtbase"
++patch -d "$work/qtbase" -p2 --forward --quiet < "$patch_file"
++
++# The obs-deps qtbase configuration (deps.qt/qt6.zsh), universal.
++cmake -S "$work/qtbase" -B "$work/build" -G Ninja \
++  -DCMAKE_BUILD_TYPE=Release \
++  -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
++  "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" \
++  -DBUILD_SHARED_LIBS=ON -DFEATURE_rpath=ON -DFEATURE_framework=ON \
++  -DFEATURE_androiddeployqt=OFF -DFEATURE_brotli=OFF -DFEATURE_dbus=OFF \
++  -DFEATURE_doubleconversion=ON -DFEATURE_glib=OFF -DFEATURE_jpeg=ON \
++  -DFEATURE_macdeployqt=OFF -DFEATURE_pcre2=ON -DFEATURE_pdf=OFF \
++  -DFEATURE_png=ON -DFEATURE_printsupport=OFF -DFEATURE_qmake=OFF \
++  -DFEATURE_separate_debug_info=OFF -DFEATURE_sql=OFF \
++  -DFEATURE_system_doubleconversion=OFF -DFEATURE_system_jpeg=OFF \
++  -DFEATURE_system_pcre2=OFF -DFEATURE_system_png=OFF \
++  -DFEATURE_system_zlib=ON -DFEATURE_testlib=OFF -DFEATURE_windeployqt=OFF \
++  -DINPUT_openssl=no -DQT_BUILD_EXAMPLES=OFF -DQT_BUILD_TESTS=OFF \
++  -DQT_BUILD_TOOLS_BY_DEFAULT=OFF -DQT_USE_VCPKG=OFF \
++  -DQT_NO_APPLE_SDK_MAX_VERSION_CHECK=ON > "$work/configure.log"
++cmake --build "$work/build" --target QCocoaIntegrationPlugin > "$work/build.log"
++
++built="$work/build/plugins/platforms/libqcocoa.dylib"
++[[ $(lipo -archs "$built") == *arm64* && $(lipo -archs "$built") == *x86_64* ]] \
++  || { print -u2 -- "$built is not universal"; exit 1; }
++strip -x "$built"
++
++[[ -f "$plugin.obs-deps" ]] || cp -p "$plugin" "$plugin.obs-deps"
++cp "$built" "$plugin"
++print -- "$patch_sha $(shasum -a 256 "$plugin" | cut -d' ' -f1)" > "$stamp"
++print -- "Patched $plugin"
+diff --git a/build-aux/livehime/qt/qcocoa-tray-icon-current-event.patch b/build-aux/livehime/qt/qcocoa-tray-icon-current-event.patch
+new file mode 100644
+index 000000000..8d2a7114c
+--- /dev/null
++++ b/build-aux/livehime/qt/qcocoa-tray-icon-current-event.patch
+@@ -0,0 +1,37 @@
++diff --git a/qtbase/src/plugins/platforms/cocoa/qcocoasystemtrayicon.mm b/qtbase/src/plugins/platforms/cocoa/qcocoasystemtrayicon.mm
++index d5c5ed8..1434390 100644
++--- a/qtbase/src/plugins/platforms/cocoa/qcocoasystemtrayicon.mm
+++++ b/qtbase/src/plugins/platforms/cocoa/qcocoasystemtrayicon.mm
++@@ -242,8 +242,32 @@ QSize fullHeightSize(!pixmap.isNull() ? pixmap.width():
++     }
++ }
++ 
+++static bool isMouseButtonEvent(NSEvent *event)
+++{
+++    switch (event.type) {
+++    case NSEventTypeLeftMouseDown:
+++    case NSEventTypeLeftMouseUp:
+++    case NSEventTypeRightMouseDown:
+++    case NSEventTypeRightMouseUp:
+++    case NSEventTypeOtherMouseDown:
+++    case NSEventTypeOtherMouseUp:
+++        return true;
+++    default:
+++        return false;
+++    }
+++}
+++
++ void QCocoaSystemTrayIcon::emitActivated()
++ {
+++    // NSControls are driven by gesture recognizers in macOS 27,
+++    // which means NSApp.currentEvent may not be a mouse event
+++    // at the point when we receive the status bar button's
+++    // action callback. This is a quick fix to avoid crashing.
+++    if (!isMouseButtonEvent(NSApp.currentEvent)) {
+++        emit activated(QPlatformSystemTrayIcon::Unknown);
+++        return;
+++    }
+++
++     auto *mouseEvent = NSApp.currentEvent;
++ 
++     auto activationReason = QPlatformSystemTrayIcon::Unknown;
+-- 
+2.54.0 (Apple Git-157)
+
